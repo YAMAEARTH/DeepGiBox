@@ -46,7 +46,6 @@
 #include "DeckLinkAPIMemoryAllocator_v14_2_1.h"
 
 // Type Declarations
-
 BMD_CONST REFIID IID_IDeckLinkEncoderInput_v10_11                        = /* 270587DA-6B7D-42E7-A1F0-6D853F581185 */ {0x27,0x05,0x87,0xDA,0x6B,0x7D,0x42,0xE7,0xA1,0xF0,0x6D,0x85,0x3F,0x58,0x11,0x85};
 
 /* Interface IDeckLinkEncoderInput_v10_11 - Created by QueryInterface from IDeckLink. */

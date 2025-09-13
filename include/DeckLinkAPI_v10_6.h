@@ -52,13 +52,12 @@ enum _BMDDeckLinkAttributeID_v10_6 {
 
     /* Flags */
 
-    BMDDeckLinkSupportsDesktopDisplay_v10_6                      = 'extd',
+    BMDDeckLinkSupportsDesktopDisplay_v10_6                      = /* 'extd' */ 0x65787464,
 };
 
 typedef uint32_t BMDIdleVideoOutputOperation_v10_6;
 enum _BMDIdleVideoOutputOperation_v10_6 {
-    bmdIdleVideoOutputDesktop_v10_6                              = 'desk'
+    bmdIdleVideoOutputDesktop_v10_6                              = /* 'desk' */ 0x6465736B
 };
-
 
 #endif /* defined(BMD_DECKLINKAPI_v10_6_H) */

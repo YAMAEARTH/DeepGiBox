@@ -46,7 +46,6 @@
 #include "DeckLinkAPIVideoInput_v11_5_1.h"
 
 // Type Declarations
-
 BMD_CONST REFIID IID_IDeckLinkInput_v11_4                               = /* 2A88CF76-F494-4216-A7EF-DC74EEB83882 */ { 0x2A,0x88,0xCF,0x76,0xF4,0x94,0x42,0x16,0xA7,0xEF,0xDC,0x74,0xEE,0xB8,0x38,0x82 };
 
 /* Interface IDeckLinkInput_v11_4 - Created by QueryInterface from IDeckLink. */

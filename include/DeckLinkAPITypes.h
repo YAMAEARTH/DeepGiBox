@@ -1,5 +1,5 @@
 /* -LICENSE-START-
-** Copyright (c) 2024 Blackmagic Design
+** Copyright (c) 2025 Blackmagic Design
 **
 ** Permission is hereby granted, free of charge, to any person or organization
 ** obtaining a copy of the software and accompanying documentation covered by
@@ -118,7 +118,7 @@ class BMD_PUBLIC IDeckLinkTimecode : public IUnknown
 public:
     virtual BMDTimecodeBCD GetBCD (void) = 0;
     virtual HRESULT GetComponents (/* out */ uint8_t* hours, /* out */ uint8_t* minutes, /* out */ uint8_t* seconds, /* out */ uint8_t* frames) = 0;
-    virtual HRESULT GetString (/* out */ CFStringRef* timecode) = 0;
+    virtual HRESULT GetString (/* out */ const char** timecode) = 0;
     virtual BMDTimecodeFlags GetFlags (void) = 0;
     virtual HRESULT GetTimecodeUserBits (/* out */ BMDTimecodeUserBits* userBits) = 0;
 

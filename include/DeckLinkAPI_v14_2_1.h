@@ -102,11 +102,8 @@ extern "C" {
     BMD_PUBLIC IDeckLinkAPIInformation* CreateDeckLinkAPIInformationInstance_v14_2_1(void);
     BMD_PUBLIC IDeckLinkGLScreenPreviewHelper_v14_2_1* CreateOpenGLScreenPreviewHelper_v14_2_1(void);
     BMD_PUBLIC IDeckLinkGLScreenPreviewHelper_v14_2_1* CreateOpenGL3ScreenPreviewHelper_v14_2_1(void);	// Requires OpenGL 3.2 support and provides improved performance and color handling
-    BMD_PUBLIC IDeckLinkCocoaScreenPreviewCallback_v14_2_1* CreateCocoaScreenPreview_v14_2_1(/* in */ void* /* (NSView*)*/ parentView);
-    BMD_PUBLIC IDeckLinkMetalScreenPreviewHelper_v14_2_1* CreateMetalScreenPreviewHelper_v14_2_1(void);
     BMD_PUBLIC IDeckLinkVideoConversion_v14_2_1* CreateVideoConversionInstance_v14_2_1(void);
     BMD_PUBLIC IDeckLinkVideoFrameAncillaryPackets* CreateVideoFrameAncillaryPacketsInstance_v14_2_1(void);	// For use when creating a custom IDeckLinkVideoFrame without wrapping IDeckLinkOutput::CreateVideoFrame
-
 }
 
 #endif      // defined(__cplusplus)

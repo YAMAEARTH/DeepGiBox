@@ -19,7 +19,9 @@
 #include "DeckLinkAPITypes.h"
 #include "DeckLinkAPIConfiguration.h"
 #include "DeckLinkAPIVideoFrame_v14_2_1.h"
+#if defined(__APPLE__)
 #include "DeckLinkAPIScreenPreviewCallback_v14_2_1.h"
+#endif
 
 extern "C" {
 
@@ -166,7 +168,12 @@ static IDeckLinkIterator* g_iterator = nullptr;
 static IDeckLink* g_device = nullptr;
 static IDeckLinkInput* g_input = nullptr;
 static SharedFrame g_shared;
-static IDeckLinkScreenPreviewCallback* g_screenPreview = nullptr; // Cocoa Screen Preview (NSView)
+// Screen preview (NSView on macOS, placeholder on Linux)
+#if defined(__APPLE__)
+static IDeckLinkScreenPreviewCallback* g_screenPreview = nullptr;
+#else
+static void* g_screenPreview = nullptr;  // Placeholder for Linux
+#endif
 static std::atomic<uint64_t> g_preview_seq{0};
 
 class CaptureCallback : public IDeckLinkInputCallback {
@@ -176,14 +183,33 @@ public:
     // IUnknown
     HRESULT QueryInterface(REFIID iid, void** ppv) override {
         if (!ppv) return E_POINTER;
-        // macOS style IUnknown UUID
-        CFUUIDBytes iunknown = CFUUIDGetUUIDBytes(IUnknownUUID);
-        if (memcmp(&iid, &iunknown, sizeof(REFIID)) == 0) {
-            *ppv = static_cast<IUnknown*>(this);
-            AddRef();
-            return S_OK;
-        }
-        if (memcmp(&iid, &IID_IDeckLinkInputCallback, sizeof(REFIID)) == 0) {
+        #if defined(__APPLE__)
+            // macOS style IUnknown UUID via CoreFoundation
+            CFUUIDBytes iunknown = CFUUIDGetUUIDBytes(IUnknownUUID);
+            if (std::memcmp(&iid, &iunknown, sizeof(REFIID)) == 0) {
+                *ppv = static_cast<IUnknown*>(this);
+                AddRef();
+                return S_OK;
+            }
+        #elif defined(_WIN32)
+            if (IsEqualIID(iid, IID_IUnknown)) {
+                *ppv = static_cast<IUnknown*>(this);
+                AddRef();
+                return S_OK;
+            }
+        #else
+            // Linux: compare against known interface IDs; IID_IUnknown may not be exposed
+            #ifdef IID_IUnknown
+            static const REFIID linux_iunknown = {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xC0,0x00,0x00,0x00,0x00,0x00,0x00,0x46};
+            if (std::memcmp(&iid, &linux_iunknown, sizeof(REFIID)) == 0) {
+                *ppv = static_cast<IUnknown*>(this);
+                AddRef();
+                return S_OK;
+            }
+            #endif
+        #endif
+
+        if (std::memcmp(&iid, &IID_IDeckLinkInputCallback, sizeof(REFIID)) == 0) {
             *ppv = static_cast<IDeckLinkInputCallback*>(this);
             AddRef();
             return S_OK;
@@ -373,12 +399,14 @@ public:
         if (!videoFrame)
             return S_OK;
 
-        // If a screen preview is attached, let DeckLink render directly into NSView.
+        // If a screen preview is attached, let DeckLink render directly into view.
         // Avoid any CPU-side GetBytes/copy/convert to minimize latency.
+        #if defined(__APPLE__)
         if (g_screenPreview != nullptr) {
             g_preview_seq.fetch_add(1, std::memory_order_relaxed);
             return S_OK;
         }
+        #endif
 
         long width = videoFrame->GetWidth();
         long height = videoFrame->GetHeight();
@@ -393,6 +421,7 @@ public:
                 bytes = nullptr;
             }
         } else {
+            #if defined(__APPLE__)
             // Fallback path on macOS: get CVPixelBuffer and read base address
             IDeckLinkMacVideoBuffer* macBuf = nullptr;
             if (videoFrame->QueryInterface(IID_IDeckLinkMacVideoBuffer, (void**)&macBuf) == S_OK && macBuf) {
@@ -415,6 +444,10 @@ public:
                 }
                 macBuf->Release();
             }
+            #else
+            // Linux: Direct buffer access only through IDeckLinkVideoFrame_v14_2_1
+            // No CVPixelBuffer equivalent on Linux
+            #endif
         }
         if (!bytes) {
             fprintf(stderr, "[shim] GetBytes failed (qrv=0x%08x, pix=0x%x)\n", (unsigned)qrv, (unsigned)pixfmt);
@@ -601,10 +634,12 @@ extern "C" bool decklink_capture_open(int32_t device_index) {
         return false;
     }
 
-    // If a screen preview is already attached (NSView provided earlier), hook it up now.
+    // If a screen preview is already attached (NSView provided earlier), hook it up now (macOS only).
+    #if defined(__APPLE__)
     if (g_screenPreview) {
         (void)g_input->SetScreenPreviewCallback(g_screenPreview);
     }
+    #endif
 
     // Determine current input connection (we set HDMI above, but read the active one)
     int64_t currConn = bmdVideoConnectionUnspecified;
@@ -723,9 +758,11 @@ extern "C" void decklink_capture_close() {
         g_input->StopStreams();
         g_input->DisableVideoInput();
         g_input->SetCallback(nullptr);
+        #if defined(__APPLE__)
         if (g_screenPreview) {
             g_input->SetScreenPreviewCallback(nullptr);
         }
+        #endif
     }
     if (g_callback) { g_callback->Release(); g_callback = nullptr; }
     if (g_input) { g_input->Release(); g_input = nullptr; }
@@ -741,7 +778,11 @@ extern "C" void decklink_capture_close() {
         g_shared.row_bytes = 0;
         g_shared.seq = 0;
     }
+    #if defined(__APPLE__)
     if (g_screenPreview) { g_screenPreview->Release(); g_screenPreview = nullptr; }
+    #else
+    g_screenPreview = nullptr;
+    #endif
     g_preview_seq.store(0, std::memory_order_relaxed);
 }
 
@@ -768,10 +809,18 @@ extern "C" bool decklink_preview_attach_nsview(void* nsview_ptr) {
 }
 
 extern "C" void decklink_preview_detach() {
+    #if defined(__APPLE__)
     if (g_input) {
         g_input->SetScreenPreviewCallback(nullptr);
     }
     if (g_screenPreview) { g_screenPreview->Release(); g_screenPreview = nullptr; }
+    #else
+    // Linux: No screen preview implementation yet
+    if (g_input) {
+        // Linux DeckLink API doesn't have SetScreenPreviewCallback
+    }
+    g_screenPreview = nullptr;
+    #endif
 }
 
 extern "C" uint64_t decklink_preview_seq() {

@@ -45,7 +45,7 @@
 
 // Interface ID Declarations
 
-BMD_CONST REFIID IID_IDeckLinkConfiguration_v10_11                   = /* EF90380B-4AE5-4346-9077-E288E149F129 */ {0xEF,0x90,0x38,0x0B,0x4A,0xE5,0x43,0x46,0x90,0x77,0xE2,0x88,0xE1,0x49,0xF1,0x29};
+BMD_CONST REFIID IID_IDeckLinkConfiguration_v10_11                       = /* EF90380B-4AE5-4346-9077-E288E149F129 */ {0xEF,0x90,0x38,0x0B,0x4A,0xE5,0x43,0x46,0x90,0x77,0xE2,0x88,0xE1,0x49,0xF1,0x29};
 
 /* Enum BMDDeckLinkConfigurationID_v10_11 - DeckLink Configuration ID */
 
@@ -54,7 +54,7 @@ enum _BMDDeckLinkConfigurationID_v10_11 {
 
     /* Video Input/Output Integers */
 
-    bmdDeckLinkConfigDuplexMode_v10_11                              = 'dupx',
+    bmdDeckLinkConfigDuplexMode_v10_11                              = /* 'dupx' */ 0x64757078,
 };
 
 // Forward Declarations
@@ -63,7 +63,7 @@ class IDeckLinkConfiguration_v10_11;
 
 /* Interface IDeckLinkConfiguration_v10_11 - DeckLink Configuration interface */
 
-class IDeckLinkConfiguration_v10_11 : public IUnknown
+class BMD_PUBLIC IDeckLinkConfiguration_v10_11 : public IUnknown
 {
 public:
     virtual HRESULT SetFlag (/* in */ BMDDeckLinkConfigurationID cfgID, /* in */ bool value) = 0;
@@ -72,8 +72,8 @@ public:
     virtual HRESULT GetInt (/* in */ BMDDeckLinkConfigurationID cfgID, /* out */ int64_t *value) = 0;
     virtual HRESULT SetFloat (/* in */ BMDDeckLinkConfigurationID cfgID, /* in */ double value) = 0;
     virtual HRESULT GetFloat (/* in */ BMDDeckLinkConfigurationID cfgID, /* out */ double *value) = 0;
-    virtual HRESULT SetString (/* in */ BMDDeckLinkConfigurationID cfgID, /* in */ CFStringRef value) = 0;
-    virtual HRESULT GetString (/* in */ BMDDeckLinkConfigurationID cfgID, /* out */ CFStringRef *value) = 0;
+    virtual HRESULT SetString (/* in */ BMDDeckLinkConfigurationID cfgID, /* in */ const char *value) = 0;
+    virtual HRESULT GetString (/* in */ BMDDeckLinkConfigurationID cfgID, /* out */ const char **value) = 0;
     virtual HRESULT WriteConfigurationToPreferences (void) = 0;
 
 protected:

@@ -45,7 +45,6 @@
 #include "DeckLinkAPIVideoOutput_v14_2_1.h"
 
 // Type Declarations
-
 BMD_CONST REFIID IID_IDeckLinkOutput_v11_4                              = /* 065A0F6C-C508-4D0D-B919-F5EB0EBFC96B */ { 0x06,0x5A,0x0F,0x6C,0xC5,0x08,0x4D,0x0D,0xB9,0x19,0xF5,0xEB,0x0E,0xBF,0xC9,0x6B };
 
 /* Interface IDeckLinkOutput_v11_4 - Created by QueryInterface from IDeckLink. */

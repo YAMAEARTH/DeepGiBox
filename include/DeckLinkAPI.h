@@ -1,5 +1,5 @@
 /* -LICENSE-START-
- ** Copyright (c) 2024 Blackmagic Design
+ ** Copyright (c) 2025 Blackmagic Design
  **  
  ** Permission is hereby granted, free of charge, to any person or organization 
  ** obtaining a copy of the software and accompanying documentation (the 
@@ -61,17 +61,14 @@
 
 /* DeckLink API */
 
-#include <CoreFoundation/CoreFoundation.h>
-#include <CoreFoundation/CFPlugInCOM.h>
 #include <stdint.h>
+#include "LinuxCOM.h"
 
 #include "DeckLinkAPITypes.h"
 #include "DeckLinkAPIModes.h"
 #include "DeckLinkAPIDiscovery.h"
 #include "DeckLinkAPIConfiguration.h"
 #include "DeckLinkAPIDeckControl.h"
-
-#include "DeckLinkAPIStreaming.h"
 
 #define BLACKMAGIC_DECKLINK_API_MAGIC	1
 
@@ -94,13 +91,11 @@ BMD_CONST REFIID IID_IDeckLinkIPFlowSetting                       = /* 86DD9174-
 BMD_CONST REFIID IID_IDeckLinkIPFlow                              = /* C5FC83C7-5B8E-42A7-9A40-7C065955D4E1 */ { 0xC5,0xFC,0x83,0xC7,0x5B,0x8E,0x42,0xA7,0x9A,0x40,0x7C,0x06,0x59,0x55,0xD4,0xE1 };
 BMD_CONST REFIID IID_IDeckLinkIPFlowIterator                      = /* BD296AB2-A5C5-4153-888F-AAB1FDBD8A5C */ { 0xBD,0x29,0x6A,0xB2,0xA5,0xC5,0x41,0x53,0x88,0x8F,0xAA,0xB1,0xFD,0xBD,0x8A,0x5C };
 BMD_CONST REFIID IID_IDeckLinkOutput                              = /* 1A8077F1-9FE2-4533-8147-2294305E253F */ { 0x1A,0x80,0x77,0xF1,0x9F,0xE2,0x45,0x33,0x81,0x47,0x22,0x94,0x30,0x5E,0x25,0x3F };
-BMD_CONST REFIID IID_IDeckLinkMacOutput                           = /* 22EFC84B-6981-4D35-9F9A-9CEC5790107E */ { 0x22,0xEF,0xC8,0x4B,0x69,0x81,0x4D,0x35,0x9F,0x9A,0x9C,0xEC,0x57,0x90,0x10,0x7E };
 BMD_CONST REFIID IID_IDeckLinkInput                               = /* 4095DB82-E294-4B8C-AAA8-3B9E80C49336 */ { 0x40,0x95,0xDB,0x82,0xE2,0x94,0x4B,0x8C,0xAA,0xA8,0x3B,0x9E,0x80,0xC4,0x93,0x36 };
 BMD_CONST REFIID IID_IDeckLinkIPExtensions                        = /* 46CF7903-A9FD-4D0B-8FFC-0103722AB442 */ { 0x46,0xCF,0x79,0x03,0xA9,0xFD,0x4D,0x0B,0x8F,0xFC,0x01,0x03,0x72,0x2A,0xB4,0x42 };
 BMD_CONST REFIID IID_IDeckLinkHDMIInputEDID                       = /* ABBBACBC-45BC-4665-9D92-ACE6E5A97902 */ { 0xAB,0xBB,0xAC,0xBC,0x45,0xBC,0x46,0x65,0x9D,0x92,0xAC,0xE6,0xE5,0xA9,0x79,0x02 };
 BMD_CONST REFIID IID_IDeckLinkEncoderInput                        = /* 46C1332E-6FD9-472A-8591-FE59C22192E1 */ { 0x46,0xC1,0x33,0x2E,0x6F,0xD9,0x47,0x2A,0x85,0x91,0xFE,0x59,0xC2,0x21,0x92,0xE1 };
 BMD_CONST REFIID IID_IDeckLinkVideoBuffer                         = /* CCB4B64A-5C86-4E02-B778-885D352709FE */ { 0xCC,0xB4,0xB6,0x4A,0x5C,0x86,0x4E,0x02,0xB7,0x78,0x88,0x5D,0x35,0x27,0x09,0xFE };
-BMD_CONST REFIID IID_IDeckLinkMacVideoBuffer                      = /* 3FBEDC55-AA43-4EAB-B12F-FA1299C7C324 */ { 0x3F,0xBE,0xDC,0x55,0xAA,0x43,0x4E,0xAB,0xB1,0x2F,0xFA,0x12,0x99,0xC7,0xC3,0x24 };
 BMD_CONST REFIID IID_IDeckLinkVideoFrame                          = /* 6502091C-615F-4F51-BAF6-45C4256DD5B0 */ { 0x65,0x02,0x09,0x1C,0x61,0x5F,0x4F,0x51,0xBA,0xF6,0x45,0xC4,0x25,0x6D,0xD5,0xB0 };
 BMD_CONST REFIID IID_IDeckLinkMutableVideoFrame                   = /* CF9EB134-0374-4C5B-95FA-1EC14819FF62 */ { 0xCF,0x9E,0xB1,0x34,0x03,0x74,0x4C,0x5B,0x95,0xFA,0x1E,0xC1,0x48,0x19,0xFF,0x62 };
 BMD_CONST REFIID IID_IDeckLinkVideoFrame3DExtensions              = /* D4DBE9C6-B4D2-49D3-ABF2-B4E86C7391B0 */ { 0xD4,0xDB,0xE9,0xC6,0xB4,0xD2,0x49,0xD3,0xAB,0xF2,0xB4,0xE8,0x6C,0x73,0x91,0xB0 };
@@ -117,9 +112,7 @@ BMD_CONST REFIID IID_IDeckLinkEncoderAudioPacket                  = /* 49E8EDC8-
 BMD_CONST REFIID IID_IDeckLinkH265NALPacket                       = /* 639C8E0B-68D5-4BDE-A6D4-95F3AEAFF2E7 */ { 0x63,0x9C,0x8E,0x0B,0x68,0xD5,0x4B,0xDE,0xA6,0xD4,0x95,0xF3,0xAE,0xAF,0xF2,0xE7 };
 BMD_CONST REFIID IID_IDeckLinkAudioInputPacket                    = /* E43D5870-2894-11DE-8C30-0800200C9A66 */ { 0xE4,0x3D,0x58,0x70,0x28,0x94,0x11,0xDE,0x8C,0x30,0x08,0x00,0x20,0x0C,0x9A,0x66 };
 BMD_CONST REFIID IID_IDeckLinkScreenPreviewCallback               = /* D4FA2345-9FBA-4497-95C3-C0C3CED3CDA8 */ { 0xD4,0xFA,0x23,0x45,0x9F,0xBA,0x44,0x97,0x95,0xC3,0xC0,0xC3,0xCE,0xD3,0xCD,0xA8 };
-BMD_CONST REFIID IID_IDeckLinkCocoaScreenPreviewCallback          = /* 91945B73-70DE-40A9-A25D-EA00397D0D3A */ { 0x91,0x94,0x5B,0x73,0x70,0xDE,0x40,0xA9,0xA2,0x5D,0xEA,0x00,0x39,0x7D,0x0D,0x3A };
 BMD_CONST REFIID IID_IDeckLinkGLScreenPreviewHelper               = /* CEB778E2-C202-4EC8-9085-0CD285CC5522 */ { 0xCE,0xB7,0x78,0xE2,0xC2,0x02,0x4E,0xC8,0x90,0x85,0x0C,0xD2,0x85,0xCC,0x55,0x22 };
-BMD_CONST REFIID IID_IDeckLinkMetalScreenPreviewHelper            = /* C15739C7-A5EF-4F0E-A7CB-6806CB87E032 */ { 0xC1,0x57,0x39,0xC7,0xA5,0xEF,0x4F,0x0E,0xA7,0xCB,0x68,0x06,0xCB,0x87,0xE0,0x32 };
 BMD_CONST REFIID IID_IDeckLinkNotificationCallback                = /* B002A1EC-070D-4288-8289-BD5D36E5FF0D */ { 0xB0,0x02,0xA1,0xEC,0x07,0x0D,0x42,0x88,0x82,0x89,0xBD,0x5D,0x36,0xE5,0xFF,0x0D };
 BMD_CONST REFIID IID_IDeckLinkNotification                        = /* B85DF4C8-BDF5-47C1-8064-28162EBDD4EB */ { 0xB8,0x5D,0xF4,0xC8,0xBD,0xF5,0x47,0xC1,0x80,0x64,0x28,0x16,0x2E,0xBD,0xD4,0xEB };
 BMD_CONST REFIID IID_IDeckLinkProfileAttributes                   = /* 17D4BF8E-4911-473A-80A0-731CF6FF345B */ { 0x17,0xD4,0xBF,0x8E,0x49,0x11,0x47,0x3A,0x80,0xA0,0x73,0x1C,0xF6,0xFF,0x34,0x5B };
@@ -522,6 +515,43 @@ enum _BMDInternalKeyingAncillaryDataSource {
     bmdInternalKeyingUsesAncillaryDataFromKeyFrame               = /* 'ikak' */ 0x696B616B
 };
 
+/* Enum BMDAudioOutputXLRDelayType - Audio output XLR delay types */
+
+typedef uint32_t BMDAudioOutputXLRDelayType;
+enum _BMDAudioOutputXLRDelayType {
+    bmdAudioOutputXLRDelayTypeTime                               = /* 'dtms' */ 0x64746D73,
+    bmdAudioOutputXLRDelayTypeFrames                             = /* 'dtfr' */ 0x64746672
+};
+
+/* Enum BMDLanguage - Languages */
+
+typedef uint32_t BMDLanguage;
+enum _BMDLanguage {
+    bmdLanguageEnglish                                           = /* 'enUS' */ 0x656E5553,
+    bmdLanguageSimplifiedChinese                                 = /* 'zhCN' */ 0x7A68434E,
+    bmdLanguageJapanese                                          = /* 'jaJP' */ 0x6A614A50,
+    bmdLanguageKorean                                            = /* 'koKR' */ 0x6B6F4B52,
+    bmdLanguageSpanish                                           = /* 'esES' */ 0x65734553,
+    bmdLanguageGerman                                            = /* 'deDE' */ 0x64654445,
+    bmdLanguageFrench                                            = /* 'frFR' */ 0x66724652,
+    bmdLanguageRussian                                           = /* 'ruRU' */ 0x72755255,
+    bmdLanguageItalian                                           = /* 'itIT' */ 0x69744954,
+    bmdLanguagePortuguese                                        = /* 'ptBR' */ 0x70744252,
+    bmdLanguageTurkish                                           = /* 'trTR' */ 0x74725452,
+    bmdLanguagePolish                                            = /* 'plPL' */ 0x706C504C,
+    bmdLanguageUkrainian                                         = /* 'ukUA' */ 0x756B5541
+};
+
+/* Enum BMDAudioMeterType - Audio meter type */
+
+typedef uint32_t BMDAudioMeterType;
+enum _BMDAudioMeterType {
+    bmdAudioMeterTypeVUMinus18db                                 = /* 'vu18' */ 0x76753138,
+    bmdAudioMeterTypeVUMinus20db                                 = /* 'vu20' */ 0x76753230,
+    bmdAudioMeterTypePPMMinus18db                                = /* 'pm18' */ 0x706D3138,
+    bmdAudioMeterTypePPMMinus20db                                = /* 'pm20' */ 0x706D3230
+};
+
 /* Enum BMDDeckLinkAttributeID - DeckLink Attribute ID */
 
 typedef uint32_t BMDDeckLinkAttributeID;
@@ -554,6 +584,7 @@ enum _BMDDeckLinkAttributeID {
     BMDDeckLinkSupportsSynchronizeToCaptureGroup                 = /* 'stcg' */ 0x73746367,
     BMDDeckLinkSupportsSynchronizeToPlaybackGroup                = /* 'stpg' */ 0x73747067,
     BMDDeckLinkHasMonitorOut                                     = /* 'fmoo' */ 0x666D6F6F,
+    BMDDeckLinkSupportsExtendedDesktop                           = /* 'dtop' */ 0x64746F70,
 
     /* Integers */
 
@@ -582,6 +613,8 @@ enum _BMDDeckLinkAttributeID {
     BMDDeckLinkMinimumPrerollFrames                              = /* 'mprf' */ 0x6D707266,
     BMDDeckLinkSupportedDynamicRange                             = /* 'sudr' */ 0x73756472,
     BMDDeckLinkMezzanineType                                     = /* 'mezt' */ 0x6D657A74,
+    BMDDeckLinkXLRDelayMsMaximum                                 = /* 'xdtx' */ 0x78647478,
+    BMDDeckLinkXLRDelayFramesMaximum                             = /* 'xdfx' */ 0x78646678,
 
     /* Floats */
 
@@ -812,13 +845,11 @@ class IDeckLinkIPFlowSetting;
 class IDeckLinkIPFlow;
 class IDeckLinkIPFlowIterator;
 class IDeckLinkOutput;
-class IDeckLinkMacOutput;
 class IDeckLinkInput;
 class IDeckLinkIPExtensions;
 class IDeckLinkHDMIInputEDID;
 class IDeckLinkEncoderInput;
 class IDeckLinkVideoBuffer;
-class IDeckLinkMacVideoBuffer;
 class IDeckLinkVideoFrame;
 class IDeckLinkMutableVideoFrame;
 class IDeckLinkVideoFrame3DExtensions;
@@ -835,9 +866,7 @@ class IDeckLinkEncoderAudioPacket;
 class IDeckLinkH265NALPacket;
 class IDeckLinkAudioInputPacket;
 class IDeckLinkScreenPreviewCallback;
-class IDeckLinkCocoaScreenPreviewCallback;
 class IDeckLinkGLScreenPreviewHelper;
-class IDeckLinkMetalScreenPreviewHelper;
 class IDeckLinkNotificationCallback;
 class IDeckLinkNotification;
 class IDeckLinkProfileAttributes;
@@ -934,7 +963,7 @@ public:
     virtual HRESULT GetFlag (/* in */ BMDDeckLinkAPIInformationID cfgID, /* out */ bool* value) = 0;
     virtual HRESULT GetInt (/* in */ BMDDeckLinkAPIInformationID cfgID, /* out */ int64_t* value) = 0;
     virtual HRESULT GetFloat (/* in */ BMDDeckLinkAPIInformationID cfgID, /* out */ double* value) = 0;
-    virtual HRESULT GetString (/* in */ BMDDeckLinkAPIInformationID cfgID, /* out */ CFStringRef* value) = 0;
+    virtual HRESULT GetString (/* in */ BMDDeckLinkAPIInformationID cfgID, /* out */ const char** value) = 0;
 
 protected:
     virtual ~IDeckLinkAPIInformation () {} // call Release method to drop reference count
@@ -948,7 +977,7 @@ public:
     virtual HRESULT GetInt (/* in */ BMDDeckLinkIPFlowAttributeID attrID, /* out */ int64_t* value) = 0;
     virtual HRESULT GetFlag (/* in */ BMDDeckLinkIPFlowAttributeID attrID, /* out */ bool* value) = 0;
     virtual HRESULT GetFloat (/* in */ BMDDeckLinkIPFlowAttributeID attrID, /* out */ double* value) = 0;
-    virtual HRESULT GetString (/* in */ BMDDeckLinkIPFlowAttributeID attrID, /* out */ CFStringRef* value) = 0;
+    virtual HRESULT GetString (/* in */ BMDDeckLinkIPFlowAttributeID attrID, /* out */ const char** value) = 0;
 
 protected:
     virtual ~IDeckLinkIPFlowAttributes () {} // call Release method to drop reference count
@@ -962,7 +991,7 @@ public:
     virtual HRESULT GetInt (/* in */ BMDDeckLinkIPFlowStatusID statusID, /* out */ int64_t* value) = 0;
     virtual HRESULT GetFlag (/* in */ BMDDeckLinkIPFlowStatusID statusID, /* out */ bool* value) = 0;
     virtual HRESULT GetFloat (/* in */ BMDDeckLinkIPFlowStatusID statusID, /* out */ double* value) = 0;
-    virtual HRESULT GetString (/* in */ BMDDeckLinkIPFlowStatusID statusID, /* out */ CFStringRef* value) = 0;
+    virtual HRESULT GetString (/* in */ BMDDeckLinkIPFlowStatusID statusID, /* out */ const char** value) = 0;
 
 protected:
     virtual ~IDeckLinkIPFlowStatus () {} // call Release method to drop reference count
@@ -976,11 +1005,11 @@ public:
     virtual HRESULT GetInt (/* in */ BMDDeckLinkIPFlowSettingID settingID, /* out */ int64_t* value) = 0;
     virtual HRESULT GetFlag (/* in */ BMDDeckLinkIPFlowSettingID settingID, /* out */ bool* value) = 0;
     virtual HRESULT GetFloat (/* in */ BMDDeckLinkIPFlowSettingID settingID, /* out */ double* value) = 0;
-    virtual HRESULT GetString (/* in */ BMDDeckLinkIPFlowSettingID settingID, /* out */ CFStringRef* value) = 0;
+    virtual HRESULT GetString (/* in */ BMDDeckLinkIPFlowSettingID settingID, /* out */ const char** value) = 0;
     virtual HRESULT SetInt (/* in */ BMDDeckLinkIPFlowSettingID settingID, /* in */ int64_t value) = 0;
     virtual HRESULT SetFlag (/* in */ BMDDeckLinkIPFlowSettingID settingID, /* in */ bool value) = 0;
     virtual HRESULT SetFloat (/* in */ BMDDeckLinkIPFlowSettingID settingID, /* in */ double value) = 0;
-    virtual HRESULT SetString (/* in */ BMDDeckLinkIPFlowSettingID settingID, /* in */ CFStringRef value) = 0;
+    virtual HRESULT SetString (/* in */ BMDDeckLinkIPFlowSettingID settingID, /* in */ const char* value) = 0;
 
 protected:
     virtual ~IDeckLinkIPFlowSetting () {} // call Release method to drop reference count
@@ -1059,17 +1088,6 @@ public:
 
 protected:
     virtual ~IDeckLinkOutput () {} // call Release method to drop reference count
-};
-
-/* Interface IDeckLinkMacOutput - Created by QueryInterface from IDeckLinkOutput. */
-
-class BMD_PUBLIC IDeckLinkMacOutput : public IUnknown
-{
-public:
-    virtual HRESULT CreateVideoFrameFromCVPixelBufferRef (/* in */ void* cvPixelBuffer, /* out */ IDeckLinkMutableVideoFrame** outFrame) = 0;
-
-protected:
-    virtual ~IDeckLinkMacOutput () {} // call Release method to drop reference count
 };
 
 /* Interface IDeckLinkInput - Created by QueryInterface from IDeckLink. */
@@ -1186,17 +1204,6 @@ protected:
     virtual ~IDeckLinkVideoBuffer () {} // call Release method to drop reference count
 };
 
-/* Interface IDeckLinkMacVideoBuffer - Video buffer helper functions for macOS; can be caller-implemented. */
-
-class BMD_PUBLIC IDeckLinkMacVideoBuffer : public IUnknown
-{
-public:
-    virtual HRESULT CreateCVPixelBufferRef (/* out */ void** cvPixelBuffer) = 0;
-
-protected:
-    virtual ~IDeckLinkMacVideoBuffer () {} // call Release method to drop reference count
-};
-
 /* Interface IDeckLinkVideoFrame - Interface to encapsulate a video frame; can be caller-implemented. */
 
 class BMD_PUBLIC IDeckLinkVideoFrame : public IUnknown
@@ -1250,7 +1257,7 @@ public:
     virtual HRESULT GetInt (/* in */ BMDDeckLinkFrameMetadataID metadataID, /* out */ int64_t* value) = 0;
     virtual HRESULT GetFloat (/* in */ BMDDeckLinkFrameMetadataID metadataID, /* out */ double* value) = 0;
     virtual HRESULT GetFlag (/* in */ BMDDeckLinkFrameMetadataID metadataID, /* out */ bool* value) = 0;
-    virtual HRESULT GetString (/* in */ BMDDeckLinkFrameMetadataID metadataID, /* out */ CFStringRef* value) = 0;
+    virtual HRESULT GetString (/* in */ BMDDeckLinkFrameMetadataID metadataID, /* out */ const char** value) = 0;
     virtual HRESULT GetBytes (/* in */ BMDDeckLinkFrameMetadataID metadataID, /* out */ void* buffer /* optional */, /* in, out */ uint32_t* bufferSize) = 0;
 
 protected:
@@ -1265,7 +1272,7 @@ public:
     virtual HRESULT SetInt (/* in */ BMDDeckLinkFrameMetadataID metadataID, /* in */ int64_t value) = 0;
     virtual HRESULT SetFloat (/* in */ BMDDeckLinkFrameMetadataID metadataID, /* in */ double value) = 0;
     virtual HRESULT SetFlag (/* in */ BMDDeckLinkFrameMetadataID metadataID, /* in */ bool value) = 0;
-    virtual HRESULT SetString (/* in */ BMDDeckLinkFrameMetadataID metadataID, /* in */ CFStringRef value) = 0;
+    virtual HRESULT SetString (/* in */ BMDDeckLinkFrameMetadataID metadataID, /* in */ const char* value) = 0;
     virtual HRESULT SetBytes (/* in */ BMDDeckLinkFrameMetadataID metadataID, /* in */ void* buffer, /* in */ uint32_t bufferSize) = 0;
 
 protected:
@@ -1413,16 +1420,6 @@ protected:
     virtual ~IDeckLinkScreenPreviewCallback () {} // call Release method to drop reference count
 };
 
-/* Interface IDeckLinkCocoaScreenPreviewCallback - Screen preview callback for Cocoa-based applications. Created with CreateCocoaScreenPreview */
-
-class BMD_PUBLIC IDeckLinkCocoaScreenPreviewCallback : public IDeckLinkScreenPreviewCallback
-{
-public:
-
-protected:
-    virtual ~IDeckLinkCocoaScreenPreviewCallback () {} // call Release method to drop reference count
-};
-
 /* Interface IDeckLinkGLScreenPreviewHelper - Created with CoCreateInstance on platforms with native COM support or from CreateOpenGLScreenPreviewHelper/CreateOpenGL3ScreenPreviewHelper on other platforms. */
 
 class BMD_PUBLIC IDeckLinkGLScreenPreviewHelper : public IUnknown
@@ -1438,20 +1435,6 @@ public:
 
 protected:
     virtual ~IDeckLinkGLScreenPreviewHelper () {} // call Release method to drop reference count
-};
-
-/* Interface IDeckLinkMetalScreenPreviewHelper - Created with CreateMetalScreenPreviewHelper(). */
-
-class BMD_PUBLIC IDeckLinkMetalScreenPreviewHelper : public IUnknown
-{
-public:
-    virtual HRESULT Initialize (/* in */ void* device) = 0;
-    virtual HRESULT Draw (/* in */ void* cmdBuffer, /* in */ void* renderPassDescriptor, /* in */ void* viewport) = 0;
-    virtual HRESULT SetFrame (/* in */ IDeckLinkVideoFrame* theFrame) = 0;
-    virtual HRESULT Set3DPreviewFormat (/* in */ BMD3DPreviewFormat previewFormat) = 0;
-
-protected:
-    virtual ~IDeckLinkMetalScreenPreviewHelper () {} // call Release method to drop reference count
 };
 
 /* Interface IDeckLinkNotificationCallback - DeckLink Notification Callback Interface */
@@ -1482,7 +1465,7 @@ public:
     virtual HRESULT GetFlag (/* in */ BMDDeckLinkAttributeID cfgID, /* out */ bool* value) = 0;
     virtual HRESULT GetInt (/* in */ BMDDeckLinkAttributeID cfgID, /* out */ int64_t* value) = 0;
     virtual HRESULT GetFloat (/* in */ BMDDeckLinkAttributeID cfgID, /* out */ double* value) = 0;
-    virtual HRESULT GetString (/* in */ BMDDeckLinkAttributeID cfgID, /* out */ CFStringRef* value) = 0;
+    virtual HRESULT GetString (/* in */ BMDDeckLinkAttributeID cfgID, /* out */ const char** value) = 0;
 
 protected:
     virtual ~IDeckLinkProfileAttributes () {} // call Release method to drop reference count
@@ -1546,7 +1529,7 @@ public:
     virtual HRESULT GetFlag (/* in */ BMDDeckLinkStatusID statusID, /* out */ bool* value) = 0;
     virtual HRESULT GetInt (/* in */ BMDDeckLinkStatusID statusID, /* out */ int64_t* value) = 0;
     virtual HRESULT GetFloat (/* in */ BMDDeckLinkStatusID statusID, /* out */ double* value) = 0;
-    virtual HRESULT GetString (/* in */ BMDDeckLinkStatusID statusID, /* out */ CFStringRef* value) = 0;
+    virtual HRESULT GetString (/* in */ BMDDeckLinkStatusID statusID, /* out */ const char** value) = 0;
     virtual HRESULT GetBytes (/* in */ BMDDeckLinkStatusID statusID, /* out */ void* buffer, /* in, out */ uint32_t* bufferSize) = 0;
 
 protected:
@@ -1613,8 +1596,6 @@ extern "C" {
     BMD_PUBLIC IDeckLinkAPIInformation* CreateDeckLinkAPIInformationInstance(void);
     BMD_PUBLIC IDeckLinkGLScreenPreviewHelper* CreateOpenGLScreenPreviewHelper(void);
     BMD_PUBLIC IDeckLinkGLScreenPreviewHelper* CreateOpenGL3ScreenPreviewHelper(void);	// Requires OpenGL 3.2 support and provides improved performance and color handling
-    BMD_PUBLIC IDeckLinkCocoaScreenPreviewCallback* CreateCocoaScreenPreview(/* in */ void* /* (NSView*)*/ parentView);
-    BMD_PUBLIC IDeckLinkMetalScreenPreviewHelper* CreateMetalScreenPreviewHelper(void);
     BMD_PUBLIC IDeckLinkVideoConversion* CreateVideoConversionInstance(void);
     BMD_PUBLIC IDeckLinkVideoFrameAncillaryPackets* CreateVideoFrameAncillaryPacketsInstance(void);	// For use when creating a custom IDeckLinkVideoFrame without wrapping IDeckLinkOutput::CreateVideoFrame
 

@@ -47,7 +47,6 @@
 #include "DeckLinkAPIVideoInput_v11_5_1.h"
 
 // Type Declarations
-
 BMD_CONST REFIID IID_IDeckLinkInput_v10_11                               = /* AF22762B-DFAC-4846-AA79-FA8883560995 */ {0xAF,0x22,0x76,0x2B,0xDF,0xAC,0x48,0x46,0xAA,0x79,0xFA,0x88,0x83,0x56,0x09,0x95};
 
 /* Interface IDeckLinkInput_v10_11 - DeckLink input interface. */

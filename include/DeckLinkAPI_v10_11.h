@@ -61,8 +61,8 @@ enum _BMDDisplayModeSupport_v10_11 {
 
 typedef uint32_t BMDDuplexMode_v10_11;
 enum _BMDDuplexMode_v10_11 {
-	bmdDuplexModeFull_v10_11                                        = 'fdup',
-	bmdDuplexModeHalf_v10_11                                        = 'hdup'
+    bmdDuplexModeFull_v10_11                                        = /* 'fdup' */ 0x66647570,
+    bmdDuplexModeHalf_v10_11                                        = /* 'hdup' */ 0x68647570
 };
 
 /* Enum BMDDeckLinkAttributeID_v10_11 - DeckLink Attribute ID */
@@ -86,10 +86,10 @@ enum  _BMDDeckLinkStatusID_v10_11 {
 
 typedef uint32_t BMDDuplexStatus_v10_11;
 enum _BMDDuplexStatus_v10_11 {
-    bmdDuplexFullDuplex_v10_11                                     = 'fdup',
-    bmdDuplexHalfDuplex_v10_11                                     = 'hdup',
-    bmdDuplexSimplex_v10_11                                        = 'splx',
-    bmdDuplexInactive_v10_11                                       = 'inac',
+    bmdDuplexFullDuplex_v10_11                                      = 'fdup',
+    bmdDuplexHalfDuplex_v10_11                                      = 'hdup',
+    bmdDuplexSimplex_v10_11                                         = 'splx',
+    bmdDuplexInactive_v10_11                                        = 'inac',
 };
 
 #if defined(__cplusplus)
@@ -102,7 +102,7 @@ public:
     virtual HRESULT GetFlag (/* in */ BMDDeckLinkAttributeID cfgID, /* out */ bool *value) = 0;
     virtual HRESULT GetInt (/* in */ BMDDeckLinkAttributeID cfgID, /* out */ int64_t *value) = 0;
     virtual HRESULT GetFloat (/* in */ BMDDeckLinkAttributeID cfgID, /* out */ double *value) = 0;
-    virtual HRESULT GetString (/* in */ BMDDeckLinkAttributeID cfgID, /* out */ CFStringRef *value) = 0;
+    virtual HRESULT GetString (/* in */ BMDDeckLinkAttributeID cfgID, /* out */ const char **value) = 0;
 
 protected:
     virtual ~IDeckLinkAttributes_v10_11 () {} // call Release method to drop reference count
@@ -121,13 +121,12 @@ public:
 
 extern "C" {
 
-    IDeckLinkIterator* BMD_PUBLIC CreateDeckLinkIteratorInstance_v10_11 (void);
-    IDeckLinkDiscovery* BMD_PUBLIC CreateDeckLinkDiscoveryInstance_v10_11 (void);
-    IDeckLinkAPIInformation* BMD_PUBLIC CreateDeckLinkAPIInformationInstance_v10_11 (void);
-    IDeckLinkGLScreenPreviewHelper* BMD_PUBLIC CreateOpenGLScreenPreviewHelper_v10_11 (void);
-    IDeckLinkCocoaScreenPreviewCallback* BMD_PUBLIC CreateCocoaScreenPreview_v10_11 (void* /* (NSView*) */ parentView);
-    IDeckLinkVideoConversion* BMD_PUBLIC CreateVideoConversionInstance_v10_11 (void);
-    IDeckLinkVideoFrameAncillaryPackets* BMD_PUBLIC CreateVideoFrameAncillaryPacketsInstance_v10_11 (void); // For use when creating a custom IDeckLinkVideoFrame without wrapping IDeckLinkOutput::CreateVideoFrame
+    BMD_PUBLIC IDeckLinkIterator* CreateDeckLinkIteratorInstance_v10_11 (void);
+    BMD_PUBLIC IDeckLinkDiscovery* CreateDeckLinkDiscoveryInstance_v10_11 (void);
+    BMD_PUBLIC IDeckLinkAPIInformation* CreateDeckLinkAPIInformationInstance_v10_11 (void);
+    BMD_PUBLIC IDeckLinkGLScreenPreviewHelper* CreateOpenGLScreenPreviewHelper_v10_11 (void);
+    BMD_PUBLIC IDeckLinkVideoConversion* CreateVideoConversionInstance_v10_11 (void);
+    BMD_PUBLIC IDeckLinkVideoFrameAncillaryPackets* CreateVideoFrameAncillaryPacketsInstance_v10_11 (void); // For use when creating a custom IDeckLinkVideoFrame without wrapping IDeckLinkOutput::CreateVideoFrame
 
 }
 
