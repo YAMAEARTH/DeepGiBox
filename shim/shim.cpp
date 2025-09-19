@@ -5,6 +5,7 @@
 #include <atomic>
 #include <mutex>
 #include <cstdio>
+#include <chrono>
 
 #if defined(_WIN32)
   #include <windows.h>
@@ -20,6 +21,10 @@
 #include "DeckLinkAPIConfiguration.h"
 #include "DeckLinkAPIVideoFrame_v14_2_1.h"
 #include "DeckLinkAPIScreenPreviewCallback_v14_2_1.h"
+
+#if !defined(__APPLE__)
+static const REFIID kIID_IUnknown = IID_IUnknown;
+#endif
 
 extern "C" {
 
@@ -169,6 +174,18 @@ static SharedFrame g_shared;
 static IDeckLinkScreenPreviewCallback* g_screenPreview = nullptr; // Cocoa Screen Preview (NSView)
 static std::atomic<uint64_t> g_preview_seq{0};
 
+// OpenGL preview helper (cross-platform)
+static IDeckLinkGLScreenPreviewHelper* g_glPreview = nullptr;
+static IDeckLinkVideoFrame* g_glFrame = nullptr;
+static IDeckLinkScreenPreviewCallback* g_glCallback = nullptr;
+static std::mutex g_glMutex;
+static std::mutex g_glFrameMutex;
+static std::atomic<uint64_t> g_gl_seq{0};
+static std::atomic<uint64_t> g_gl_last_arrival_ns{0};
+static std::atomic<uint64_t> g_gl_last_latency_ns{0};
+
+extern "C" void decklink_preview_gl_disable();
+
 class CaptureCallback : public IDeckLinkInputCallback {
 public:
     CaptureCallback() : m_ref(1) {}
@@ -176,9 +193,21 @@ public:
     // IUnknown
     HRESULT QueryInterface(REFIID iid, void** ppv) override {
         if (!ppv) return E_POINTER;
-        // macOS style IUnknown UUID
+#if defined(__APPLE__)
+        // macOS style IUnknown UUID เปรียบเทียบผ่าน CoreFoundation
         CFUUIDBytes iunknown = CFUUIDGetUUIDBytes(IUnknownUUID);
-        if (memcmp(&iid, &iunknown, sizeof(REFIID)) == 0) {
+        if (memcmp(&iid, &iunknown, sizeof(CFUUIDBytes)) == 0) {
+            *ppv = static_cast<IUnknown*>(this);
+            AddRef();
+            return S_OK;
+        }
+        if (memcmp(&iid, &IID_IDeckLinkInputCallback, sizeof(CFUUIDBytes)) == 0) {
+            *ppv = static_cast<IDeckLinkInputCallback*>(this);
+            AddRef();
+            return S_OK;
+        }
+#else
+        if (memcmp(&iid, &kIID_IUnknown, sizeof(REFIID)) == 0) {
             *ppv = static_cast<IUnknown*>(this);
             AddRef();
             return S_OK;
@@ -188,6 +217,7 @@ public:
             AddRef();
             return S_OK;
         }
+#endif
         *ppv = nullptr;
         return E_NOINTERFACE;
     }
@@ -392,8 +422,10 @@ public:
                 vf->Release();
                 bytes = nullptr;
             }
-        } else {
-            // Fallback path on macOS: get CVPixelBuffer and read base address
+        }
+#if defined(__APPLE__)
+        else {
+            // เส้นทางเฉพาะ macOS: ดึง CVPixelBuffer แล้วอ่านตำแหน่งข้อมูลโดยตรง
             IDeckLinkMacVideoBuffer* macBuf = nullptr;
             if (videoFrame->QueryInterface(IID_IDeckLinkMacVideoBuffer, (void**)&macBuf) == S_OK && macBuf) {
                 CVPixelBufferRef pb = nullptr;
@@ -416,6 +448,7 @@ public:
                 macBuf->Release();
             }
         }
+#endif
         if (!bytes) {
             fprintf(stderr, "[shim] GetBytes failed (qrv=0x%08x, pix=0x%x)\n", (unsigned)qrv, (unsigned)pixfmt);
             if (vf) vf->Release();
@@ -486,6 +519,70 @@ private:
 };
 
 static CaptureCallback* g_callback = nullptr;
+
+class GLPreviewCallback : public IDeckLinkScreenPreviewCallback {
+public:
+    GLPreviewCallback() : m_ref(1) {}
+
+    HRESULT QueryInterface(REFIID iid, void** ppv) override {
+        if (!ppv) return E_POINTER;
+#if defined(__APPLE__)
+        CFUUIDBytes iunknown = CFUUIDGetUUIDBytes(IUnknownUUID);
+        if (memcmp(&iid, &iunknown, sizeof(CFUUIDBytes)) == 0) {
+            *ppv = static_cast<IUnknown*>(this);
+            AddRef();
+            return S_OK;
+        }
+        if (memcmp(&iid, &IID_IDeckLinkScreenPreviewCallback, sizeof(CFUUIDBytes)) == 0) {
+            *ppv = static_cast<IDeckLinkScreenPreviewCallback*>(this);
+            AddRef();
+            return S_OK;
+        }
+#else
+        if (memcmp(&iid, &kIID_IUnknown, sizeof(REFIID)) == 0) {
+            *ppv = static_cast<IUnknown*>(this);
+            AddRef();
+            return S_OK;
+        }
+        if (memcmp(&iid, &IID_IDeckLinkScreenPreviewCallback, sizeof(REFIID)) == 0) {
+            *ppv = static_cast<IDeckLinkScreenPreviewCallback*>(this);
+            AddRef();
+            return S_OK;
+        }
+#endif
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+
+    ULONG AddRef() override { return ++m_ref; }
+
+    ULONG Release() override {
+        ULONG r = --m_ref;
+        if (r == 0) delete this;
+        return r;
+    }
+
+    HRESULT DrawFrame(IDeckLinkVideoFrame* frame) override {
+        std::lock_guard<std::mutex> lk(g_glFrameMutex);
+        if (g_glFrame) {
+            g_glFrame->Release();
+            g_glFrame = nullptr;
+        }
+        if (frame) {
+            frame->AddRef();
+            g_glFrame = frame;
+        }
+        g_gl_seq.fetch_add(1, std::memory_order_relaxed);
+        auto now = std::chrono::steady_clock::now().time_since_epoch();
+        g_gl_last_arrival_ns.store(
+            (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(now).count(),
+            std::memory_order_relaxed);
+        return S_OK;
+    }
+
+private:
+    std::atomic<ULONG> m_ref;
+};
 
 static bool pick_supported_mode(IDeckLinkInput* input, BMDVideoConnection connection, BMDDisplayMode& outMode, BMDPixelFormat& outPix) {
     if (!input) return false;
@@ -719,6 +816,7 @@ extern "C" bool decklink_capture_get_frame(CaptureFrame* out) {
 }
 
 extern "C" void decklink_capture_close() {
+    decklink_preview_gl_disable();
     if (g_input) {
         g_input->StopStreams();
         g_input->DisableVideoInput();
@@ -776,4 +874,125 @@ extern "C" void decklink_preview_detach() {
 
 extern "C" uint64_t decklink_preview_seq() {
     return g_preview_seq.load(std::memory_order_relaxed);
+}
+
+extern "C" bool decklink_preview_gl_create() {
+    std::lock_guard<std::mutex> lk(g_glMutex);
+    if (g_glPreview)
+        return true;
+    IDeckLinkGLScreenPreviewHelper* helper = CreateOpenGLScreenPreviewHelper();
+    if (!helper) {
+        fprintf(stderr, "[shim] CreateOpenGLScreenPreviewHelper failed\n");
+        return false;
+    }
+    g_glPreview = helper;
+    g_gl_seq.store(0, std::memory_order_relaxed);
+    g_gl_last_arrival_ns.store(0, std::memory_order_relaxed);
+    g_gl_last_latency_ns.store(0, std::memory_order_relaxed);
+    return true;
+}
+
+extern "C" bool decklink_preview_gl_initialize_gl() {
+    std::lock_guard<std::mutex> lk(g_glMutex);
+    if (!g_glPreview)
+        return false;
+    HRESULT hr = g_glPreview->InitializeGL();
+    if (hr != S_OK) {
+        fprintf(stderr, "[shim] IDeckLinkGLScreenPreviewHelper::InitializeGL failed hr=0x%08x\n", (unsigned)hr);
+        return false;
+    }
+    return true;
+}
+
+extern "C" bool decklink_preview_gl_enable() {
+    std::lock_guard<std::mutex> lk(g_glMutex);
+    if (!g_glPreview) {
+        if (!decklink_preview_gl_create())
+            return false;
+    }
+    if (!g_glCallback)
+        g_glCallback = new GLPreviewCallback();
+    if (!g_input) {
+        fprintf(stderr, "[shim] decklink_preview_gl_enable: input not initialized\n");
+        return false;
+    }
+    HRESULT hr = g_input->SetScreenPreviewCallback(g_glCallback);
+    if (hr != S_OK) {
+        fprintf(stderr, "[shim] SetScreenPreviewCallback(GL) failed hr=0x%08x\n", (unsigned)hr);
+        return false;
+    }
+    return true;
+}
+
+extern "C" bool decklink_preview_gl_render() {
+    IDeckLinkVideoFrame* frame = nullptr;
+    uint64_t arrival = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_glFrameMutex);
+        if (g_glFrame) {
+            g_glFrame->AddRef();
+            frame = g_glFrame;
+            arrival = g_gl_last_arrival_ns.load(std::memory_order_relaxed);
+        }
+    }
+    if (!frame || !g_glPreview)
+        return false;
+
+    HRESULT hr = g_glPreview->SetFrame(frame);
+    frame->Release();
+    if (hr != S_OK) {
+        fprintf(stderr, "[shim] SetFrame failed hr=0x%08x\n", (unsigned)hr);
+        return false;
+    }
+    hr = g_glPreview->PaintGL();
+    if (hr != S_OK) {
+        fprintf(stderr, "[shim] PaintGL failed hr=0x%08x\n", (unsigned)hr);
+        return false;
+    }
+    auto now_ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (arrival != 0 && now_ns >= arrival)
+        g_gl_last_latency_ns.store(now_ns - arrival, std::memory_order_relaxed);
+    return true;
+}
+
+extern "C" void decklink_preview_gl_disable() {
+    if (g_input)
+        (void)g_input->SetScreenPreviewCallback(nullptr);
+    {
+        std::lock_guard<std::mutex> lk(g_glFrameMutex);
+        if (g_glFrame) {
+            g_glFrame->Release();
+            g_glFrame = nullptr;
+        }
+    }
+    std::lock_guard<std::mutex> lk(g_glMutex);
+    if (g_glCallback) {
+        g_glCallback->Release();
+        g_glCallback = nullptr;
+    }
+    g_gl_seq.store(0, std::memory_order_relaxed);
+    g_gl_last_arrival_ns.store(0, std::memory_order_relaxed);
+    g_gl_last_latency_ns.store(0, std::memory_order_relaxed);
+}
+
+extern "C" void decklink_preview_gl_destroy() {
+    decklink_preview_gl_disable();
+    std::lock_guard<std::mutex> lk(g_glMutex);
+    if (g_glPreview) {
+        g_glPreview->Release();
+        g_glPreview = nullptr;
+    }
+}
+
+extern "C" uint64_t decklink_preview_gl_seq() {
+    return g_gl_seq.load(std::memory_order_relaxed);
+}
+
+extern "C" uint64_t decklink_preview_gl_last_timestamp_ns() {
+    return g_gl_last_arrival_ns.load(std::memory_order_relaxed);
+}
+
+extern "C" uint64_t decklink_preview_gl_last_latency_ns() {
+    return g_gl_last_latency_ns.load(std::memory_order_relaxed);
 }

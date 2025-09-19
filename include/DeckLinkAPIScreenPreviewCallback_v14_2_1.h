@@ -47,7 +47,6 @@
 // Type Declarations
 
 BMD_CONST REFIID IID_IDeckLinkScreenPreviewCallback_v14_2_1           = /* B1D3F49A-85FE-4C5D-95C8-0B5D5DCCD438 */ { 0xB1, 0xD3, 0xF4, 0x9A, 0x85, 0xFE, 0x4C, 0x5D, 0x95, 0xC8, 0x0B, 0x5D, 0x5D, 0xCC, 0xD4, 0x38 };
-BMD_CONST REFIID IID_IDeckLinkCocoaScreenPreviewCallback_v14_2_1      = /* D174152F-8F96-4C07-83A5-DD5F5AF0A2AA */ { 0xD1,0x74,0x15,0x2F,0x8F,0x96,0x4C,0x07,0x83,0xA5,0xDD,0x5F,0x5A,0xF0,0xA2,0xAA };
 
 /* Interface IDeckLinkScreenPreviewCallback_v14_2_1 - Screen preview callback */
 
@@ -58,16 +57,6 @@ public:
 
 protected:
     virtual ~IDeckLinkScreenPreviewCallback_v14_2_1 () {} // call Release method to drop reference count
-};
-
-/* Interface IDeckLinkCocoaScreenPreviewCallback_v14_2_1 - Screen preview callback for Cocoa-based applications. Created with CreateCocoaScreenPreview */
-
-class BMD_PUBLIC IDeckLinkCocoaScreenPreviewCallback_v14_2_1 : public IDeckLinkScreenPreviewCallback_v14_2_1
-{
-public:
-
-protected:
-	virtual ~IDeckLinkCocoaScreenPreviewCallback_v14_2_1 () {} // call Release method to drop reference count
 };
 
 #endif /* defined(BMD_DECKLINKAPISCREENPREVIEWCALLBACK_v14_2_1_H) */

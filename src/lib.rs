@@ -29,9 +29,7 @@ pub fn devicelist() -> Vec<String> {
         if p.is_null() {
             continue;
         }
-        let s = unsafe { CStr::from_ptr(p) }
-            .to_string_lossy()
-            .into_owned();
+        let s = unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned();
         out.push(s);
     }
 

@@ -49,11 +49,11 @@ BMD_CONST REFIID IID_IDeckLinkEncoderConfiguration_v10_5          = /* 67455668-
 
 // Forward Declarations
 
-class IDeckLinkConfiguration_v10_5;
+class IDeckLinkEncoderConfiguration_v10_5;
 
 /* Interface IDeckLinkEncoderConfiguration_v10_5 - DeckLink Encoder Configuration interface. Obtained from IDeckLinkEncoderInput */
 
-class IDeckLinkEncoderConfiguration_v10_5 : public IUnknown
+class BMD_PUBLIC IDeckLinkEncoderConfiguration_v10_5 : public IUnknown
 {
 public:
     virtual HRESULT SetFlag (/* in */ BMDDeckLinkEncoderConfigurationID cfgID, /* in */ bool value) = 0;
@@ -62,8 +62,8 @@ public:
     virtual HRESULT GetInt (/* in */ BMDDeckLinkEncoderConfigurationID cfgID, /* out */ int64_t *value) = 0;
     virtual HRESULT SetFloat (/* in */ BMDDeckLinkEncoderConfigurationID cfgID, /* in */ double value) = 0;
     virtual HRESULT GetFloat (/* in */ BMDDeckLinkEncoderConfigurationID cfgID, /* out */ double *value) = 0;
-    virtual HRESULT SetString (/* in */ BMDDeckLinkEncoderConfigurationID cfgID, /* in */ CFStringRef value) = 0;
-    virtual HRESULT GetString (/* in */ BMDDeckLinkEncoderConfigurationID cfgID, /* out */ CFStringRef *value) = 0;
+    virtual HRESULT SetString (/* in */ BMDDeckLinkEncoderConfigurationID cfgID, /* in */ const char *value) = 0;
+    virtual HRESULT GetString (/* in */ BMDDeckLinkEncoderConfigurationID cfgID, /* out */ const char **value) = 0;
     virtual HRESULT GetDecoderConfigurationInfo (/* out */ void *buffer, /* in */ long bufferSize, /* out */ long *returnedSize) = 0;
 
 protected:

@@ -58,11 +58,11 @@ enum  _BMDDeckLinkConfigurationID_v10_2 {
 
 typedef uint32_t BMDAudioConnection_v10_2;
 enum _BMDAudioConnection_v10_2 {
-    bmdAudioConnectionEmbedded_v10_2                             = 'embd',
-    bmdAudioConnectionAESEBU_v10_2                               = 'aes ',
-    bmdAudioConnectionAnalog_v10_2                               = 'anlg',
-    bmdAudioConnectionAnalogXLR_v10_2                            = 'axlr',
-    bmdAudioConnectionAnalogRCA_v10_2                            = 'arca'
+    bmdAudioConnectionEmbedded_v10_2                             = /* 'embd' */ 0x656D6264,
+    bmdAudioConnectionAESEBU_v10_2                               = /* 'aes ' */ 0x61657320,
+    bmdAudioConnectionAnalog_v10_2                               = /* 'anlg' */ 0x616E6C67,
+    bmdAudioConnectionAnalogXLR_v10_2                            = /* 'axlr' */ 0x61786C72,
+    bmdAudioConnectionAnalogRCA_v10_2                            = /* 'arca' */ 0x61726361
 };
 
 #endif /* defined(BMD_DECKLINKAPI_v10_2_H) */

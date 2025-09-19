@@ -1,5 +1,5 @@
 /* -LICENSE-START-
-** Copyright (c) 2024 Blackmagic Design
+** Copyright (c) 2025 Blackmagic Design
 **
 ** Permission is hereby granted, free of charge, to any person or organization
 ** obtaining a copy of the software and accompanying documentation covered by
@@ -192,7 +192,7 @@ public:
     virtual HRESULT StepBack (/* out */ BMDDeckControlError* error) = 0;
     virtual HRESULT Jog (/* in */ double rate, /* out */ BMDDeckControlError* error) = 0;
     virtual HRESULT Shuttle (/* in */ double rate, /* out */ BMDDeckControlError* error) = 0;
-    virtual HRESULT GetTimecodeString (/* out */ CFStringRef* currentTimeCode, /* out */ BMDDeckControlError* error) = 0;
+    virtual HRESULT GetTimecodeString (/* out */ const char** currentTimeCode, /* out */ BMDDeckControlError* error) = 0;
     virtual HRESULT GetTimecode (/* out */ IDeckLinkTimecode** currentTimecode, /* out */ BMDDeckControlError* error) = 0;
     virtual HRESULT GetTimecodeBCD (/* out */ BMDTimecodeBCD* currentTimecode, /* out */ BMDDeckControlError* error) = 0;
     virtual HRESULT SetPreroll (/* in */ uint32_t prerollSeconds) = 0;

@@ -103,8 +103,8 @@ class BMD_PUBLIC IDeckLinkVideoFrameMetadataExtensions_v11_5 : public IUnknown
 public:
     virtual HRESULT GetInt (/* in */ BMDDeckLinkFrameMetadataID_v11_5 metadataID, /* out */ int64_t *value) = 0;
     virtual HRESULT GetFloat (/* in */ BMDDeckLinkFrameMetadataID_v11_5 metadataID, /* out */ double *value) = 0;
-    virtual HRESULT GetFlag (/* in */ BMDDeckLinkFrameMetadataID_v11_5 metadataID, /* out */ bool *value) = 0;
-    virtual HRESULT GetString (/* in */ BMDDeckLinkFrameMetadataID_v11_5 metadataID, /* out */ CFStringRef *value) = 0;
+    virtual HRESULT GetFlag (/* in */ BMDDeckLinkFrameMetadataID_v11_5 metadataID, /* out */ bool* value) = 0;
+    virtual HRESULT GetString (/* in */ BMDDeckLinkFrameMetadataID_v11_5 metadataID, /* out */ const char **value) = 0;
 
 protected:
     virtual ~IDeckLinkVideoFrameMetadataExtensions_v11_5 () {} // call Release method to drop reference count

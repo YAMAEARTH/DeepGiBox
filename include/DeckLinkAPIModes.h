@@ -1,5 +1,5 @@
 /* -LICENSE-START-
-** Copyright (c) 2024 Blackmagic Design
+** Copyright (c) 2025 Blackmagic Design
 **
 ** Permission is hereby granted, free of charge, to any person or organization
 ** obtaining a copy of the software and accompanying documentation covered by
@@ -269,7 +269,7 @@ protected:
 class BMD_PUBLIC IDeckLinkDisplayMode : public IUnknown
 {
 public:
-    virtual HRESULT GetName (/* out */ CFStringRef* name) = 0;
+    virtual HRESULT GetName (/* out */ const char** name) = 0;
     virtual BMDDisplayMode GetDisplayMode (void) = 0;
     virtual long GetWidth (void) = 0;
     virtual long GetHeight (void) = 0;

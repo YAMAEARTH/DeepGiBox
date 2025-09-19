@@ -7,9 +7,14 @@ build = "build.rs"
 [dependencies]
 libc = "0.2"
 minifb = "0.24"
-winit = "0.29"
+winit = { version = "0.29", default-features = false, features = ["rwh_05", "rwh_06", "x11", "wayland", "wayland-dlopen", "wayland-csd-adwaita"] }
 wgpu = "0.19"
 pollster = "0.3"
+glutin = "0.31"
+glutin-winit = "0.4"
+glow = "0.13"
+anyhow = "1.0"
+raw-window-handle = "0.5"
 
 [build-dependencies]
 cc = "1.0"
@@ -29,3 +34,7 @@ path = "src/bin/capture_preview_wgpu.rs"
 [[bin]]
 name = "capture_preview_screen"
 path = "src/bin/capture_preview_screen.rs"
+
+[[bin]]
+name = "capture_preview_gl"
+path = "src/bin/capture_preview_gl.rs"

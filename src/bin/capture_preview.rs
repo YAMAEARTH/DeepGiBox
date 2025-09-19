@@ -57,7 +57,10 @@ fn main() {
     let mut height: usize = 360;
     let mut buffer: Vec<u32> = vec![0xFF202020; width * height];
     let mut window: Window = Window::new(
-        &format!("DeckLink Preview - {}x{} (waiting for signal)", width, height),
+        &format!(
+            "DeckLink Preview - {}x{} (waiting for signal)",
+            width, height
+        ),
         width,
         height,
         WindowOptions::default(),
@@ -74,7 +77,12 @@ fn main() {
         let ok = unsafe { decklink_capture_get_frame(cf.as_mut_ptr()) };
         if ok {
             let cf = unsafe { cf.assume_init() };
-            if cf.seq != 0 && cf.seq != last_seq && !cf.data.is_null() && cf.width > 0 && cf.height > 0 {
+            if cf.seq != 0
+                && cf.seq != last_seq
+                && !cf.data.is_null()
+                && cf.width > 0
+                && cf.height > 0
+            {
                 last_seq = cf.seq;
                 let w = cf.width as usize;
                 let h = cf.height as usize;

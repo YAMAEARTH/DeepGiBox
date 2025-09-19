@@ -50,7 +50,7 @@ enum _BMDDeckLinkStatusID_v11_5_1 {
 
     /* Video output flags */
 
-    bmdDeckLinkStatusDetectedVideoInputFlags_v11_5_1                     = /* 'dvif' */ 0x64766966,
+	bmdDeckLinkStatusDetectedVideoInputFlags_v11_5_1                     = /* 'dvif' */ 0x64766966,
 
 };
 

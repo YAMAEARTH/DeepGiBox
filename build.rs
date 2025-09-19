@@ -6,41 +6,88 @@ fn main() {
     let sdk_root = env::var("DECKLINK_SDK_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| manifest_dir.parent().unwrap().to_path_buf());
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_else(|_| String::from(""));
 
-    // Ensure the linker searches the standard macOS Frameworks directory
-    println!("cargo:rustc-link-search=framework=/Library/Frameworks");
-    println!("cargo:rustc-link-lib=framework=DeckLinkAPI");
-    println!("cargo:rustc-link-lib=framework=CoreFoundation");
-    println!("cargo:rustc-link-lib=framework=CoreVideo");
-
-    let include_candidates = [
+    let mut include_candidates = vec![
+        manifest_dir.join("include"),
         manifest_dir.join("shim").join("include"),
-        sdk_root.join("Mac").join("include"),
-        sdk_root.join("include"),
-        PathBuf::from("/Library/Frameworks/DeckLinkAPI.framework/Headers"),
     ];
-
     let mut build = cc::Build::new();
-    build.cpp(true)
+    build
+        .cpp(true)
         .flag_if_supported("-std=c++17")
         .file("shim/shim.cpp")
         .warnings(true);
 
-    // On macOS, link-time symbols like CreateDeckLinkIteratorInstance are
-    // versioned in the framework. We must compile DeckLinkAPIDispatch.cpp
-    // from the SDK to resolve them via CFBundle at runtime.
-    let dispatch_candidates = [
-        manifest_dir.join("include").join("DeckLinkAPIDispatch.cpp"),
-        manifest_dir.join("shim").join("include").join("DeckLinkAPIDispatch.cpp"),
-        sdk_root.join("rust").join("include").join("DeckLinkAPIDispatch.cpp"),
-        sdk_root.join("include").join("DeckLinkAPIDispatch.cpp"),
-        PathBuf::from("/Library/Frameworks/DeckLinkAPI.framework/Headers/DeckLinkAPIDispatch.cpp"),
-    ];
-    if let Some(dispatch) = dispatch_candidates.iter().find(|p| p.exists()) {
-        println!("cargo:warning=cc adding: {}", dispatch.display());
-        build.file(dispatch);
-    } else {
-        println!("cargo:warning=DeckLinkAPIDispatch.cpp not found in typical locations; relying on framework symbols only");
+    match target_os.as_str() {
+        "macos" => {
+            println!("cargo:rustc-link-search=framework=/Library/Frameworks");
+            println!("cargo:rustc-link-lib=framework=DeckLinkAPI");
+            println!("cargo:rustc-link-lib=framework=CoreFoundation");
+            println!("cargo:rustc-link-lib=framework=CoreVideo");
+
+            include_candidates.push(sdk_root.join("Mac").join("include"));
+            include_candidates.push(sdk_root.join("include"));
+            include_candidates.push(PathBuf::from(
+                "/Library/Frameworks/DeckLinkAPI.framework/Headers",
+            ));
+        }
+        "linux" => {
+            println!("cargo:rustc-link-lib=dylib=DeckLinkAPI");
+
+            let lib_candidates = [
+                sdk_root.join("Linux").join("x86_64").join("lib"),
+                sdk_root.join("Linux").join("bin"),
+                sdk_root.join("Linux").join("bin").join("x86_64"),
+                sdk_root.join("Linux").join("x86_64"),
+                sdk_root.join("Linux").join("lib"),
+                sdk_root.join("Linux").join("bin").join("intel"),
+                sdk_root.join("Linux"),
+                sdk_root.join("lib"),
+                PathBuf::from("/usr/local/lib"),
+                PathBuf::from("/usr/lib"),
+            ];
+            for dir in lib_candidates.iter().filter(|p| p.exists()) {
+                println!("cargo:rustc-link-search=native={}", dir.display());
+            }
+
+            include_candidates.push(sdk_root.join("Linux").join("include"));
+            include_candidates.push(sdk_root.join("include"));
+            include_candidates.push(PathBuf::from("/usr/include/DeckLink"));
+        }
+        _ => {
+            println!("cargo:rustc-link-lib=dylib=DeckLinkAPI");
+            include_candidates.push(sdk_root.join("include"));
+        }
+    }
+
+    if matches!(target_os.as_str(), "macos" | "linux") {
+        // คอมไพล์ DeckLinkAPIDispatch.cpp เพื่อเรียกใช้สัญลักษณ์ที่มี version suffix ในไลบรารี
+        let dispatch_candidates = [
+            manifest_dir.join("include").join("DeckLinkAPIDispatch.cpp"),
+            manifest_dir
+                .join("shim")
+                .join("include")
+                .join("DeckLinkAPIDispatch.cpp"),
+            sdk_root
+                .join("rust")
+                .join("include")
+                .join("DeckLinkAPIDispatch.cpp"),
+            sdk_root
+                .join("Linux")
+                .join("include")
+                .join("DeckLinkAPIDispatch.cpp"),
+            sdk_root.join("include").join("DeckLinkAPIDispatch.cpp"),
+            PathBuf::from(
+                "/Library/Frameworks/DeckLinkAPI.framework/Headers/DeckLinkAPIDispatch.cpp",
+            ),
+        ];
+        if let Some(dispatch) = dispatch_candidates.iter().find(|p| p.exists()) {
+            println!("cargo:warning=cc adding: {}", dispatch.display());
+            build.file(dispatch);
+        } else {
+            println!("cargo:warning=DeckLinkAPIDispatch.cpp not found in typical locations; relying on library symbols only");
+        }
     }
 
     for dir in include_candidates.iter().filter(|p| p.exists()) {
@@ -48,7 +95,7 @@ fn main() {
         build.include(dir);
     }
 
-    // Re-run triggers
+    // ให้ build.rs รันใหม่เมื่อไฟล์ shim หรือค่า env เปลี่ยน
     println!("cargo:rerun-if-changed=shim/shim.cpp");
     println!("cargo:rerun-if-changed=shim/include");
     println!("cargo:rerun-if-env-changed=DECKLINK_SDK_DIR");
