@@ -1,3 +1,27 @@
 echo "Archive/target/" >> .gitignore
 echo "target/" >> .gitignore
 echo "*.DS_Store" >> .gitignore
+echo "target/" >> .gitignore
+echo "uhd_3840_2160_30fps.mp4" >> .gitignore
+echo "target/" >> .gitignore
+echo "uhd_3840_2160_30fps.mp4" >> .gitignore
+git add .gitignore
+
+# Rust build
+/target/
+
+# macOS system files
+.DS_Store
+
+# Media files (video/images for testing)
+*.mp4
+*.avi
+*.mov
+
+# Archives
+*.zip
+*.tar
+*.gz
+
+# Logs
+*.log
