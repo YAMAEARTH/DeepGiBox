@@ -183,6 +183,9 @@ static std::mutex g_glFrameMutex;
 static std::atomic<uint64_t> g_gl_seq{0};
 static std::atomic<uint64_t> g_gl_last_arrival_ns{0};
 static std::atomic<uint64_t> g_gl_last_latency_ns{0};
+static std::atomic<uint32_t> g_last_getbytes_qrv{0};
+static std::atomic<uint32_t> g_last_getbytes_pix{0};
+static std::atomic<uint64_t> g_gl_last_render_seq{0};
 
 extern "C" void decklink_preview_gl_disable();
 
@@ -450,10 +453,20 @@ public:
         }
 #endif
         if (!bytes) {
-            fprintf(stderr, "[shim] GetBytes failed (qrv=0x%08x, pix=0x%x)\n", (unsigned)qrv, (unsigned)pixfmt);
+            const uint32_t uqrv = (uint32_t)qrv;
+            const uint32_t upix = (uint32_t)pixfmt;
+            uint32_t last_q = g_last_getbytes_qrv.load(std::memory_order_relaxed);
+            uint32_t last_p = g_last_getbytes_pix.load(std::memory_order_relaxed);
+            if (last_q != uqrv || last_p != upix) {
+                fprintf(stderr, "[shim] GetBytes failed (qrv=0x%08x, pix=0x%x)\n", (unsigned)qrv, (unsigned)pixfmt);
+                g_last_getbytes_qrv.store(uqrv, std::memory_order_relaxed);
+                g_last_getbytes_pix.store(upix, std::memory_order_relaxed);
+            }
             if (vf) vf->Release();
             return S_OK;
         }
+        g_last_getbytes_qrv.store(0, std::memory_order_relaxed);
+        g_last_getbytes_pix.store(0, std::memory_order_relaxed);
 
         {
             std::lock_guard<std::mutex> lk(g_shared.mtx);
@@ -889,6 +902,7 @@ extern "C" bool decklink_preview_gl_create() {
     g_gl_seq.store(0, std::memory_order_relaxed);
     g_gl_last_arrival_ns.store(0, std::memory_order_relaxed);
     g_gl_last_latency_ns.store(0, std::memory_order_relaxed);
+    g_gl_last_render_seq.store(0, std::memory_order_relaxed);
     return true;
 }
 
@@ -949,10 +963,15 @@ extern "C" bool decklink_preview_gl_render() {
         fprintf(stderr, "[shim] PaintGL failed hr=0x%08x\n", (unsigned)hr);
         return false;
     }
-    auto now_ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
-    if (arrival != 0 && now_ns >= arrival)
-        g_gl_last_latency_ns.store(now_ns - arrival, std::memory_order_relaxed);
+    uint64_t seq = g_gl_seq.load(std::memory_order_relaxed);
+    uint64_t last_render = g_gl_last_render_seq.load(std::memory_order_relaxed);
+    if (seq != last_render) {
+        auto now_ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (arrival != 0 && now_ns >= arrival)
+            g_gl_last_latency_ns.store(now_ns - arrival, std::memory_order_relaxed);
+        g_gl_last_render_seq.store(seq, std::memory_order_relaxed);
+    }
     return true;
 }
 
@@ -974,6 +993,7 @@ extern "C" void decklink_preview_gl_disable() {
     g_gl_seq.store(0, std::memory_order_relaxed);
     g_gl_last_arrival_ns.store(0, std::memory_order_relaxed);
     g_gl_last_latency_ns.store(0, std::memory_order_relaxed);
+    g_gl_last_render_seq.store(0, std::memory_order_relaxed);
 }
 
 extern "C" void decklink_preview_gl_destroy() {

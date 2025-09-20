@@ -24,17 +24,5 @@ name = "devicelist"
 path = "src/bin/device_list.rs"
 
 [[bin]]
-name = "capture_preview"
-path = "src/bin/capture_preview.rs"
-
-[[bin]]
-name = "capture_preview_wgpu"
-path = "src/bin/capture_preview_wgpu.rs"
-
-[[bin]]
-name = "capture_preview_screen"
-path = "src/bin/capture_preview_screen.rs"
-
-[[bin]]
 name = "capture_preview_gl"
 path = "src/bin/capture_preview_gl.rs"
