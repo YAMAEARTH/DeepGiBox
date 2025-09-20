@@ -24,5 +24,5 @@ name = "devicelist"
 path = "src/bin/device_list.rs"
 
 [[bin]]
-name = "capture_preview_gl"
-path = "src/bin/capture_preview_gl.rs"
+name = "nvidia_decklink_preview_gl"
+path = "src/bin/nvidia_decklink_preview_gl.rs"

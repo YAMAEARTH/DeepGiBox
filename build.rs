@@ -11,6 +11,10 @@ fn main() {
     let mut include_candidates = vec![
         manifest_dir.join("include"),
         manifest_dir.join("shim").join("include"),
+        manifest_dir
+            .join("Samples")
+            .join("NVIDIA_GPUDirect")
+            .join("include"),
     ];
     let mut build = cc::Build::new();
     build
@@ -60,6 +64,27 @@ fn main() {
             include_candidates.push(sdk_root.join("include"));
         }
     }
+
+    let dvp_lib_dir = env::var_os("DVP_LIB_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            manifest_dir
+                .join("Samples")
+                .join("NVIDIA_GPUDirect")
+                .join("x86_64")
+        });
+        
+    if dvp_lib_dir.exists() {
+        println!("cargo:rustc-link-search=native={}", dvp_lib_dir.display());
+        let dvp_exact = dvp_lib_dir.join("libdvp.so.1");
+        if dvp_exact.exists() {
+            println!(
+                "cargo:rustc-link-arg=-l:{}",
+                dvp_exact.file_name().unwrap().to_string_lossy()
+            );
+        }
+    }
+    println!("cargo:rustc-link-lib=dylib=dvp");
 
     if matches!(target_os.as_str(), "macos" | "linux") {
         // คอมไพล์ DeckLinkAPIDispatch.cpp เพื่อเรียกใช้สัญลักษณ์ที่มี version suffix ในไลบรารี

@@ -6,6 +6,18 @@
 #include <mutex>
 #include <cstdio>
 #include <chrono>
+#include <unordered_map>
+#include <memory>
+#include <algorithm>
+#include <cerrno>
+
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <sys/resource.h>
+#endif
+
+#include "DVPAPI.h"
+#include "dvpapi_gl.h"
 
 #if defined(_WIN32)
   #include <windows.h>
@@ -19,8 +31,11 @@
 #include "DeckLinkAPIModes.h"
 #include "DeckLinkAPITypes.h"
 #include "DeckLinkAPIConfiguration.h"
+#include "DeckLinkAPIMemoryAllocator_v14_2_1.h"
+#include "DeckLinkAPIVideoInput_v14_2_1.h"
 #include "DeckLinkAPIVideoFrame_v14_2_1.h"
 #include "DeckLinkAPIScreenPreviewCallback_v14_2_1.h"
+#include "DeckLinkAPI_v14_2_1.h"
 
 #if !defined(__APPLE__)
 static const REFIID kIID_IUnknown = IID_IUnknown;
@@ -148,9 +163,27 @@ struct CaptureFrame {
     uint64_t seq;      // monotonically increasing frame sequence
 };
 
+struct DeckLinkDVPFrame {
+    uint64_t seq;
+    uint64_t timestamp_ns;
+    uint64_t sysmem_handle;
+    uint64_t sync_handle;
+    uint64_t semaphore_addr;
+    const uint8_t* cpu_ptr;
+    uint64_t buffer_size;
+    uint32_t width;
+    uint32_t height;
+    uint32_t row_bytes;
+    uint32_t pixel_format;
+    uint32_t release_value;
+    uint32_t reserved;
+};
+
 bool decklink_capture_open(int32_t device_index);
 bool decklink_capture_get_frame(CaptureFrame* out);
 void decklink_capture_close();
+bool decklink_capture_latest_dvp_frame(DeckLinkDVPFrame* out);
+void decklink_capture_reset_dvp_fence();
 
 } // extern "C"
 
@@ -158,26 +191,84 @@ void decklink_capture_close();
 
 namespace {
 
-struct SharedFrame {
-    std::vector<uint8_t> data; // BGRA
-    int32_t width = 0;
-    int32_t height = 0;
-    int32_t row_bytes = 0; // width * 4
-    std::mutex mtx;
+struct DVPRequirements {
+    uint32_t bufferAddrAlignment = 4096;
+    uint32_t bufferStrideAlignment = 256;
+    uint32_t semaphoreAddrAlignment = 64;
+    uint32_t semaphoreAllocSize = 0;
+    uint32_t semaphorePayloadOffset = 0;
+    uint32_t semaphorePayloadSize = 0;
+};
+
+struct DVPBufferRecord {
+    void* basePtr = nullptr;
+    size_t size = 0;
+    DVPBufferHandle sysmemHandle = 0;
+    DVPSyncObjectHandle syncHandle = 0;
+    uint32_t* semaphore = nullptr;
+    void* semaphoreBacking = nullptr;
+    uint32_t releaseValue = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t rowBytes = 0;
+    BMDPixelFormat pixelFormat = bmdFormatUnspecified;
     uint64_t seq = 0;
+    uint64_t timestampNs = 0;
+};
+
+struct LatestFrameState {
+    DVPBufferRecord* buffer = nullptr;
+    uint64_t seq = 0;
+};
+
+static std::mutex g_dvpInitMutex;
+static bool g_dvpInitialized = false;
+static DVPRequirements g_dvpRequirements{};
+
+class GPUDirectAllocator : public IDeckLinkMemoryAllocator_v14_2_1 {
+public:
+    GPUDirectAllocator();
+    virtual ~GPUDirectAllocator();
+
+    // IUnknown
+    HRESULT QueryInterface(REFIID iid, void** ppv) override;
+    ULONG AddRef() override;
+    ULONG Release() override;
+
+    // IDeckLinkMemoryAllocator_v14_2_1
+    HRESULT AllocateBuffer(uint32_t bufferSize, void** allocatedBuffer) override;
+    HRESULT ReleaseBuffer(void* buffer) override;
+    HRESULT Commit() override;
+    HRESULT Decommit() override;
+
+    DVPBufferRecord* resolve(void* ptr);
+    void evacuateAll();
+
+private:
+    struct BufferEntry {
+        std::unique_ptr<DVPBufferRecord> record;
+    };
+
+    std::mutex m_mutex;
+    std::unordered_map<void*, BufferEntry> m_buffers;
+    std::atomic<ULONG> m_refCount{1};
+    bool m_committed = false;
 };
 
 static IDeckLinkIterator* g_iterator = nullptr;
 static IDeckLink* g_device = nullptr;
-static IDeckLinkInput* g_input = nullptr;
-static SharedFrame g_shared;
-static IDeckLinkScreenPreviewCallback* g_screenPreview = nullptr; // Cocoa Screen Preview (NSView)
+static IDeckLinkInput_v14_2_1* g_input = nullptr;
+static GPUDirectAllocator* g_allocator = nullptr;
+static LatestFrameState g_latestFrame{};
+static std::mutex g_latestMutex;
+static std::atomic<uint64_t> g_frameSeq{0};
+static IDeckLinkScreenPreviewCallback_v14_2_1* g_screenPreview = nullptr; // Cocoa Screen Preview (NSView)
 static std::atomic<uint64_t> g_preview_seq{0};
 
 // OpenGL preview helper (cross-platform)
 static IDeckLinkGLScreenPreviewHelper* g_glPreview = nullptr;
-static IDeckLinkVideoFrame* g_glFrame = nullptr;
-static IDeckLinkScreenPreviewCallback* g_glCallback = nullptr;
+static IDeckLinkVideoFrame_v14_2_1* g_glFrame = nullptr;
+static IDeckLinkScreenPreviewCallback_v14_2_1* g_glCallback = nullptr;
 static std::mutex g_glMutex;
 static std::mutex g_glFrameMutex;
 static std::atomic<uint64_t> g_gl_seq{0};
@@ -187,9 +278,306 @@ static std::atomic<uint32_t> g_last_getbytes_qrv{0};
 static std::atomic<uint32_t> g_last_getbytes_pix{0};
 static std::atomic<uint64_t> g_gl_last_render_seq{0};
 
+#if defined(__linux__)
+static void ensure_memlock_limit(size_t bytes)
+{
+    struct rlimit limit;
+    if (getrlimit(RLIMIT_MEMLOCK, &limit) != 0) {
+        fprintf(stderr, "[shim] getrlimit(RLIMIT_MEMLOCK) failed: %s\n", strerror(errno));
+        return;
+    }
+
+    rlim_t desired = static_cast<rlim_t>(bytes);
+    if (limit.rlim_cur >= desired && (limit.rlim_max == RLIM_INFINITY || limit.rlim_max >= desired))
+        return;
+
+    struct rlimit newLimit = limit;
+    if (newLimit.rlim_max < desired && newLimit.rlim_max != RLIM_INFINITY)
+        newLimit.rlim_max = desired;
+    newLimit.rlim_cur = desired;
+    if (setrlimit(RLIMIT_MEMLOCK, &newLimit) != 0) {
+        fprintf(stderr, "[shim] setrlimit(RLIMIT_MEMLOCK) failed: %s\n", strerror(errno));
+    }
+}
+#else
+static void ensure_memlock_limit(size_t) {}
+#endif
+
+static bool ensure_gpudirect_initialized()
+{
+    std::lock_guard<std::mutex> lk(g_dvpInitMutex);
+    if (g_dvpInitialized)
+        return true;
+
+    ensure_memlock_limit(512ull * 1024ull * 1024ull);
+
+    DVPStatus status = dvpInitGLContext(DVP_DEVICE_FLAGS_SHARE_APP_CONTEXT);
+    if (status != DVP_STATUS_OK) {
+        fprintf(stderr, "[shim] dvpInitGLContext failed (status=%d)\n", (int)status);
+        return false;
+    }
+
+    status = dvpGetRequiredConstantsGLCtx(&g_dvpRequirements.bufferAddrAlignment,
+                                          &g_dvpRequirements.bufferStrideAlignment,
+                                          &g_dvpRequirements.semaphoreAddrAlignment,
+                                          &g_dvpRequirements.semaphoreAllocSize,
+                                          &g_dvpRequirements.semaphorePayloadOffset,
+                                          &g_dvpRequirements.semaphorePayloadSize);
+    if (status != DVP_STATUS_OK) {
+        fprintf(stderr, "[shim] dvpGetRequiredConstantsGLCtx failed (status=%d)\n", (int)status);
+        dvpCloseGLContext();
+        return false;
+    }
+
+    if (g_dvpRequirements.bufferAddrAlignment == 0)
+        g_dvpRequirements.bufferAddrAlignment = 4096;
+    if (g_dvpRequirements.semaphoreAddrAlignment == 0)
+        g_dvpRequirements.semaphoreAddrAlignment = 64;
+    if (g_dvpRequirements.semaphoreAllocSize == 0)
+        g_dvpRequirements.semaphoreAllocSize = 4096;
+    if (g_dvpRequirements.semaphorePayloadSize == 0)
+        g_dvpRequirements.semaphorePayloadSize = sizeof(uint32_t);
+
+    g_dvpInitialized = true;
+    return true;
+}
+
+static void shutdown_gpudirect()
+{
+    std::lock_guard<std::mutex> lk(g_dvpInitMutex);
+    if (!g_dvpInitialized)
+        return;
+    dvpCloseGLContext();
+    g_dvpInitialized = false;
+    g_dvpRequirements = DVPRequirements{};
+}
+
+static void reset_latest_frame()
+{
+    std::lock_guard<std::mutex> lk(g_latestMutex);
+    g_latestFrame = LatestFrameState{};
+}
+
+GPUDirectAllocator::GPUDirectAllocator() = default;
+
+GPUDirectAllocator::~GPUDirectAllocator()
+{
+    evacuateAll();
+}
+
+HRESULT GPUDirectAllocator::QueryInterface(REFIID iid, void** ppv)
+{
+    if (!ppv)
+        return E_POINTER;
+
+#if defined(__APPLE__)
+    CFUUIDBytes iunknown = CFUUIDGetUUIDBytes(IUnknownUUID);
+    if (memcmp(&iid, &iunknown, sizeof(CFUUIDBytes)) == 0) {
+        *ppv = static_cast<IUnknown*>(this);
+        AddRef();
+        return S_OK;
+    }
+    if (memcmp(&iid, &IID_IDeckLinkMemoryAllocator_v14_2_1, sizeof(CFUUIDBytes)) == 0) {
+        *ppv = static_cast<IDeckLinkMemoryAllocator_v14_2_1*>(this);
+        AddRef();
+        return S_OK;
+    }
+#else
+    if (memcmp(&iid, &kIID_IUnknown, sizeof(REFIID)) == 0) {
+        *ppv = static_cast<IUnknown*>(this);
+        AddRef();
+        return S_OK;
+    }
+    if (memcmp(&iid, &IID_IDeckLinkMemoryAllocator_v14_2_1, sizeof(REFIID)) == 0) {
+        *ppv = static_cast<IDeckLinkMemoryAllocator_v14_2_1*>(this);
+        AddRef();
+        return S_OK;
+    }
+#endif
+
+    *ppv = nullptr;
+    return E_NOINTERFACE;
+}
+
+ULONG GPUDirectAllocator::AddRef()
+{
+    return ++m_refCount;
+}
+
+ULONG GPUDirectAllocator::Release()
+{
+    ULONG v = --m_refCount;
+    if (v == 0)
+        delete this;
+    return v;
+}
+
+HRESULT GPUDirectAllocator::AllocateBuffer(uint32_t bufferSize, void** allocatedBuffer)
+{
+    if (!allocatedBuffer || bufferSize == 0)
+        return E_INVALIDARG;
+
+    if (!ensure_gpudirect_initialized())
+        return E_FAIL;
+
+    size_t requested = static_cast<size_t>(bufferSize);
+    size_t alignment = std::max<size_t>(g_dvpRequirements.bufferAddrAlignment, 4096);
+    void* base = nullptr;
+    int err = posix_memalign(&base, alignment, requested);
+    if (err != 0 || !base) {
+        fprintf(stderr, "[shim] posix_memalign failed (err=%d)\n", err);
+        return E_OUTOFMEMORY;
+    }
+
+#if defined(__linux__)
+    if (mlock(base, requested) != 0) {
+        fprintf(stderr, "[shim] mlock failed: %s\n", strerror(errno));
+    }
+#endif
+
+    DVPSysmemBufferDesc desc{};
+    desc.width = 0;
+    desc.height = 0;
+    desc.stride = 0;
+    desc.size = bufferSize;
+    desc.format = DVP_BUFFER;
+    desc.type = DVP_UNSIGNED_BYTE;
+    desc.bufAddr = base;
+
+    DVPBufferHandle sysmemHandle = 0;
+    DVPStatus status = dvpCreateBuffer(&desc, &sysmemHandle);
+    if (status != DVP_STATUS_OK) {
+        fprintf(stderr, "[shim] dvpCreateBuffer failed (status=%d)\n", (int)status);
+#if defined(__linux__)
+        munlock(base, requested);
+#endif
+        std::free(base);
+        return E_FAIL;
+    }
+
+    const size_t semaphoreAllocSize = std::max<size_t>(g_dvpRequirements.semaphoreAllocSize, sizeof(uint32_t));
+    const size_t semaphoreAlignment = std::max<size_t>(g_dvpRequirements.semaphoreAddrAlignment, alignof(uint32_t));
+    void* semBacking = std::malloc(semaphoreAllocSize + semaphoreAlignment);
+    if (!semBacking) {
+        fprintf(stderr, "[shim] semaphore allocation failed\n");
+        dvpDestroyBuffer(sysmemHandle);
+#if defined(__linux__)
+        munlock(base, requested);
+#endif
+        std::free(base);
+        return E_OUTOFMEMORY;
+    }
+    uintptr_t semAddr = reinterpret_cast<uintptr_t>(semBacking);
+    semAddr = (semAddr + semaphoreAlignment - 1) & ~(static_cast<uintptr_t>(semaphoreAlignment) - 1);
+    uint32_t* semaphore = reinterpret_cast<uint32_t*>(semAddr);
+    std::memset(semaphore, 0, g_dvpRequirements.semaphorePayloadSize);
+
+    DVPSyncObjectDesc syncDesc{};
+    syncDesc.sem = semaphore;
+    syncDesc.flags = 0;
+    syncDesc.externalClientWaitFunc = nullptr;
+
+    DVPSyncObjectHandle syncHandle = 0;
+    status = dvpImportSyncObject(&syncDesc, &syncHandle);
+    if (status != DVP_STATUS_OK) {
+        fprintf(stderr, "[shim] dvpImportSyncObject failed (status=%d)\n", (int)status);
+        std::free(semBacking);
+        dvpDestroyBuffer(sysmemHandle);
+#if defined(__linux__)
+        munlock(base, requested);
+#endif
+        std::free(base);
+        return E_FAIL;
+    }
+
+    auto record = std::make_unique<DVPBufferRecord>();
+    record->basePtr = base;
+    record->size = requested;
+    record->sysmemHandle = sysmemHandle;
+    record->syncHandle = syncHandle;
+    record->semaphore = semaphore;
+    record->semaphoreBacking = semBacking;
+
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_buffers.emplace(base, BufferEntry{std::move(record)});
+    }
+
+    *allocatedBuffer = base;
+    return S_OK;
+}
+
+HRESULT GPUDirectAllocator::ReleaseBuffer(void* buffer)
+{
+    if (!buffer)
+        return S_OK;
+
+    std::unique_ptr<DVPBufferRecord> record;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        auto it = m_buffers.find(buffer);
+        if (it == m_buffers.end())
+            return S_FALSE;
+        record = std::move(it->second.record);
+        m_buffers.erase(it);
+    }
+
+    if (record) {
+        if (record->syncHandle)
+            dvpFreeSyncObject(record->syncHandle);
+        if (record->sysmemHandle)
+            dvpDestroyBuffer(record->sysmemHandle);
+        if (record->semaphoreBacking)
+            std::free(record->semaphoreBacking);
+#if defined(__linux__)
+        if (record->basePtr && record->size)
+            munlock(record->basePtr, record->size);
+#endif
+        if (record->basePtr)
+            std::free(record->basePtr);
+    }
+
+    return S_OK;
+}
+
+HRESULT GPUDirectAllocator::Commit()
+{
+    m_committed = true;
+    return S_OK;
+}
+
+HRESULT GPUDirectAllocator::Decommit()
+{
+    m_committed = false;
+    evacuateAll();
+    return S_OK;
+}
+
+DVPBufferRecord* GPUDirectAllocator::resolve(void* ptr)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    auto it = m_buffers.find(ptr);
+    if (it == m_buffers.end())
+        return nullptr;
+    return it->second.record.get();
+}
+
+void GPUDirectAllocator::evacuateAll()
+{
+    std::vector<void*> keys;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        keys.reserve(m_buffers.size());
+        for (auto& kv : m_buffers)
+            keys.push_back(kv.first);
+    }
+    for (void* ptr : keys)
+        ReleaseBuffer(ptr);
+}
+
 extern "C" void decklink_preview_gl_disable();
 
-class CaptureCallback : public IDeckLinkInputCallback {
+class CaptureCallback : public IDeckLinkInputCallback_v14_2_1 {
 public:
     CaptureCallback() : m_ref(1) {}
 
@@ -204,8 +592,8 @@ public:
             AddRef();
             return S_OK;
         }
-        if (memcmp(&iid, &IID_IDeckLinkInputCallback, sizeof(CFUUIDBytes)) == 0) {
-            *ppv = static_cast<IDeckLinkInputCallback*>(this);
+        if (memcmp(&iid, &IID_IDeckLinkInputCallback_v14_2_1, sizeof(CFUUIDBytes)) == 0) {
+            *ppv = static_cast<IDeckLinkInputCallback_v14_2_1*>(this);
             AddRef();
             return S_OK;
         }
@@ -215,8 +603,8 @@ public:
             AddRef();
             return S_OK;
         }
-        if (memcmp(&iid, &IID_IDeckLinkInputCallback, sizeof(REFIID)) == 0) {
-            *ppv = static_cast<IDeckLinkInputCallback*>(this);
+        if (memcmp(&iid, &IID_IDeckLinkInputCallback_v14_2_1, sizeof(REFIID)) == 0) {
+            *ppv = static_cast<IDeckLinkInputCallback_v14_2_1*>(this);
             AddRef();
             return S_OK;
         }
@@ -265,144 +653,7 @@ public:
         return S_OK;
     }
 
-    static inline uint8_t clamp_u8(int v) {
-        return (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v));
-    }
-
-    static void convert_uyvy_to_bgra(const uint8_t* src, int width, int height, int srcStride, uint8_t* dst, int dstStride) {
-        for (int y = 0; y < height; ++y) {
-            const uint8_t* s = src + (size_t)y * (size_t)srcStride;
-            uint8_t* d = dst + (size_t)y * (size_t)dstStride;
-            for (int x = 0; x < width; x += 2) {
-                int U = s[0];
-                int Y0 = s[1];
-                int V = s[2];
-                int Y1 = s[3];
-                s += 4;
-
-                int C0 = Y0 - 16;
-                int C1 = Y1 - 16;
-                int D = U - 128;
-                int E = V - 128;
-
-                // Pixel 0
-                int R0 = (298 * C0 + 409 * E + 128) >> 8;
-                int G0 = (298 * C0 - 100 * D - 208 * E + 128) >> 8;
-                int B0 = (298 * C0 + 516 * D + 128) >> 8;
-                d[0] = clamp_u8(B0);
-                d[1] = clamp_u8(G0);
-                d[2] = clamp_u8(R0);
-                d[3] = 255;
-
-                // Pixel 1
-                int R1 = (298 * C1 + 409 * E + 128) >> 8;
-                int G1 = (298 * C1 - 100 * D - 208 * E + 128) >> 8;
-                int B1 = (298 * C1 + 516 * D + 128) >> 8;
-                d[4] = clamp_u8(B1);
-                d[5] = clamp_u8(G1);
-                d[6] = clamp_u8(R1);
-                d[7] = 255;
-                d += 8;
-            }
-        }
-    }
-
-    static void convert_yuyv_to_bgra(const uint8_t* src, int width, int height, int srcStride, uint8_t* dst, int dstStride) {
-        for (int y = 0; y < height; ++y) {
-            const uint8_t* s = src + (size_t)y * (size_t)srcStride;
-            uint8_t* d = dst + (size_t)y * (size_t)dstStride;
-            for (int x = 0; x < width; x += 2) {
-                int Y0 = s[0];
-                int U  = s[1];
-                int Y1 = s[2];
-                int V  = s[3];
-                s += 4;
-
-                int C0 = Y0 - 16;
-                int C1 = Y1 - 16;
-                int D = U - 128;
-                int E = V - 128;
-
-                int R0 = (298 * C0 + 409 * E + 128) >> 8;
-                int G0 = (298 * C0 - 100 * D - 208 * E + 128) >> 8;
-                int B0 = (298 * C0 + 516 * D + 128) >> 8;
-                d[0] = clamp_u8(B0);
-                d[1] = clamp_u8(G0);
-                d[2] = clamp_u8(R0);
-                d[3] = 255;
-
-                int R1 = (298 * C1 + 409 * E + 128) >> 8;
-                int G1 = (298 * C1 - 100 * D - 208 * E + 128) >> 8;
-                int B1 = (298 * C1 + 516 * D + 128) >> 8;
-                d[4] = clamp_u8(B1);
-                d[5] = clamp_u8(G1);
-                d[6] = clamp_u8(R1);
-                d[7] = 255;
-                d += 8;
-            }
-        }
-    }
-
-    static void convert_v210_to_bgra(const uint8_t* src, int width, int height, int srcStride, uint8_t* dst, int dstStride) {
-        auto next_sample = [&](const uint8_t*& ps, uint32_t& word, int& left) -> uint16_t {
-            if (left == 0) {
-                word = *(const uint32_t*)ps;
-                ps += 4;
-                left = 3;
-            }
-            uint16_t s = (uint16_t)(word & 0x3FF);
-            word >>= 10;
-            left--;
-            return s;
-        };
-
-        for (int y = 0; y < height; ++y) {
-            const uint8_t* ps = src + (size_t)y * (size_t)srcStride;
-            uint8_t* d = dst + (size_t)y * (size_t)dstStride;
-            uint32_t word = 0; int left = 0;
-
-            for (int x = 0; x < width; x += 2) {
-                // Sample stream pattern in v210: U, Y, V, Y, repeating
-                uint16_t U10 = next_sample(ps, word, left);
-                uint16_t Y0_10 = next_sample(ps, word, left);
-                uint16_t V10 = next_sample(ps, word, left);
-                uint16_t Y1_10 = next_sample(ps, word, left);
-
-                // Downscale to 8-bit (approx.)
-                int U = (int)(U10 >> 2);
-                int V = (int)(V10 >> 2);
-                int Y0 = (int)(Y0_10 >> 2);
-                int Y1 = (int)(Y1_10 >> 2);
-
-                int C0 = Y0 - 16;
-                int C1 = Y1 - 16;
-                int D = U - 128;
-                int E = V - 128;
-
-                // Pixel 0
-                int R0 = (298 * C0 + 409 * E + 128) >> 8;
-                int G0 = (298 * C0 - 100 * D - 208 * E + 128) >> 8;
-                int B0 = (298 * C0 + 516 * D + 128) >> 8;
-                d[0] = clamp_u8(B0);
-                d[1] = clamp_u8(G0);
-                d[2] = clamp_u8(R0);
-                d[3] = 255;
-
-                // Pixel 1
-                int R1 = (298 * C1 + 409 * E + 128) >> 8;
-                int G1 = (298 * C1 - 100 * D - 208 * E + 128) >> 8;
-                int B1 = (298 * C1 + 516 * D + 128) >> 8;
-                d[4] = clamp_u8(B1);
-                d[5] = clamp_u8(G1);
-                d[6] = clamp_u8(R1);
-                d[7] = 255;
-
-                d += 8;
-            }
-        }
-    }
-
-    HRESULT VideoInputFrameArrived(IDeckLinkVideoInputFrame* videoFrame, IDeckLinkAudioInputPacket* /*audioPacket*/) override {
+    HRESULT VideoInputFrameArrived(IDeckLinkVideoInputFrame_v14_2_1* videoFrame, IDeckLinkAudioInputPacket* /*audioPacket*/) override {
         if (!videoFrame)
             return S_OK;
 
@@ -468,61 +719,38 @@ public:
         g_last_getbytes_qrv.store(0, std::memory_order_relaxed);
         g_last_getbytes_pix.store(0, std::memory_order_relaxed);
 
-        {
-            std::lock_guard<std::mutex> lk(g_shared.mtx);
-            // Ensure buffer size
-            const int32_t w = (int32_t)width;
-            const int32_t h = (int32_t)height;
-            const int32_t dstStride = w * 4;
-            const size_t wantSize = (size_t)dstStride * (size_t)h;
-            if (g_shared.data.size() != wantSize) g_shared.data.resize(wantSize);
-            g_shared.width = w;
-            g_shared.height = h;
-            g_shared.row_bytes = dstStride;
-
-            if (pixfmt == bmdFormat8BitBGRA) {
-                // Copy with row strides
-                const uint8_t* src = (const uint8_t*)bytes;
-                for (int32_t y = 0; y < h; ++y) {
-                    const uint8_t* s = src + (size_t)y * (size_t)rowBytes;
-                    uint8_t* d = g_shared.data.data() + (size_t)y * (size_t)dstStride;
-                    std::memcpy(d, s, (size_t)dstStride);
-                }
-            } else if (pixfmt == bmdFormat8BitARGB) {
-                // Convert ARGB -> BGRA by channel swap per pixel
-                const uint8_t* src = (const uint8_t*)bytes;
-                for (int32_t y = 0; y < h; ++y) {
-                    const uint8_t* s = src + (size_t)y * (size_t)rowBytes;
-                    uint8_t* d = g_shared.data.data() + (size_t)y * (size_t)dstStride;
-                    for (int32_t x = 0; x < w; ++x) {
-                        uint8_t a = s[0];
-                        uint8_t r = s[1];
-                        uint8_t g = s[2];
-                        uint8_t b = s[3];
-                        d[0] = b; d[1] = g; d[2] = r; d[3] = a;
-                        s += 4; d += 4;
-                    }
-                }
-            } else if (pixfmt == bmdFormat8BitYUV) {
-                // Convert UYVY to BGRA
-                const uint8_t* src = (const uint8_t*)bytes;
-                // Heuristic: if the first plane looks like YUYV, handle; else default UYVY
-                // We don't know exact CVPF here; try both depending on alignment of U and Y
-                convert_uyvy_to_bgra(src, w, h, (int)rowBytes, g_shared.data.data(), dstStride);
-            } else if (pixfmt == bmdFormat10BitYUV) {
-                const uint8_t* src = (const uint8_t*)bytes;
-                convert_v210_to_bgra(src, w, h, (int)rowBytes, g_shared.data.data(), dstStride);
-            } else {
-                // Unsupported format: fill black
-                std::memset(g_shared.data.data(), 0, g_shared.data.size());
+        DVPBufferRecord* record = (g_allocator && bytes) ? g_allocator->resolve(bytes) : nullptr;
+        if (!record) {
+            static bool s_warned = false;
+            if (!s_warned) {
+                fprintf(stderr, "[shim] GPUDirect buffer lookup failed; frame pointer not registered with allocator\n");
+                s_warned = true;
             }
-            static bool s_logged = false;
-            if (!s_logged) {
-                fprintf(stderr, "[shim] First frame: %dx%d, rb=%ld, pix=0x%x\n", w, h, (long)rowBytes, (unsigned)pixfmt);
-                s_logged = true;
-            }
-            g_shared.seq++;
+            if (vf) vf->Release();
+            return S_OK;
         }
+
+        record->width = static_cast<uint32_t>(std::max<long>(width, 0));
+        record->height = static_cast<uint32_t>(std::max<long>(height, 0));
+        record->rowBytes = static_cast<uint32_t>(std::max<long>(rowBytes, 0));
+        record->pixelFormat = pixfmt;
+
+        uint64_t seq = g_frameSeq.fetch_add(1, std::memory_order_relaxed) + 1;
+        record->seq = seq;
+        record->timestampNs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+        record->releaseValue += 1;
+        if (record->semaphore) {
+            record->semaphore[0] = record->releaseValue;
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(g_latestMutex);
+            g_latestFrame.buffer = record;
+            g_latestFrame.seq = seq;
+        }
+
         if (vf) vf->Release();
         return S_OK;
     }
@@ -533,7 +761,7 @@ private:
 
 static CaptureCallback* g_callback = nullptr;
 
-class GLPreviewCallback : public IDeckLinkScreenPreviewCallback {
+class GLPreviewCallback : public IDeckLinkScreenPreviewCallback_v14_2_1 {
 public:
     GLPreviewCallback() : m_ref(1) {}
 
@@ -546,8 +774,8 @@ public:
             AddRef();
             return S_OK;
         }
-        if (memcmp(&iid, &IID_IDeckLinkScreenPreviewCallback, sizeof(CFUUIDBytes)) == 0) {
-            *ppv = static_cast<IDeckLinkScreenPreviewCallback*>(this);
+        if (memcmp(&iid, &IID_IDeckLinkScreenPreviewCallback_v14_2_1, sizeof(CFUUIDBytes)) == 0) {
+            *ppv = static_cast<IDeckLinkScreenPreviewCallback_v14_2_1*>(this);
             AddRef();
             return S_OK;
         }
@@ -557,8 +785,8 @@ public:
             AddRef();
             return S_OK;
         }
-        if (memcmp(&iid, &IID_IDeckLinkScreenPreviewCallback, sizeof(REFIID)) == 0) {
-            *ppv = static_cast<IDeckLinkScreenPreviewCallback*>(this);
+        if (memcmp(&iid, &IID_IDeckLinkScreenPreviewCallback_v14_2_1, sizeof(REFIID)) == 0) {
+            *ppv = static_cast<IDeckLinkScreenPreviewCallback_v14_2_1*>(this);
             AddRef();
             return S_OK;
         }
@@ -575,7 +803,7 @@ public:
         return r;
     }
 
-    HRESULT DrawFrame(IDeckLinkVideoFrame* frame) override {
+    HRESULT DrawFrame(IDeckLinkVideoFrame_v14_2_1* frame) override {
         std::lock_guard<std::mutex> lk(g_glFrameMutex);
         if (g_glFrame) {
             g_glFrame->Release();
@@ -597,7 +825,7 @@ private:
     std::atomic<ULONG> m_ref;
 };
 
-static bool pick_supported_mode(IDeckLinkInput* input, BMDVideoConnection connection, BMDDisplayMode& outMode, BMDPixelFormat& outPix) {
+static bool pick_supported_mode(IDeckLinkInput_v14_2_1* input, BMDVideoConnection connection, BMDDisplayMode& outMode, BMDPixelFormat& outPix) {
     if (!input) return false;
     IDeckLinkDisplayModeIterator* it = nullptr;
     if (input->GetDisplayModeIterator(&it) != S_OK || !it) return false;
@@ -638,6 +866,14 @@ static bool pick_supported_mode(IDeckLinkInput* input, BMDVideoConnection connec
 
 extern "C" bool decklink_capture_open(int32_t device_index) {
     if (g_input) return true; // already open
+
+    if (!ensure_gpudirect_initialized()) {
+        fprintf(stderr, "[shim] GPUDirect initialization failed\n");
+        return false;
+    }
+
+    reset_latest_frame();
+    g_frameSeq.store(0, std::memory_order_relaxed);
 
     g_iterator = CreateDeckLinkIteratorInstance();
     if (!g_iterator) {
@@ -692,9 +928,19 @@ extern "C" bool decklink_capture_open(int32_t device_index) {
     }
 
     // Get input interface
-    HRESULT qri = g_device->QueryInterface(IID_IDeckLinkInput, (void**)&g_input);
+    HRESULT qri = g_device->QueryInterface(IID_IDeckLinkInput_v14_2_1, (void**)&g_input);
     if (qri != S_OK || !g_input) {
         fprintf(stderr, "[shim] QueryInterface(IID_IDeckLinkInput) failed hr=0x%08x\n", (unsigned)qri);
+        g_device->Release(); g_device = nullptr;
+        g_iterator->Release(); g_iterator = nullptr;
+        return false;
+    }
+
+    g_allocator = new GPUDirectAllocator();
+    if (g_input->SetVideoInputFrameMemoryAllocator(g_allocator) != S_OK) {
+        fprintf(stderr, "[shim] SetVideoInputFrameMemoryAllocator failed\n");
+        g_allocator->Release(); g_allocator = nullptr;
+        g_input->Release(); g_input = nullptr;
         g_device->Release(); g_device = nullptr;
         g_iterator->Release(); g_iterator = nullptr;
         return false;
@@ -705,6 +951,8 @@ extern "C" bool decklink_capture_open(int32_t device_index) {
     if (g_input->SetCallback(g_callback) != S_OK) {
         fprintf(stderr, "[shim] SetCallback failed\n");
         g_callback->Release(); g_callback = nullptr;
+        g_input->SetVideoInputFrameMemoryAllocator(nullptr);
+        if (g_allocator) { g_allocator->Release(); g_allocator = nullptr; }
         g_input->Release(); g_input = nullptr;
         g_device->Release(); g_device = nullptr;
         g_iterator->Release(); g_iterator = nullptr;
@@ -789,6 +1037,8 @@ extern "C" bool decklink_capture_open(int32_t device_index) {
         fprintf(stderr, "[shim] Could not enable any mode on available connections\n");
         g_input->SetCallback(nullptr);
         g_callback->Release(); g_callback = nullptr;
+        g_input->SetVideoInputFrameMemoryAllocator(nullptr);
+        if (g_allocator) { g_allocator->Release(); g_allocator = nullptr; }
         g_input->Release(); g_input = nullptr;
         g_device->Release(); g_device = nullptr;
         g_iterator->Release(); g_iterator = nullptr;
@@ -800,6 +1050,8 @@ extern "C" bool decklink_capture_open(int32_t device_index) {
         g_input->DisableVideoInput();
         g_input->SetCallback(nullptr);
         g_callback->Release(); g_callback = nullptr;
+        g_input->SetVideoInputFrameMemoryAllocator(nullptr);
+        if (g_allocator) { g_allocator->Release(); g_allocator = nullptr; }
         g_input->Release(); g_input = nullptr;
         g_device->Release(); g_device = nullptr;
         g_iterator->Release(); g_iterator = nullptr;
@@ -810,22 +1062,45 @@ extern "C" bool decklink_capture_open(int32_t device_index) {
 }
 
 extern "C" bool decklink_capture_get_frame(CaptureFrame* out) {
-    if (!out) return false;
-    std::lock_guard<std::mutex> lk(g_shared.mtx);
-    if (g_shared.data.empty() || g_shared.width <= 0 || g_shared.height <= 0) {
+    if (out) {
         out->data = nullptr;
         out->width = 0;
         out->height = 0;
         out->row_bytes = 0;
         out->seq = 0;
-        return false;
     }
-    out->data = g_shared.data.data();
-    out->width = g_shared.width;
-    out->height = g_shared.height;
-    out->row_bytes = g_shared.row_bytes;
-    out->seq = g_shared.seq;
+    fprintf(stderr, "[shim] decklink_capture_get_frame is disabled; use decklink_capture_latest_dvp_frame() for zero-copy access\n");
+    return false;
+}
+
+extern "C" bool decklink_capture_latest_dvp_frame(DeckLinkDVPFrame* out) {
+    if (!out)
+        return false;
+
+    std::lock_guard<std::mutex> lk(g_latestMutex);
+    if (!g_latestFrame.buffer)
+        return false;
+
+    const DVPBufferRecord* record = g_latestFrame.buffer;
+    out->seq = record->seq;
+    out->timestamp_ns = record->timestampNs;
+    out->sysmem_handle = record->sysmemHandle;
+    out->sync_handle = record->syncHandle;
+    out->semaphore_addr = reinterpret_cast<uint64_t>(record->semaphore);
+    out->cpu_ptr = static_cast<const uint8_t*>(record->basePtr);
+    out->buffer_size = record->size;
+    out->width = record->width;
+    out->height = record->height;
+    out->row_bytes = record->rowBytes;
+    out->pixel_format = static_cast<uint32_t>(record->pixelFormat);
+    out->release_value = record->releaseValue;
+    out->reserved = 0;
     return true;
+}
+
+extern "C" void decklink_capture_reset_dvp_fence() {
+    reset_latest_frame();
+    g_frameSeq.store(0, std::memory_order_relaxed);
 }
 
 extern "C" void decklink_capture_close() {
@@ -837,33 +1112,36 @@ extern "C" void decklink_capture_close() {
         if (g_screenPreview) {
             g_input->SetScreenPreviewCallback(nullptr);
         }
+        g_input->SetVideoInputFrameMemoryAllocator(nullptr);
     }
     if (g_callback) { g_callback->Release(); g_callback = nullptr; }
+    if (g_allocator) { g_allocator->Release(); g_allocator = nullptr; }
     if (g_input) { g_input->Release(); g_input = nullptr; }
     if (g_device) { g_device->Release(); g_device = nullptr; }
     if (g_iterator) { g_iterator->Release(); g_iterator = nullptr; }
-
-    // Reset shared frame
-    {
-        std::lock_guard<std::mutex> lk(g_shared.mtx);
-        g_shared.data.clear();
-        g_shared.width = 0;
-        g_shared.height = 0;
-        g_shared.row_bytes = 0;
-        g_shared.seq = 0;
-    }
+    reset_latest_frame();
+    g_frameSeq.store(0, std::memory_order_relaxed);
     if (g_screenPreview) { g_screenPreview->Release(); g_screenPreview = nullptr; }
     g_preview_seq.store(0, std::memory_order_relaxed);
+    shutdown_gpudirect();
 }
 
 extern "C" bool decklink_preview_attach_nsview(void* nsview_ptr) {
 #if defined(__APPLE__)
     if (g_screenPreview) { g_screenPreview->Release(); g_screenPreview = nullptr; }
-    g_screenPreview = CreateCocoaScreenPreview(nsview_ptr);
-    if (!g_screenPreview) {
+    IDeckLinkScreenPreviewCallback* previewBase = CreateCocoaScreenPreview(nsview_ptr);
+    if (!previewBase) {
         fprintf(stderr, "[shim] CreateCocoaScreenPreview failed\n");
         return false;
     }
+    IDeckLinkScreenPreviewCallback_v14_2_1* preview = nullptr;
+    if (previewBase->QueryInterface(IID_IDeckLinkScreenPreviewCallback_v14_2_1, (void**)&preview) != S_OK || !preview) {
+        fprintf(stderr, "[shim] QueryInterface(IDeckLinkScreenPreviewCallback_v14_2_1) failed\n");
+        previewBase->Release();
+        return false;
+    }
+    previewBase->Release();
+    g_screenPreview = preview;
     if (g_input) {
         if (g_input->SetScreenPreviewCallback(g_screenPreview) != S_OK) {
             fprintf(stderr, "[shim] SetScreenPreviewCallback failed\n");
@@ -939,7 +1217,7 @@ extern "C" bool decklink_preview_gl_enable() {
 }
 
 extern "C" bool decklink_preview_gl_render() {
-    IDeckLinkVideoFrame* frame = nullptr;
+    IDeckLinkVideoFrame_v14_2_1* frame = nullptr;
     uint64_t arrival = 0;
     {
         std::lock_guard<std::mutex> lk(g_glFrameMutex);
@@ -952,7 +1230,16 @@ extern "C" bool decklink_preview_gl_render() {
     if (!frame || !g_glPreview)
         return false;
 
-    HRESULT hr = g_glPreview->SetFrame(frame);
+    IDeckLinkVideoFrame* baseFrame = nullptr;
+    HRESULT qri = frame->QueryInterface(IID_IDeckLinkVideoFrame, (void**)&baseFrame);
+    if (qri != S_OK || !baseFrame) {
+        fprintf(stderr, "[shim] QueryInterface(IDeckLinkVideoFrame) failed hr=0x%08x\n", (unsigned)qri);
+        frame->Release();
+        return false;
+    }
+
+    HRESULT hr = g_glPreview->SetFrame(baseFrame);
+    baseFrame->Release();
     frame->Release();
     if (hr != S_OK) {
         fprintf(stderr, "[shim] SetFrame failed hr=0x%08x\n", (unsigned)hr);

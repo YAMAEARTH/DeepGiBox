@@ -16,6 +16,24 @@ use winit::event_loop::EventLoop;
 use winit::keyboard::{Key, NamedKey};
 use winit::window::Window;
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct DeckLinkDVPFrame {
+    seq: u64,
+    timestamp_ns: u64,
+    sysmem_handle: u64,
+    sync_handle: u64,
+    semaphore_addr: u64,
+    cpu_ptr: *const u8,
+    buffer_size: u64,
+    width: u32,
+    height: u32,
+    row_bytes: u32,
+    pixel_format: u32,
+    release_value: u32,
+    reserved: u32,
+}
+
 extern "C" {
     fn decklink_capture_open(device_index: i32) -> bool;
     fn decklink_capture_close();
@@ -26,12 +44,14 @@ extern "C" {
     fn decklink_preview_gl_render() -> bool;
     fn decklink_preview_gl_disable();
     fn decklink_preview_gl_destroy();
-    fn decklink_preview_gl_seq() -> u64;
-    fn decklink_preview_gl_last_timestamp_ns() -> u64;
     fn decklink_preview_gl_last_latency_ns() -> u64;
+
+    fn decklink_capture_latest_dvp_frame(out: *mut DeckLinkDVPFrame) -> bool;
+    fn decklink_capture_reset_dvp_fence();
 }
 
 unsafe fn cleanup_preview() {
+    decklink_capture_reset_dvp_fence();
     decklink_preview_gl_destroy();
     decklink_capture_close();
 }
@@ -162,7 +182,8 @@ fn main() -> Result<()> {
         }
     }
 
-    let mut last_seq = 0u64;
+    let mut last_dvp_seq = 0u64;
+    let mut latest_frame_info = DeckLinkDVPFrame::default();
     let mut frames = 0u32;
     let mut last_fps_instant = Instant::now();
 
@@ -184,15 +205,28 @@ fn main() -> Result<()> {
                         gl_state.swap_buffers();
                     }
 
-                    let seq = unsafe { decklink_preview_gl_seq() };
-                    if seq != last_seq {
-                        frames = frames.saturating_add(seq.saturating_sub(last_seq) as u32);
-                        last_seq = seq;
+                    let mut frame = DeckLinkDVPFrame::default();
+                    let has_dvp = unsafe { decklink_capture_latest_dvp_frame(&mut frame as *mut DeckLinkDVPFrame) };
+                    if has_dvp && frame.seq != 0 {
+                        if frame.seq != last_dvp_seq {
+                            frames = frames.saturating_add(frame.seq.saturating_sub(last_dvp_seq) as u32);
+                            last_dvp_seq = frame.seq;
+                        }
+                        latest_frame_info = frame;
                     }
                     if last_fps_instant.elapsed() >= Duration::from_secs(1) {
                         let latency_ns = unsafe { decklink_preview_gl_last_latency_ns() };
                         let latency_ms = latency_ns as f64 / 1_000_000.0;
-                        println!("fps: {frames}, latency: {latency_ms:.2} ms");
+                        if latest_frame_info.seq != 0 {
+                            println!(
+                                "fps: {frames}, latency: {latency_ms:.2} ms | dvp seq={} hBuf=0x{:x} sync=0x{:x}",
+                                latest_frame_info.seq,
+                                latest_frame_info.sysmem_handle,
+                                latest_frame_info.sync_handle
+                            );
+                        } else {
+                            println!("fps: {frames}, latency: {latency_ms:.2} ms");
+                        }
                         frames = 0;
                         last_fps_instant = Instant::now();
                     }
