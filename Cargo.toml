@@ -4,4 +4,4 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-opencv = { version = "0.95", features = ["cudawarping"] }
+opencv = { version = "0.95", features = ["cudawarping", "cudaimgproc", "cudaarithm"] }
