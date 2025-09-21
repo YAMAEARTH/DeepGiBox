@@ -1,1 +1,1 @@
-# onnxruntime-tensorrt
+use main.rs for inferencing with GPU binding and outpput at CPU

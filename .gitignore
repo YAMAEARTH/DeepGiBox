@@ -1,1 +1,43 @@
 /target
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+trt_cache/
+*.engine
+*.onnx
+*.plan
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+
+# Logs
+*.log
+
+# IDE / Editor configs
+.vscode/
+.idea/
+
+# TensorRT cache & large artifacts
+trt_cache/
+*.engine
+*.onnx
+*.plan
+
+# Checkpoints / Models
+*.pt
+*.pth
+*.ckpt
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/

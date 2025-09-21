@@ -6,3 +6,5 @@ edition = "2024"
 [dependencies]
 ort = { path = "../ort", features = ["tensorrt", "cuda"] }
 ndarray = "0.16"
+image = { version = "0.24", default-features = false, features = ["jpeg", "png"] }
+similari = "0.26.2"
