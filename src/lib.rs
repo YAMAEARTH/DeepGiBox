@@ -1,12 +1,26 @@
-// /Users/yamaearth/Documents/3_1/Capstone/Blackmagic DeckLink SDK 14.4/rust/src/lib.rs
-use libc::{c_char, int32_t};
+// DeepGI Pipeline - DeckLink Rust Library
+use libc::c_char;
 use std::ffi::CStr;
 use std::slice;
+
+// Export new pipeline modules
+pub mod packets;
+pub mod capture;
+pub mod preview;
+pub mod pipeline;
+pub mod headless;
+
+// Re-export key types for convenience
+pub use packets::*;
+pub use capture::{CaptureConfig, CaptureStage, DeckLinkCapture};
+pub use preview::{PreviewConfig, PreviewStage, DeckLinkPreview, PreviewStats};
+pub use pipeline::{Pipeline, PipelineBuilder, PipelineConfig, ProcessingStage, FrameInfoStage};
+pub use headless::{HeadlessProcessor, HeadlessConfig, PipelineStage};
 
 #[repr(C)]
 struct DLDeviceList {
     names: *mut *mut c_char,
-    count: int32_t,
+    count: i32,
 }
 
 extern "C" {

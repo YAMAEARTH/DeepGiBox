@@ -15,6 +15,7 @@ glutin-winit = "0.4"
 glow = "0.13"
 anyhow = "1.0"
 raw-window-handle = "0.5"
+thiserror = "1.0"
 
 [build-dependencies]
 cc = "1.0"
@@ -26,3 +27,11 @@ path = "src/bin/device_list.rs"
 [[bin]]
 name = "capture_preview_gl"
 path = "src/bin/capture_preview_gl.rs"
+
+[[bin]]
+name = "pipeline_example"
+path = "src/bin/pipeline_example.rs"
+
+[[bin]]
+name = "headless_test"
+path = "src/bin/headless_test.rs"
