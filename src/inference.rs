@@ -1,4 +1,4 @@
-use image::{imageops::FilterType, io::Reader as ImageReader, DynamicImage, GenericImageView};
+use image::{imageops::FilterType, io::Reader as ImageReader, GenericImageView, RgbImage};
 use ort::{
     execution_providers::TensorRTExecutionProvider,
     memory::{AllocationDevice, Allocator, AllocatorType, MemoryInfo, MemoryType},
@@ -15,8 +15,9 @@ pub const INPUT_SHAPE: [usize; 4] = [1, 3, INPUT_HEIGHT as usize, INPUT_WIDTH as
 
 pub struct PreprocessedImage {
     pub normalized: Vec<f32>,
-    pub original: DynamicImage,
     pub original_size: (u32, u32),
+    pub letterbox_scale: f32,
+    pub letterbox_pad: (f32, f32),
 }
 
 pub struct InferenceContext {
@@ -136,6 +137,13 @@ impl InferenceContext {
     }
 }
 
+
+// this is just generated preprocess replace with kot's version
+//***************************************
+//*************************************** 
+//*************************************** 
+//*************************************** 
+//***************************************  */
 pub fn preprocess_image(image_path: &Path) -> Result<PreprocessedImage> {
     let original = ImageReader::open(image_path)
         .map_err(Error::wrap)?
@@ -143,16 +151,31 @@ pub fn preprocess_image(image_path: &Path) -> Result<PreprocessedImage> {
         .map_err(Error::wrap)?;
     let original_size = original.dimensions();
 
+    let (orig_w, orig_h) = (original_size.0 as f32, original_size.1 as f32);
+    let scale = (INPUT_WIDTH as f32 / orig_w).min(INPUT_HEIGHT as f32 / orig_h);
+    let new_w = (orig_w * scale).round() as u32;
+    let new_h = (orig_h * scale).round() as u32;
+
     let resized = original
-        .resize_exact(INPUT_WIDTH, INPUT_HEIGHT, FilterType::Triangle)
+        .resize_exact(new_w.max(1), new_h.max(1), FilterType::Triangle)
         .to_rgb8();
+
+    let pad_x = ((INPUT_WIDTH - new_w) / 2) as u32;
+    let pad_y = ((INPUT_HEIGHT - new_h) / 2) as u32;
+
+    let mut letterboxed = RgbImage::from_pixel(INPUT_WIDTH, INPUT_HEIGHT, image::Rgb([114, 114, 114]));
+    for y in 0..new_h {
+        for x in 0..new_w {
+            let pixel = resized.get_pixel(x, y);
+            letterboxed.put_pixel(x + pad_x, y + pad_y, *pixel);
+        }
+    }
 
     let mut normalized = vec![0.0f32; (INPUT_WIDTH * INPUT_HEIGHT * 3) as usize];
     let plane_size = (INPUT_WIDTH * INPUT_HEIGHT) as usize;
-
     for y in 0..INPUT_HEIGHT {
         for x in 0..INPUT_WIDTH {
-            let pixel = resized.get_pixel(x, y);
+            let pixel = letterboxed.get_pixel(x, y);
             let idx = (y * INPUT_WIDTH + x) as usize;
             normalized[idx] = pixel[0] as f32 / 255.0;
             normalized[idx + plane_size] = pixel[1] as f32 / 255.0;
@@ -162,7 +185,12 @@ pub fn preprocess_image(image_path: &Path) -> Result<PreprocessedImage> {
 
     Ok(PreprocessedImage {
         normalized,
-        original,
         original_size,
+        letterbox_scale: scale,
+        letterbox_pad: (pad_x as f32, pad_y as f32),
     })
 }
+//*************************************** 
+//*************************************** 
+//*************************************** 
+//*************************************** 
