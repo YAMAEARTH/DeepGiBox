@@ -26,3 +26,11 @@ path = "src/bin/device_list.rs"
 [[bin]]
 name = "capture_preview_gl"
 path = "src/bin/capture_preview_gl.rs"
+
+[[bin]]
+name = "capture"
+path = "src/bin/capture.rs"
+
+[[bin]]
+name = "preview_gl"
+path = "src/bin/preview_gl.rs"

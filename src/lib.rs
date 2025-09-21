@@ -1,12 +1,15 @@
 // /Users/yamaearth/Documents/3_1/Capstone/Blackmagic DeckLink SDK 14.4/rust/src/lib.rs
-use libc::{c_char, int32_t};
+use libc::c_char;
 use std::ffi::CStr;
 use std::slice;
+
+pub mod capture;
+pub mod preview_gl;
 
 #[repr(C)]
 struct DLDeviceList {
     names: *mut *mut c_char,
-    count: int32_t,
+    count: i32,
 }
 
 extern "C" {

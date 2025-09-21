@@ -20,6 +20,9 @@ Note: The repo currently focuses on macOS and links against `DeckLinkAPI.framewo
   - `src/bin/capture_preview.rs` — CPU preview (`minifb`)
   - `src/bin/capture_preview_wgpu.rs` — GPU preview (`wgpu`)
   - `src/bin/capture_preview_screen.rs` — Cocoa NSView screen preview
+  - `src/bin/capture_preview_gl.rs` — combined OpenGL preview + capture
+  - `src/bin/capture.rs` — capture-only helper that logs frame metadata
+  - `src/bin/preview_gl.rs` — OpenGL preview that reuses the capture session wrapper
 
 ## System Requirements
 - macOS with Blackmagic Desktop Video (driver) and DeckLink SDK installed
