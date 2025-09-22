@@ -4,18 +4,25 @@ use std::ffi::CStr;
 use std::slice;
 
 // Export new pipeline modules
-pub mod packets;
 pub mod capture;
-pub mod preview;
-pub mod pipeline;
 pub mod headless;
+pub mod packets;
+pub mod pipeline;
+pub mod preprocessing;
+pub mod preprocessing_v2;
+pub mod preview;
 
 // Re-export key types for convenience
 pub use packets::*;
 pub use capture::{CaptureConfig, CaptureStage, DeckLinkCapture};
 pub use preview::{PreviewConfig, PreviewStage, DeckLinkPreview, PreviewStats};
 pub use pipeline::{Pipeline, PipelineBuilder, PipelineConfig, ProcessingStage, FrameInfoStage};
-pub use headless::{HeadlessProcessor, HeadlessConfig, PipelineStage};
+pub use preprocessing::{PreprocessingStage, PreprocessingStageConfig};
+pub use headless::{
+    HeadlessProcessor, HeadlessConfig, StageMetrics,
+    InferenceConfig, PostProcessingConfig, 
+    TrackingConfig, OverlayConfig, KeyingConfig, OutputConfig
+};
 
 #[repr(C)]
 struct DLDeviceList {

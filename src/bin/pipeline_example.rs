@@ -1,8 +1,9 @@
 use std::time::Duration;
 use anyhow::Result;
 use decklink_rust::{
-    PipelineBuilder, CaptureConfig, PreviewConfig, ColorSpace, 
-    ProcessingStage, RawFramePacket, PipelineError
+    CaptureConfig, ColorSpace, 
+    ProcessingStage, RawFramePacket, PipelineError,
+    PreprocessingStage, PreprocessingStageConfig
 };
 
 /// Custom processing stage that demonstrates frame modification
@@ -81,9 +82,18 @@ fn main() -> Result<()> {
     println!("Pipeline configuration:");
     println!("  Device: {} ({})", 0, devices.get(0).unwrap_or(&"Unknown".to_string()));
     println!("  Source ID: {}", 42);
-    println!("  Processing: Custom AI Processing Stage");
-    println!("  Mode: Headless capture + processing");
+    println!("  Processing: Preprocessing + Custom AI Processing Stage");
+    println!("  Mode: Headless capture + preprocessing + processing");
     println!();
+
+    // Create preprocessing configuration
+    let preprocessing_config = PreprocessingStageConfig {
+        pan_x: 0,
+        pan_y: 0,
+        zoom: 1.5, // 1.5x zoom for demo
+        target_size: (512, 512),
+        debug: true,
+    };
 
     // Create capture stage directly (headless mode)
     let mut capture_stage = decklink_rust::capture::CaptureStage::new(capture_config);
@@ -94,6 +104,7 @@ fn main() -> Result<()> {
             println!("✓ Capture started successfully!");
             println!("Processing frames... (Running for 10 seconds)");
             
+            let mut preprocessing_stage = PreprocessingStage::new(preprocessing_config);
             let mut processing_stage = CustomProcessingStage::new("AI_Processor");
             let start_time = std::time::Instant::now();
             let mut total_processed = 0u64;
@@ -103,8 +114,18 @@ fn main() -> Result<()> {
             while start_time.elapsed() < Duration::from_secs(10) {
                 match capture_stage.get_next_frame() {
                     Ok(Some(frame)) => {
-                        // Process the frame through our custom stage
-                        match processing_stage.process(frame) {
+                        // First run preprocessing
+                        let preprocessed_frame = match preprocessing_stage.process(frame) {
+                            Ok(frame) => frame,
+                            Err(e) => {
+                                eprintln!("Preprocessing error: {}", e);
+                                total_dropped += 1;
+                                continue;
+                            }
+                        };
+                        
+                        // Then run custom processing
+                        match processing_stage.process(preprocessed_frame) {
                             Ok(_processed_frame) => {
                                 total_processed += 1;
                                 // Here you would normally pass the processed frame to the next stage

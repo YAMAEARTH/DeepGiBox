@@ -119,10 +119,11 @@ pub enum ColorFormat {
     BGR,
 }
 
-/// Memory location for tensor data (GPU only for now)
+/// Memory location for tensor data
 #[derive(Debug, Clone)]
 pub enum TensorMem {
     Cuda { device_ptr: u64 },
+    Cpu { data: Vec<u8> },
 }
 
 /// Tensor input packet for inference stage

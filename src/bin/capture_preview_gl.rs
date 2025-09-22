@@ -188,7 +188,7 @@ fn main() -> Result<()> {
 
                     // Print stats periodically
                     if last_stats_time.elapsed() >= Duration::from_secs(1) {
-                        let pipeline_stats = pipeline.get_stats();
+                        let pipeline_stats = pipeline.get_performance_stats();
                         let preview_stats = pipeline.get_preview_stats();
                         
                         println!(
