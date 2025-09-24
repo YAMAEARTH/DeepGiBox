@@ -1,4 +1,5 @@
-// /Users/yamaearth/Documents/3_1/Capstone/Blackmagic DeckLink SDK 14.4/rust/src/lib.rs
+pub mod capture;
+
 use libc::{c_char, int32_t};
 use std::ffi::CStr;
 use std::slice;
