@@ -24,26 +24,29 @@ fn main() -> Result<()> {
     let input_tensor = context.prepare_input(&preprocessed.normalized)?;
     let inference_output = context.run(&input_tensor)?;
 
+    println!("{:?}", inference_output.shape);
     println!("Inference completed in {:?}", inference_output.duration);
     println!("Model output shape: {:?}", inference_output.shape);
 
-    let num_classes = inference_output
-        .shape
-        .last()
-        .map(|last| (*last as usize).saturating_sub(5))
-        .filter(|&classes| classes > 0)
-        .unwrap_or(1);
-
-    let stride = 5 + num_classes;
-    if let Some(first_detection) = inference_output.predictions.chunks(stride).next() {
-        println!(
-            "First raw detection chunk: {:?}",
-            &first_detection[..first_detection.len().min(stride)]
-        );
+    let stride = 7; // as in your run
+    if let Some(chunk) = inference_output.predictions.chunks(stride).next() {
+        let cx = chunk[0];
+        let cy = chunk[1];
+        let w = chunk[2];
+        let h = chunk[3];
+        let obj = chunk[4];
+        let class_scores = &chunk[5..7];
+        let (class_id, &class_score) = class_scores
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap();
+        let final_score = obj * class_score;
+        println!("cx={} cy={} w={} h={} obj={} class={} score={}", cx, cy, w, h, obj, class_id, final_score);
     }
 
+    let num_classes = 2;    
     let mut tracker = SortTracker::new(3, 1, 0.3);
-
     let post_cfg = YoloPostConfig {
         num_classes,
         confidence_threshold: 0.35,

@@ -41,3 +41,5 @@ trt_cache/
 
 # Jupyter Notebook checkpoints
 .ipynb_checkpoints/
+
+*.mp4
