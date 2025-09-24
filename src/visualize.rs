@@ -23,6 +23,30 @@ pub fn visualize_detections(
     Ok(())
 }
 
+pub fn visualize_detections_on_image(
+    image: &RgbImage,
+    result: &PostprocessingResult,
+) -> Result<RgbImage> {
+    let mut output_image = image.clone();
+    
+    // Draw all detections
+    for detection in &result.detections {
+        draw_bbox(&mut output_image, detection.bbox, BOX_COLOR);
+    }
+    
+    // Draw all tracks (if any)
+    for track in &result.tracks {
+        // Use different color for tracks
+        const TRACK_COLOR: [u8; 3] = [0, 255, 0]; // Green for tracks
+        draw_bbox(&mut output_image, track.bbox, TRACK_COLOR);
+        
+        // You could also draw track ID here if needed
+        // draw_text(&mut output_image, &track.id.to_string(), track.bbox);
+    }
+    
+    Ok(output_image)
+}
+
 fn load_image(path: &Path) -> Result<RgbImage> {
     ImageReader::open(path)
         .map_err(Error::wrap)?
