@@ -4,27 +4,27 @@ This project demonstrates using the Blackmagic DeckLink SDK from Rust via a C++ 
 - List DeckLink devices
 - Open a video capture stream and preview frames
   - CPU preview using `minifb`
-  - GPU preview using `winit + wgpu`
-  - Native macOS Cocoa Screen Preview that renders directly to an NSView for ultra-low latency
+  - OpenGL preview using the DeckLink GL screen preview helper
+- Inspect 8-bit YUV frame buffers without conversion
 
-Note: The repo currently focuses on macOS and links against `DeckLinkAPI.framework`.
+Note: The repo currently targets Linux and links against the DeckLink SDK shared library (`libDeckLinkAPI.so`).
 
 ## Project Layout
 - `Cargo.toml` — package, example binaries, and dependencies
-- `build.rs` — builds the C++ shim and links `DeckLinkAPI.framework` (also adds `DeckLinkAPIDispatch.cpp`)
-- `shim/shim.cpp` — C++ shim exposing a C ABI around DeckLink (device list, capture, screen preview)
-- `include/` — DeckLink SDK headers plus `DeckLinkAPIDispatch.cpp` for macOS
+- `build.rs` — builds the C++ shim and links `libDeckLinkAPI.so` (also adds `DeckLinkAPIDispatch.cpp`)
+- `shim/shim.cpp` — C++ shim exposing a C ABI around DeckLink (device list, capture, OpenGL preview)
+- `include/` — DeckLink SDK headers plus `DeckLinkAPIDispatch.cpp`
 - `src/lib.rs` — safe Rust wrapper(s) such as device listing
 - Example binaries:
   - `src/bin/device_list.rs` — list devices
-  - `src/bin/capture_preview.rs` — CPU preview (`minifb`)
-  - `src/bin/capture_preview_wgpu.rs` — GPU preview (`wgpu`)
-  - `src/bin/capture_preview_screen.rs` — Cocoa NSView screen preview
+  - `src/bin/capture_preview_gl.rs` — OpenGL preview via DeckLinkGLScreenPreviewHelper
+  - `src/bin/capture_test.rs` — minimal capture loop for experiments
+  - `src/bin/capture_yuv_dump.rs` — inspect DeckLink 8-bit YUV frames
 
 ## System Requirements
-- macOS with Blackmagic Desktop Video (driver) and DeckLink SDK installed
-- `DeckLinkAPI.framework` available at `/Library/Frameworks/DeckLinkAPI.framework`
-- Rust toolchain (`rustup`) and Xcode Command Line Tools
+- Linux with Blackmagic Desktop Video (driver) and DeckLink SDK installed
+- `libDeckLinkAPI.so` available on the loader search path (e.g., `/usr/lib`, `/usr/local/lib`, or via `LD_LIBRARY_PATH`)
+- Rust toolchain (`rustup`) and standard build tools (e.g., `build-essential`)
 
 SDK setup options:
 - The project includes `include/` with headers and `DeckLinkAPIDispatch.cpp`
@@ -41,7 +41,7 @@ cargo build
 cargo build --release
 ```
 
-If `DeckLinkAPI.framework` is not under `/Library/Frameworks`, install it via Blackmagic Desktop Video or copy it there before building.
+Ensure `libDeckLinkAPI.so` can be found at runtime; adjust `LD_LIBRARY_PATH` if the library lives outside standard locations.
 
 ## Usage (example binaries)
 The examples default to using the first device (index 0). To use another device, adjust the index in the example source for now.
@@ -51,33 +51,32 @@ The examples default to using the first device (index 0). To use another device,
 cargo run --bin devicelist
 ```
 
-- CPU preview (convert to BGRA then display via `minifb`)
+- OpenGL preview (DeckLink GL helper)
 ```bash
-cargo run --bin capture_preview
+cargo run --bin capture_preview_gl
 ```
 
-- GPU preview via wgpu (Metal on macOS)
+- Dump 8-bit YUV frames to console
 ```bash
-cargo run --bin capture_preview_wgpu
+cargo run --bin capture_yuv_dump
 ```
 
-- Cocoa NSView screen preview (very low latency)
+- Minimal capture loop for testing
 ```bash
-cargo run --bin capture_preview_screen
+cargo run --bin capture_test
 ```
 Press Esc to exit in preview modes.
 
 ## Technical Notes
-- The C++ shim (`shim/shim.cpp`) exposes C ABI functions (`decklink_list_devices`, `decklink_capture_open`, `decklink_capture_get_frame`, `decklink_preview_attach_nsview`, etc.) for Rust to call
-- Multiple pixel formats are converted to BGRA for CPU preview (e.g., UYVY, YUYV, v210 → BGRA)
-- The Screen Preview path renders directly into an NSView via DeckLink, minimizing copies and latency
+- The C++ shim (`shim/shim.cpp`) exposes C ABI functions (`decklink_list_devices`, `decklink_capture_open`, `decklink_capture_get_frame`, `decklink_capture_close`, and DeckLink GL preview helpers) for Rust to call
+- DeckLink input is configured to deliver raw 8-bit YUV (UYVY); the shim copies each row verbatim into a shared buffer for Rust consumers
 - `build.rs`:
-  - Adds link search and links `DeckLinkAPI.framework`, `CoreFoundation`, `CoreVideo`
-  - Compiles `shim/shim.cpp` and includes `DeckLinkAPIDispatch.cpp` when found in known locations (`include/`, `DECKLINK_SDK_DIR`, etc.)
+  - Adds native link search paths and links against `libDeckLinkAPI`
+  - Compiles `shim/shim.cpp` and includes `DeckLinkAPIDispatch.cpp` when found in common locations (`include/`, `DECKLINK_SDK_DIR`, etc.)
 
 ## Troubleshooting
-- Framework not found at build time
-  - Ensure `/Library/Frameworks/DeckLinkAPI.framework` exists and Blackmagic Desktop Video is installed
+- Shared library not found at build or run time
+  - Ensure `libDeckLinkAPI.so` is installed (part of Desktop Video) and visible to both the linker and runtime loader (update `LD_LIBRARY_PATH` or copy it into `/usr/lib`/`/usr/local/lib`)
 - `DeckLinkAPIDispatch.cpp` missing
   - The repo includes it under `include/`. If removed, set `DECKLINK_SDK_DIR` correctly or restore the file
 - No video shown at runtime
@@ -86,7 +85,7 @@ Press Esc to exit in preview modes.
   - If multiple cards/ports are present, update the device index in the example
 
 ## Limitations
-- macOS-focused (Metal/wgpu + DeckLinkAPI.framework)
+- Linux-only for now (tested with Desktop Video 14.x)
 - No CLI flags yet for selecting device/mode (edit the example source for now)
 - Examples do not include audio/recording yet
 
@@ -102,27 +101,27 @@ Press Esc to exit in preview modes.
 - ค้นหาอุปกรณ์ DeckLink (device list)
 - เปิดสตรีมวิดีโอจากการ์ดและแสดงผลแบบพรีวิว
   - โหมดพรีวิวผ่าน CPU (`minifb`)
-  - โหมดพรีวิวผ่าน GPU (`winit + wgpu`)
-  - โหมดพรีวิวแบบแนบตรงกับ NSView ของ macOS (Cocoa Screen Preview) — ลดดีเลย์สูงสุด
+  - โหมดพรีวิวผ่าน OpenGL ด้วย DeckLink GL screen preview helper
+- ดึงเฟรม YUV 8-bit ไปจัดเก็บ/ประมวลผลภายหลัง
 
-หมายเหตุ: โค้ดในรีโปนี้โฟกัสที่ macOS (DeckLinkAPI.framework) เป็นหลักในตอนนี้
+หมายเหตุ: ตอนนี้รีโปโฟกัสการทำงานบน Linux โดยเชื่อมกับไลบรารี `libDeckLinkAPI.so`
 
 ## โครงสร้างสำคัญของโปรเจ็กต์
 - `Cargo.toml` — กำหนดแพ็กเกจ, ไบนารีตัวอย่าง และไลบรารีที่ใช้
-- `build.rs` — คอมไพล์ C++ shim และแนบ DeckLinkAPI.framework รวมถึง `DeckLinkAPIDispatch.cpp`
-- `shim/shim.cpp` — C++ shim ที่ห่อ DeckLink SDK เป็น C ABI (เช่น list devices, capture, screen preview)
-- `include/` — เฮดเดอร์ DeckLink SDK และ `DeckLinkAPIDispatch.cpp` สำหรับ macOS
+- `build.rs` — คอมไพล์ C++ shim และลิงก์กับ `libDeckLinkAPI.so` (พร้อมเพิ่ม `DeckLinkAPIDispatch.cpp` หากพบ)
+- `shim/shim.cpp` — C++ shim ที่ห่อ DeckLink SDK เป็น C ABI (list devices, capture, OpenGL preview)
+- `include/` — เฮดเดอร์ DeckLink SDK และ `DeckLinkAPIDispatch.cpp`
 - `src/lib.rs` — ฟังก์ชัน Rust แบบปลอดภัยสำหรับดึงรายชื่ออุปกรณ์ เป็นต้น
 - ตัวอย่างไบนารี:
   - `src/bin/device_list.rs` — แสดงรายชื่ออุปกรณ์
-  - `src/bin/capture_preview.rs` — พรีวิวผ่าน CPU (`minifb`)
-  - `src/bin/capture_preview_wgpu.rs` — พรีวิวผ่าน GPU (`wgpu`)
-  - `src/bin/capture_preview_screen.rs` — พรีวิวแบบแนบ NSView (Cocoa)
+  - `src/bin/capture_preview_gl.rs` — พรีวิวผ่าน OpenGL (DeckLinkGLScreenPreviewHelper)
+  - `src/bin/capture_test.rs` — ลูปจับภาพแบบเรียบง่ายสำหรับทดลอง
+  - `src/bin/capture_yuv_dump.rs` — ตรวจสอบเฟรม YUV 8-bit
 
 ## ข้อกำหนดระบบ
-- macOS พร้อมติดตั้ง Blackmagic Desktop Video (ไดรเวอร์) และ DeckLink SDK
-- มี `DeckLinkAPI.framework` ที่ `/Library/Frameworks/DeckLinkAPI.framework`
-- ติดตั้ง Rust (ผ่าน `rustup`) และมี Xcode Command Line Tools
+- Linux ที่ติดตั้ง Blackmagic Desktop Video (ไดรเวอร์) และ DeckLink SDK
+- มี `libDeckLinkAPI.so` อยู่ในเส้นทางที่ตัวลิงเกอร์/รันไทม์มองเห็น (เช่น `/usr/lib`, `/usr/local/lib` หรือกำหนด `LD_LIBRARY_PATH`)
+- ติดตั้ง Rust (ผ่าน `rustup`) และชุดเครื่องมือคอมไพล์พื้นฐาน (เช่น `build-essential`)
 
 ทางเลือกการตั้งค่า SDK:
 - โฟลเดอร์ `include/` ในโปรเจ็กต์มีเฮดเดอร์ + `DeckLinkAPIDispatch.cpp` มาให้แล้ว
@@ -139,7 +138,7 @@ cargo build
 cargo build --release
 ```
 
-หาก `DeckLinkAPI.framework` ไม่อยู่ใต้ `/Library/Frameworks` ให้ติดตั้งจาก Blackmagic Desktop Video SDK หรือคัดลอกไปยังตำแหน่งดังกล่าวก่อนคอมไพล์
+หากระบบไม่พบ `libDeckLinkAPI.so` ให้เพิ่มตำแหน่งไลบรารีไปยัง `LD_LIBRARY_PATH` หรือคัดลอกไปยังไดเรกทอรีมาตรฐานก่อนคอมไพล์/รัน
 
 ## การใช้งาน (ตัวอย่างไบนารี)
 แอปตัวอย่างทุกตัวในตอนนี้เลือกใช้อุปกรณ์ตัวแรก (index 0) หากต้องการเลือกอุปกรณ์อื่น ให้แก้ไขโค้ดที่เกี่ยวข้องในไฟล์ตัวอย่างนั้นๆ
@@ -149,33 +148,32 @@ cargo build --release
 cargo run --bin devicelist
 ```
 
-- พรีวิวแบบ CPU (คอนเวิร์ตเป็น BGRA แล้วแสดงผลด้วย `minifb`)
+- พรีวิวผ่าน OpenGL (DeckLink GL helper)
 ```bash
-cargo run --bin capture_preview
+cargo run --bin capture_preview_gl
 ```
 
-- พรีวิวแบบ GPU ผ่าน wgpu (Metal บน macOS)
+- ตรวจสอบเฟรม YUV 8-bit บนคอนโซล
 ```bash
-cargo run --bin capture_preview_wgpu
+cargo run --bin capture_yuv_dump
 ```
 
-- พรีวิวแบบแนบ NSView (Cocoa Screen Preview; ดีเลย์ต่ำมาก)
+- ลูปจับภาพแบบง่ายสำหรับทดลอง
 ```bash
-cargo run --bin capture_preview_screen
+cargo run --bin capture_test
 ```
 กด Esc เพื่อปิดหน้าต่าง/ออกจากโปรแกรมในโหมดพรีวิว
 
 ## รายละเอียดด้านเทคนิคโดยย่อ
-- C++ shim (`shim/shim.cpp`) ห่อ DeckLink SDK ให้เป็น C ABI ที่ Rust เรียกได้สะดวก (เช่น `decklink_list_devices`, `decklink_capture_open`, `decklink_capture_get_frame`, `decklink_preview_attach_nsview`)
-- รองรับสัญญาณหลายแบบและคอนเวิร์ตเป็น BGRA สำหรับพรีวิว CPU (เช่น UYVY, YUYV, v210 → BGRA)
-- โหมด Screen Preview ใช้ DeckLink API เรนเดอร์เข้าสู่ NSView โดยตรง (ลดการคัดลอกบัฟเฟอร์)
+- C++ shim (`shim/shim.cpp`) ห่อ DeckLink SDK เป็น C ABI ที่ Rust เรียกใช้ง่าย (เช่น `decklink_list_devices`, `decklink_capture_open`, `decklink_capture_get_frame`, `decklink_capture_close`, รวมถึงฟังก์ชัน DeckLink GL preview)
+- กำหนดให้ DeckLink ส่งเฟรม YUV 8-bit (UYVY) โดยตรง ตัว shim ทำหน้าที่คัดลอกข้อมูลรายแถวเข้าสู่บัฟเฟอร์ที่ฝั่ง Rust อ่านต่อได้เลย
 - `build.rs` จะ:
-  - เพิ่มเส้นทางลิงก์ `DeckLinkAPI.framework`, `CoreFoundation`, `CoreVideo`
-  - คอมไพล์ `shim/shim.cpp` และแนบ `DeckLinkAPIDispatch.cpp` ถ้าพบในตำแหน่งที่รู้จัก (`include/`, `DECKLINK_SDK_DIR`, ฯลฯ)
+  - เพิ่มเส้นทางลิงก์แบบ native และลิงก์กับ `libDeckLinkAPI`
+  - คอมไพล์ `shim/shim.cpp` และแนบ `DeckLinkAPIDispatch.cpp` หากพบในตำแหน่งที่รู้จัก (`include/`, `DECKLINK_SDK_DIR`, ฯลฯ)
 
 ## การแก้ไขปัญหา (Troubleshooting)
-- คอมไพล์ไม่เจอ DeckLink framework
-  - ตรวจสอบว่ามี `/Library/Frameworks/DeckLinkAPI.framework` และติดตั้ง Blackmagic Desktop Video ถูกต้อง
+- คอมไพล์/รัน แล้วไม่เจอ `libDeckLinkAPI.so`
+  - ตรวจสอบว่าติดตั้ง Blackmagic Desktop Video แล้ว และเพิ่มเส้นทางไลบรารีลงใน `LD_LIBRARY_PATH` หรือคัดลอก `.so` ไปยัง `/usr/lib` / `/usr/local/lib`
 - คอมไพล์ไม่พบ `DeckLinkAPIDispatch.cpp`
   - โปรเจ็กต์นี้มีไฟล์ใน `include/` แล้ว หากย้ายออก ให้กำหนดตัวแปร `DECKLINK_SDK_DIR` ให้อยู่ถูกที่ หรือคัดลอกไฟล์กลับมา
 - รันแล้วไม่เห็นภาพ
@@ -184,7 +182,7 @@ cargo run --bin capture_preview_screen
   - ถ้าต่อหลายการ์ด/หลายพอร์ต ให้แก้ไข index อุปกรณ์ในซอร์สไบนารีที่ใช้งาน
 
 ## ข้อจำกัดปัจจุบัน
-- โฟกัสที่ macOS เป็นหลัก (Metal/wgpu + DeckLinkAPI.framework)
+- โฟกัสที่ Linux เป็นหลักในตอนนี้
 - ยังไม่ได้ทำ CLI เลือกอุปกรณ์/โหมดรับสัญญาณ (แก้ชั่วคราวได้ในซอร์สของไบนารี)
 - ยังไม่รองรับการบันทึกเสียง/ไฟล์ในตัวอย่าง
 

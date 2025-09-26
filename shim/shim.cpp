@@ -7,13 +7,6 @@
 #include <cstdio>
 #include <chrono>
 
-#if defined(_WIN32)
-  #include <windows.h>
-#elif defined(__APPLE__)
-  #include <CoreFoundation/CoreFoundation.h>
-  #include <CoreVideo/CoreVideo.h>
-#endif
-
 // Include DeckLink SDK header (ensure include path points to where this header lives)
 #include "DeckLinkAPI.h"
 #include "DeckLinkAPIModes.h"
@@ -23,9 +16,7 @@
 #include "DeckLinkAPIVideoInput_v14_2_1.h"
 #include "DeckLinkAPIScreenPreviewCallback_v14_2_1.h"
 
-#if !defined(__APPLE__)
 static const REFIID kIID_IUnknown = IID_IUnknown;
-#endif
 
 extern "C" {
 
@@ -34,56 +25,13 @@ struct DLDeviceList {
     int32_t count;
 };
 
-static char* dup_utf8_from_bmd_str(
-#if defined(_WIN32)
-    BSTR s
-#elif defined(__APPLE__)
-    CFStringRef s
-#else
-    const char* s
-#endif
-) {
-#if defined(_WIN32)
-    if (!s) return strdup("(unknown)");
-    int size = WideCharToMultiByte(CP_UTF8, 0, s, -1, nullptr, 0, nullptr, nullptr);
-    if (size <= 0) return strdup("(unknown)");
-    char* out = (char*)std::malloc((size_t)size);
-    if (!out) return nullptr;
-    WideCharToMultiByte(CP_UTF8, 0, s, -1, out, size, nullptr, nullptr);
-    return out;
-#elif defined(__APPLE__)
-    if (!s) return strdup("(unknown)");
-    CFIndex len = CFStringGetLength(s);
-    CFIndex maxSize = CFStringGetMaximumSizeForEncoding(len, kCFStringEncodingUTF8) + 1;
-    char* out = (char*)std::malloc((size_t)maxSize);
-    if (!out) return nullptr;
-    if (!CFStringGetCString(s, out, maxSize, kCFStringEncodingUTF8)) {
-        std::free(out);
-        return strdup("(unknown)");
-    }
-    return out;
-#else
+static char* dup_utf8_from_bmd_str(const char* s) {
     if (!s) return strdup("(unknown)");
     return strdup(s);
-#endif
 }
 
-static void release_bmd_str(
-#if defined(_WIN32)
-    BSTR s
-#elif defined(__APPLE__)
-    CFStringRef s
-#else
-    const char* s
-#endif
-) {
-#if defined(_WIN32)
-    if (s) SysFreeString(s);
-#elif defined(__APPLE__)
-    if (s) CFRelease(s);
-#else
+static void release_bmd_str(const char* s) {
     if (s) std::free((void*)s); // Linux SDK returns malloc'd char*
-#endif
 }
 
 DLDeviceList decklink_list_devices() {
@@ -98,13 +46,7 @@ DLDeviceList decklink_list_devices() {
     IDeckLink* deckLink = nullptr;
 
     while (it->Next(&deckLink) == S_OK && deckLink) {
-#if defined(_WIN32)
-        BSTR bname = nullptr;
-#elif defined(__APPLE__)
-        CFStringRef bname = nullptr;
-#else
         const char* bname = nullptr;
-#endif
         if (deckLink->GetDisplayName(&bname) == S_OK) {
             char* cstr = dup_utf8_from_bmd_str(bname);
             release_bmd_str(bname);
@@ -160,10 +102,10 @@ void decklink_capture_close();
 namespace {
 
 struct SharedFrame {
-    std::vector<uint8_t> data; // BGRA
+    std::vector<uint8_t> data; // 8-bit YUV (DeckLink UYVY layout)
     int32_t width = 0;
     int32_t height = 0;
-    int32_t row_bytes = 0; // width * 4
+    int32_t row_bytes = 0; // bytes per input row as reported by DeckLink
     std::mutex mtx;
     uint64_t seq = 0;
 };
@@ -172,8 +114,6 @@ static IDeckLinkIterator* g_iterator = nullptr;
 static IDeckLink* g_device = nullptr;
 static IDeckLinkInput* g_input = nullptr;
 static SharedFrame g_shared;
-static IDeckLinkScreenPreviewCallback* g_screenPreview = nullptr; // Cocoa Screen Preview (NSView)
-static std::atomic<uint64_t> g_preview_seq{0};
 
 // OpenGL preview helper (cross-platform)
 static IDeckLinkGLScreenPreviewHelper* g_glPreview = nullptr;
@@ -199,20 +139,6 @@ public:
     // IUnknown
     HRESULT QueryInterface(REFIID iid, void** ppv) override {
         if (!ppv) return E_POINTER;
-#if defined(__APPLE__)
-        // macOS style IUnknown UUID เปรียบเทียบผ่าน CoreFoundation
-        CFUUIDBytes iunknown = CFUUIDGetUUIDBytes(IUnknownUUID);
-        if (memcmp(&iid, &iunknown, sizeof(CFUUIDBytes)) == 0) {
-            *ppv = static_cast<IUnknown*>(this);
-            AddRef();
-            return S_OK;
-        }
-        if (memcmp(&iid, &IID_IDeckLinkInputCallback, sizeof(CFUUIDBytes)) == 0) {
-            *ppv = static_cast<IDeckLinkInputCallback*>(this);
-            AddRef();
-            return S_OK;
-        }
-#else
         if (memcmp(&iid, &kIID_IUnknown, sizeof(REFIID)) == 0) {
             *ppv = static_cast<IUnknown*>(this);
             AddRef();
@@ -223,7 +149,6 @@ public:
             AddRef();
             return S_OK;
         }
-#endif
         *ppv = nullptr;
         return E_NOINTERFACE;
     }
@@ -235,186 +160,36 @@ public:
     }
 
     // IDeckLinkInputCallback
-    HRESULT VideoInputFormatChanged(BMDVideoInputFormatChangedEvents /*events*/, IDeckLinkDisplayMode* newDisplayMode, BMDDetectedVideoInputFormatFlags detectedSignalFlags) override {
+    HRESULT VideoInputFormatChanged(BMDVideoInputFormatChangedEvents /*events*/, IDeckLinkDisplayMode* newDisplayMode, BMDDetectedVideoInputFormatFlags /*detectedSignalFlags*/) override {
         if (!newDisplayMode || !g_input) return S_OK;
-        BMDPixelFormat pix = bmdFormat10BitYUV;
-        if (detectedSignalFlags & bmdDetectedVideoInputRGB444)
-            pix = bmdFormat8BitBGRA;
-        else if (detectedSignalFlags & bmdDetectedVideoInputYCbCr422)
-            pix = bmdFormat10BitYUV;
         BMDTimeValue fd = 0; BMDTimeScale ts = 0;
         newDisplayMode->GetFrameRate(&fd, &ts);
         long w = newDisplayMode->GetWidth();
         long h = newDisplayMode->GetHeight();
-        fprintf(stderr, "[shim] FormatChanged: %ldx%ld, fps=%.3f, pix=0x%x\n", w, h, (ts && fd) ? (double)ts/(double)fd : 0.0, (unsigned)pix);
+        fprintf(stderr, "[shim] FormatChanged: %ldx%ld, fps=%.3f\n", w, h, (ts && fd) ? (double)ts/(double)fd : 0.0);
 
         // Avoid reconfiguring to the same mode/pixel format repeatedly
         static BMDDisplayMode s_lastMode = (BMDDisplayMode)0;
-        static BMDPixelFormat s_lastPix = (BMDPixelFormat)0;
-        if (s_lastMode == newDisplayMode->GetDisplayMode() && s_lastPix == pix) {
+        if (s_lastMode == newDisplayMode->GetDisplayMode()) {
             return S_OK;
         }
 
         g_input->StopStreams();
-        HRESULT en = g_input->EnableVideoInput(newDisplayMode->GetDisplayMode(), pix, bmdVideoInputEnableFormatDetection);
-        if (en != S_OK && (pix == bmdFormat10BitYUV)) {
-            // Fallback to 8-bit UYVY if 10-bit fails
-            en = g_input->EnableVideoInput(newDisplayMode->GetDisplayMode(), bmdFormat8BitYUV, bmdVideoInputEnableFormatDetection);
+        HRESULT en = g_input->EnableVideoInput(newDisplayMode->GetDisplayMode(), bmdFormat8BitYUV, bmdVideoInputEnableFormatDetection);
+        if (en == S_OK) {
+            fprintf(stderr, "[shim] FormatChanged: pix=0x%x\n", (unsigned)bmdFormat8BitYUV);
+            g_input->StartStreams();
+            s_lastMode = newDisplayMode->GetDisplayMode();
+        } else {
+            fprintf(stderr, "[shim] FormatChanged: EnableVideoInput failed hr=0x%08x\n", (unsigned)en);
+            s_lastMode = (BMDDisplayMode)0;
         }
-        g_input->StartStreams();
-
-        s_lastMode = newDisplayMode->GetDisplayMode();
-        s_lastPix = pix;
         return S_OK;
-    }
-
-    static inline uint8_t clamp_u8(int v) {
-        return (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v));
-    }
-
-    static void convert_uyvy_to_bgra(const uint8_t* src, int width, int height, int srcStride, uint8_t* dst, int dstStride) {
-        for (int y = 0; y < height; ++y) {
-            const uint8_t* s = src + (size_t)y * (size_t)srcStride;
-            uint8_t* d = dst + (size_t)y * (size_t)dstStride;
-            for (int x = 0; x < width; x += 2) {
-                int U = s[0];
-                int Y0 = s[1];
-                int V = s[2];
-                int Y1 = s[3];
-                s += 4;
-
-                int C0 = Y0 - 16;
-                int C1 = Y1 - 16;
-                int D = U - 128;
-                int E = V - 128;
-
-                // Pixel 0
-                int R0 = (298 * C0 + 409 * E + 128) >> 8;
-                int G0 = (298 * C0 - 100 * D - 208 * E + 128) >> 8;
-                int B0 = (298 * C0 + 516 * D + 128) >> 8;
-                d[0] = clamp_u8(B0);
-                d[1] = clamp_u8(G0);
-                d[2] = clamp_u8(R0);
-                d[3] = 255;
-
-                // Pixel 1
-                int R1 = (298 * C1 + 409 * E + 128) >> 8;
-                int G1 = (298 * C1 - 100 * D - 208 * E + 128) >> 8;
-                int B1 = (298 * C1 + 516 * D + 128) >> 8;
-                d[4] = clamp_u8(B1);
-                d[5] = clamp_u8(G1);
-                d[6] = clamp_u8(R1);
-                d[7] = 255;
-                d += 8;
-            }
-        }
-    }
-
-    static void convert_yuyv_to_bgra(const uint8_t* src, int width, int height, int srcStride, uint8_t* dst, int dstStride) {
-        for (int y = 0; y < height; ++y) {
-            const uint8_t* s = src + (size_t)y * (size_t)srcStride;
-            uint8_t* d = dst + (size_t)y * (size_t)dstStride;
-            for (int x = 0; x < width; x += 2) {
-                int Y0 = s[0];
-                int U  = s[1];
-                int Y1 = s[2];
-                int V  = s[3];
-                s += 4;
-
-                int C0 = Y0 - 16;
-                int C1 = Y1 - 16;
-                int D = U - 128;
-                int E = V - 128;
-
-                int R0 = (298 * C0 + 409 * E + 128) >> 8;
-                int G0 = (298 * C0 - 100 * D - 208 * E + 128) >> 8;
-                int B0 = (298 * C0 + 516 * D + 128) >> 8;
-                d[0] = clamp_u8(B0);
-                d[1] = clamp_u8(G0);
-                d[2] = clamp_u8(R0);
-                d[3] = 255;
-
-                int R1 = (298 * C1 + 409 * E + 128) >> 8;
-                int G1 = (298 * C1 - 100 * D - 208 * E + 128) >> 8;
-                int B1 = (298 * C1 + 516 * D + 128) >> 8;
-                d[4] = clamp_u8(B1);
-                d[5] = clamp_u8(G1);
-                d[6] = clamp_u8(R1);
-                d[7] = 255;
-                d += 8;
-            }
-        }
-    }
-
-    static void convert_v210_to_bgra(const uint8_t* src, int width, int height, int srcStride, uint8_t* dst, int dstStride) {
-        auto next_sample = [&](const uint8_t*& ps, uint32_t& word, int& left) -> uint16_t {
-            if (left == 0) {
-                word = *(const uint32_t*)ps;
-                ps += 4;
-                left = 3;
-            }
-            uint16_t s = (uint16_t)(word & 0x3FF);
-            word >>= 10;
-            left--;
-            return s;
-        };
-
-        for (int y = 0; y < height; ++y) {
-            const uint8_t* ps = src + (size_t)y * (size_t)srcStride;
-            uint8_t* d = dst + (size_t)y * (size_t)dstStride;
-            uint32_t word = 0; int left = 0;
-
-            for (int x = 0; x < width; x += 2) {
-                // Sample stream pattern in v210: U, Y, V, Y, repeating
-                uint16_t U10 = next_sample(ps, word, left);
-                uint16_t Y0_10 = next_sample(ps, word, left);
-                uint16_t V10 = next_sample(ps, word, left);
-                uint16_t Y1_10 = next_sample(ps, word, left);
-
-                // Downscale to 8-bit (approx.)
-                int U = (int)(U10 >> 2);
-                int V = (int)(V10 >> 2);
-                int Y0 = (int)(Y0_10 >> 2);
-                int Y1 = (int)(Y1_10 >> 2);
-
-                int C0 = Y0 - 16;
-                int C1 = Y1 - 16;
-                int D = U - 128;
-                int E = V - 128;
-
-                // Pixel 0
-                int R0 = (298 * C0 + 409 * E + 128) >> 8;
-                int G0 = (298 * C0 - 100 * D - 208 * E + 128) >> 8;
-                int B0 = (298 * C0 + 516 * D + 128) >> 8;
-                d[0] = clamp_u8(B0);
-                d[1] = clamp_u8(G0);
-                d[2] = clamp_u8(R0);
-                d[3] = 255;
-
-                // Pixel 1
-                int R1 = (298 * C1 + 409 * E + 128) >> 8;
-                int G1 = (298 * C1 - 100 * D - 208 * E + 128) >> 8;
-                int B1 = (298 * C1 + 516 * D + 128) >> 8;
-                d[4] = clamp_u8(B1);
-                d[5] = clamp_u8(G1);
-                d[6] = clamp_u8(R1);
-                d[7] = 255;
-
-                d += 8;
-            }
-        }
     }
 
     HRESULT VideoInputFrameArrived(IDeckLinkVideoInputFrame* videoFrame, IDeckLinkAudioInputPacket* /*audioPacket*/) override {
         if (!videoFrame)
             return S_OK;
-
-        // If a screen preview is attached, let DeckLink render directly into NSView.
-        // Avoid any CPU-side GetBytes/copy/convert to minimize latency.
-        if (g_screenPreview != nullptr) {
-            g_preview_seq.fetch_add(1, std::memory_order_relaxed);
-            return S_OK;
-        }
 
         long width = videoFrame->GetWidth();
         long height = videoFrame->GetHeight();
@@ -469,32 +244,6 @@ public:
                 bytes = nullptr;
             }
         }
-#if defined(__APPLE__)
-        if (!bytes) {
-            // เส้นทางเฉพาะ macOS: ดึง CVPixelBuffer แล้วอ่านตำแหน่งข้อมูลโดยตรง
-            IDeckLinkMacVideoBuffer* macBuf = nullptr;
-            if (videoFrame->QueryInterface(IID_IDeckLinkMacVideoBuffer, (void**)&macBuf) == S_OK && macBuf) {
-                CVPixelBufferRef pb = nullptr;
-                if (macBuf->CreateCVPixelBufferRef((void**)&pb) == S_OK && pb) {
-                    CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
-                    bytes = CVPixelBufferGetBaseAddress(pb);
-                    if (bytes) {
-                        rowBytes = (long)CVPixelBufferGetBytesPerRow(pb);
-                        OSType cvfmt = CVPixelBufferGetPixelFormatType(pb);
-                        // If DeckLink pixfmt is Unspecified, derive from CVPixelBuffer format
-                        if (pixfmt == bmdFormatUnspecified) {
-                            if (cvfmt == kCVPixelFormatType_422YpCbCr8) pixfmt = bmdFormat8BitYUV; // '2vuy' (UYVY)
-                            else if (cvfmt == kCVPixelFormatType_422YpCbCr8_yuvs) pixfmt = bmdFormat8BitYUV; // YUYV
-                            else if (cvfmt == kCVPixelFormatType_422YpCbCr10) pixfmt = bmdFormat10BitYUV; // v210
-                        }
-                    }
-                    CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
-                    CFRelease(pb);
-                }
-                macBuf->Release();
-            }
-        }
-#endif
         if (!bytes) {
             const uint32_t ubase_q = (uint32_t)qri_results[0];
             const uint32_t ubase_gb = (uint32_t)getbytes_results[0];
@@ -546,47 +295,26 @@ public:
             // Ensure buffer size
             const int32_t w = (int32_t)width;
             const int32_t h = (int32_t)height;
-            const int32_t dstStride = w * 4;
-            const size_t wantSize = (size_t)dstStride * (size_t)h;
+            const int32_t srcStride = (int32_t)rowBytes;
+            const size_t wantSize = (size_t)srcStride * (size_t)h;
             if (g_shared.data.size() != wantSize) g_shared.data.resize(wantSize);
             g_shared.width = w;
             g_shared.height = h;
-            g_shared.row_bytes = dstStride;
+            g_shared.row_bytes = srcStride;
 
-            if (pixfmt == bmdFormat8BitBGRA) {
-                // Copy with row strides
+            if (pixfmt == bmdFormat8BitYUV) {
                 const uint8_t* src = (const uint8_t*)bytes;
                 for (int32_t y = 0; y < h; ++y) {
                     const uint8_t* s = src + (size_t)y * (size_t)rowBytes;
-                    uint8_t* d = g_shared.data.data() + (size_t)y * (size_t)dstStride;
-                    std::memcpy(d, s, (size_t)dstStride);
+                    uint8_t* d = g_shared.data.data() + (size_t)y * (size_t)srcStride;
+                    std::memcpy(d, s, (size_t)srcStride);
                 }
-            } else if (pixfmt == bmdFormat8BitARGB) {
-                // Convert ARGB -> BGRA by channel swap per pixel
-                const uint8_t* src = (const uint8_t*)bytes;
-                for (int32_t y = 0; y < h; ++y) {
-                    const uint8_t* s = src + (size_t)y * (size_t)rowBytes;
-                    uint8_t* d = g_shared.data.data() + (size_t)y * (size_t)dstStride;
-                    for (int32_t x = 0; x < w; ++x) {
-                        uint8_t a = s[0];
-                        uint8_t r = s[1];
-                        uint8_t g = s[2];
-                        uint8_t b = s[3];
-                        d[0] = b; d[1] = g; d[2] = r; d[3] = a;
-                        s += 4; d += 4;
-                    }
-                }
-            } else if (pixfmt == bmdFormat8BitYUV) {
-                // Convert UYVY to BGRA
-                const uint8_t* src = (const uint8_t*)bytes;
-                // Heuristic: if the first plane looks like YUYV, handle; else default UYVY
-                // We don't know exact CVPF here; try both depending on alignment of U and Y
-                convert_uyvy_to_bgra(src, w, h, (int)rowBytes, g_shared.data.data(), dstStride);
-            } else if (pixfmt == bmdFormat10BitYUV) {
-                const uint8_t* src = (const uint8_t*)bytes;
-                convert_v210_to_bgra(src, w, h, (int)rowBytes, g_shared.data.data(), dstStride);
             } else {
-                // Unsupported format: fill black
+                static bool s_warned = false;
+                if (!s_warned) {
+                    fprintf(stderr, "[shim] Unsupported pixel format 0x%x, zeroing buffer\n", (unsigned)pixfmt);
+                    s_warned = true;
+                }
                 std::memset(g_shared.data.data(), 0, g_shared.data.size());
             }
             static bool s_logged = false;
@@ -620,19 +348,6 @@ public:
 
     HRESULT QueryInterface(REFIID iid, void** ppv) override {
         if (!ppv) return E_POINTER;
-#if defined(__APPLE__)
-        CFUUIDBytes iunknown = CFUUIDGetUUIDBytes(IUnknownUUID);
-        if (memcmp(&iid, &iunknown, sizeof(CFUUIDBytes)) == 0) {
-            *ppv = static_cast<IUnknown*>(this);
-            AddRef();
-            return S_OK;
-        }
-        if (memcmp(&iid, &IID_IDeckLinkScreenPreviewCallback, sizeof(CFUUIDBytes)) == 0) {
-            *ppv = static_cast<IDeckLinkScreenPreviewCallback*>(this);
-            AddRef();
-            return S_OK;
-        }
-#else
         if (memcmp(&iid, &kIID_IUnknown, sizeof(REFIID)) == 0) {
             *ppv = static_cast<IUnknown*>(this);
             AddRef();
@@ -643,7 +358,6 @@ public:
             AddRef();
             return S_OK;
         }
-#endif
         *ppv = nullptr;
         return E_NOINTERFACE;
     }
@@ -683,27 +397,18 @@ static bool pick_supported_mode(IDeckLinkInput* input, BMDVideoConnection connec
     IDeckLinkDisplayModeIterator* it = nullptr;
     if (input->GetDisplayModeIterator(&it) != S_OK || !it) return false;
 
-    // Scan for the first display mode supported for the current connection, preferring v210 then UYVY then BGRA/ARGB
+    // Scan for the first display mode supported for the current connection using 8-bit YUV
     BMDDisplayMode chosenMode = (BMDDisplayMode)0;
     BMDPixelFormat chosenPix = bmdFormatUnspecified;
 
     IDeckLinkDisplayMode* mode = nullptr;
     while (it->Next(&mode) == S_OK && mode) {
         bool supported = false; BMDDisplayMode actualMode = (BMDDisplayMode)0;
-
-        // Prefer 8-bit UYVY for lower CPU conversion cost, then v210, then BGRA/ARGB
-        const BMDPixelFormat prefs[] = { bmdFormat8BitYUV, bmdFormat10BitYUV, bmdFormat8BitBGRA, bmdFormat8BitARGB };
-        for (BMDPixelFormat pf : prefs) {
-            supported = false; actualMode = (BMDDisplayMode)0;
-            HRESULT hr = input->DoesSupportVideoMode(connection, mode->GetDisplayMode(), pf,
-                                bmdNoVideoInputConversion, bmdSupportedVideoModeDefault, &actualMode, &supported);
-            if (hr == S_OK && supported) {
-                chosenMode = mode->GetDisplayMode();
-                chosenPix = pf;
-                break;
-            }
-        }
-        if (chosenPix != bmdFormatUnspecified) {
+        HRESULT hr = input->DoesSupportVideoMode(connection, mode->GetDisplayMode(), bmdFormat8BitYUV,
+                            bmdNoVideoInputConversion, bmdSupportedVideoModeDefault, &actualMode, &supported);
+        if (hr == S_OK && supported) {
+            chosenMode = mode->GetDisplayMode();
+            chosenPix = bmdFormat8BitYUV;
             mode->Release();
             break;
         }
@@ -792,11 +497,6 @@ extern "C" bool decklink_capture_open(int32_t device_index) {
         return false;
     }
 
-    // If a screen preview is already attached (NSView provided earlier), hook it up now.
-    if (g_screenPreview) {
-        (void)g_input->SetScreenPreviewCallback(g_screenPreview);
-    }
-
     // Determine current input connection (we set HDMI above, but read the active one)
     int64_t currConn = bmdVideoConnectionUnspecified;
     {
@@ -835,10 +535,7 @@ extern "C" bool decklink_capture_open(int32_t device_index) {
         }
         // First attempt: format detection with unknown mode (if supported)
         if (supportsDetect) {
-            // Try 8-bit UYVY first for lower CPU conversion
             HRESULT en = g_input->EnableVideoInput(bmdModeUnknown, bmdFormat8BitYUV, flags);
-            if (en == S_OK) return true;
-            en = g_input->EnableVideoInput(bmdModeUnknown, bmdFormat10BitYUV, flags);
             if (en == S_OK) return true;
         }
 
@@ -915,9 +612,6 @@ extern "C" void decklink_capture_close() {
         g_input->StopStreams();
         g_input->DisableVideoInput();
         g_input->SetCallback(nullptr);
-        if (g_screenPreview) {
-            g_input->SetScreenPreviewCallback(nullptr);
-        }
     }
     if (g_callback) { g_callback->Release(); g_callback = nullptr; }
     if (g_input) { g_input->Release(); g_input = nullptr; }
@@ -933,41 +627,6 @@ extern "C" void decklink_capture_close() {
         g_shared.row_bytes = 0;
         g_shared.seq = 0;
     }
-    if (g_screenPreview) { g_screenPreview->Release(); g_screenPreview = nullptr; }
-    g_preview_seq.store(0, std::memory_order_relaxed);
-}
-
-extern "C" bool decklink_preview_attach_nsview(void* nsview_ptr) {
-#if defined(__APPLE__)
-    if (g_screenPreview) { g_screenPreview->Release(); g_screenPreview = nullptr; }
-    g_screenPreview = CreateCocoaScreenPreview(nsview_ptr);
-    if (!g_screenPreview) {
-        fprintf(stderr, "[shim] CreateCocoaScreenPreview failed\n");
-        return false;
-    }
-    if (g_input) {
-        if (g_input->SetScreenPreviewCallback(g_screenPreview) != S_OK) {
-            fprintf(stderr, "[shim] SetScreenPreviewCallback failed\n");
-            return false;
-        }
-    }
-    return true;
-#else
-    (void)nsview_ptr;
-    fprintf(stderr, "[shim] decklink_preview_attach_nsview is only supported on macOS\n");
-    return false;
-#endif
-}
-
-extern "C" void decklink_preview_detach() {
-    if (g_input) {
-        g_input->SetScreenPreviewCallback(nullptr);
-    }
-    if (g_screenPreview) { g_screenPreview->Release(); g_screenPreview = nullptr; }
-}
-
-extern "C" uint64_t decklink_preview_seq() {
-    return g_preview_seq.load(std::memory_order_relaxed);
 }
 
 extern "C" bool decklink_preview_gl_create() {

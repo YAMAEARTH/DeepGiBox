@@ -20,18 +20,6 @@ fn main() {
         .warnings(true);
 
     match target_os.as_str() {
-        "macos" => {
-            println!("cargo:rustc-link-search=framework=/Library/Frameworks");
-            println!("cargo:rustc-link-lib=framework=DeckLinkAPI");
-            println!("cargo:rustc-link-lib=framework=CoreFoundation");
-            println!("cargo:rustc-link-lib=framework=CoreVideo");
-
-            include_candidates.push(sdk_root.join("Mac").join("include"));
-            include_candidates.push(sdk_root.join("include"));
-            include_candidates.push(PathBuf::from(
-                "/Library/Frameworks/DeckLinkAPI.framework/Headers",
-            ));
-        }
         "linux" => {
             println!("cargo:rustc-link-lib=dylib=DeckLinkAPI");
 
@@ -55,39 +43,33 @@ fn main() {
             include_candidates.push(sdk_root.join("include"));
             include_candidates.push(PathBuf::from("/usr/include/DeckLink"));
         }
-        _ => {
-            println!("cargo:rustc-link-lib=dylib=DeckLinkAPI");
-            include_candidates.push(sdk_root.join("include"));
+        other => {
+            panic!("Unsupported target OS for DeckLink capture shim: {}", other);
         }
     }
 
-    if matches!(target_os.as_str(), "macos" | "linux") {
-        // คอมไพล์ DeckLinkAPIDispatch.cpp เพื่อเรียกใช้สัญลักษณ์ที่มี version suffix ในไลบรารี
-        let dispatch_candidates = [
-            manifest_dir.join("include").join("DeckLinkAPIDispatch.cpp"),
-            manifest_dir
-                .join("shim")
-                .join("include")
-                .join("DeckLinkAPIDispatch.cpp"),
-            sdk_root
-                .join("rust")
-                .join("include")
-                .join("DeckLinkAPIDispatch.cpp"),
-            sdk_root
-                .join("Linux")
-                .join("include")
-                .join("DeckLinkAPIDispatch.cpp"),
-            sdk_root.join("include").join("DeckLinkAPIDispatch.cpp"),
-            PathBuf::from(
-                "/Library/Frameworks/DeckLinkAPI.framework/Headers/DeckLinkAPIDispatch.cpp",
-            ),
-        ];
-        if let Some(dispatch) = dispatch_candidates.iter().find(|p| p.exists()) {
-            println!("cargo:warning=cc adding: {}", dispatch.display());
-            build.file(dispatch);
-        } else {
-            println!("cargo:warning=DeckLinkAPIDispatch.cpp not found in typical locations; relying on library symbols only");
-        }
+    // คอมไพล์ DeckLinkAPIDispatch.cpp เพื่อเรียกใช้สัญลักษณ์ที่มี version suffix ในไลบรารี
+    let dispatch_candidates = [
+        manifest_dir.join("include").join("DeckLinkAPIDispatch.cpp"),
+        manifest_dir
+            .join("shim")
+            .join("include")
+            .join("DeckLinkAPIDispatch.cpp"),
+        sdk_root
+            .join("rust")
+            .join("include")
+            .join("DeckLinkAPIDispatch.cpp"),
+        sdk_root
+            .join("Linux")
+            .join("include")
+            .join("DeckLinkAPIDispatch.cpp"),
+        sdk_root.join("include").join("DeckLinkAPIDispatch.cpp"),
+    ];
+    if let Some(dispatch) = dispatch_candidates.iter().find(|p| p.exists()) {
+        println!("cargo:warning=cc adding: {}", dispatch.display());
+        build.file(dispatch);
+    } else {
+        println!("cargo:warning=DeckLinkAPIDispatch.cpp not found in typical locations; relying on library symbols only");
     }
 
     for dir in include_candidates.iter().filter(|p| p.exists()) {

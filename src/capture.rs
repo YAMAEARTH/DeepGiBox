@@ -16,7 +16,7 @@ extern "C" {
     fn decklink_capture_close();
 }
 
-/// Raw DeckLink frame metadata (BGRA interleaved, 8 bits per channel).
+/// ข้อมูลเฟรม DeckLink ดิบ (8-bit YUV, รูปแบบ UYVY ที่ DeckLink ส่งมาโดยตรง).
 ///
 /// `data_ptr` points at a C++ shim-managed buffer with length `data_len` bytes
 /// (`row_bytes * height`). The buffer may be overwritten when a new frame arrives,
