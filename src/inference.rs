@@ -15,8 +15,11 @@ pub const INPUT_SHAPE: [usize; 4] = [1, 3, INPUT_HEIGHT as usize, INPUT_WIDTH as
 
 pub struct PreprocessedImage {
     pub normalized: Vec<f32>,
+    #[allow(dead_code)]
     pub original_size: (u32, u32),
+    #[allow(dead_code)]
     pub letterbox_scale: f32,
+    #[allow(dead_code)]
     pub letterbox_pad: (f32, f32),
 }
 
@@ -28,7 +31,9 @@ pub struct InferenceContext {
 
 pub struct InferenceOutput {
     pub predictions: Vec<f32>,
+    #[allow(dead_code)]
     pub shape: Vec<i64>,
+    #[allow(dead_code)]
     pub duration: Duration,
 }
 
@@ -144,6 +149,7 @@ impl InferenceContext {
 //*************************************** 
 //*************************************** 
 //***************************************  */
+#[allow(dead_code)]
 pub fn preprocess_image(image_path: &Path) -> Result<PreprocessedImage> {
     let original = ImageReader::open(image_path)
         .map_err(Error::wrap)?

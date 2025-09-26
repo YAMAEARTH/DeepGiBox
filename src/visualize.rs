@@ -1,27 +1,8 @@
 use crate::post::PostprocessingResult;
-use image::{io::Reader as ImageReader, Rgb, RgbImage};
-use ort::{Error, Result};
-use std::path::Path;
+use image::{Rgb, RgbImage};
+use ort::Result;
 
 const BOX_COLOR: [u8; 3] = [255, 99, 132];
-
-pub fn visualize_detections(
-    image_path: &Path,
-    result: &PostprocessingResult,
-    output_path: &Path,
-) -> Result<()> {
-    let mut image = load_image(image_path)?;
-
-    if let Some(best_detection) = result.detections.first() {
-        draw_bbox(&mut image, best_detection.bbox, BOX_COLOR);
-    }
-
-    image
-        .save(output_path)
-        .map_err(Error::wrap)?;
-
-    Ok(())
-}
 
 pub fn visualize_detections_on_image(
     image: &RgbImage,
@@ -45,14 +26,6 @@ pub fn visualize_detections_on_image(
     }
     
     Ok(output_image)
-}
-
-fn load_image(path: &Path) -> Result<RgbImage> {
-    ImageReader::open(path)
-        .map_err(Error::wrap)?
-        .decode()
-        .map(|img| img.to_rgb8())
-        .map_err(Error::wrap)
 }
 
 fn draw_bbox(image: &mut RgbImage, bbox: [f32; 4], color: [u8; 3]) {

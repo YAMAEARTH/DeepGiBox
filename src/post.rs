@@ -15,8 +15,11 @@ pub struct Detection {
 
 #[derive(Debug, Clone)]
 pub struct TrackedObject {
+    #[allow(dead_code)]
     pub id: u64,
+    #[allow(dead_code)]
     pub class_id: usize,
+    #[allow(dead_code)]
     pub score: f32,
     pub bbox: [f32; 4],
 }
