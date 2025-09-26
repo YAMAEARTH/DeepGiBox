@@ -20,6 +20,7 @@
 #include "DeckLinkAPITypes.h"
 #include "DeckLinkAPIConfiguration.h"
 #include "DeckLinkAPIVideoFrame_v14_2_1.h"
+#include "DeckLinkAPIVideoInput_v14_2_1.h"
 #include "DeckLinkAPIScreenPreviewCallback_v14_2_1.h"
 
 #if !defined(__APPLE__)
@@ -183,7 +184,9 @@ static std::mutex g_glFrameMutex;
 static std::atomic<uint64_t> g_gl_seq{0};
 static std::atomic<uint64_t> g_gl_last_arrival_ns{0};
 static std::atomic<uint64_t> g_gl_last_latency_ns{0};
-static std::atomic<uint32_t> g_last_getbytes_qrv{0};
+static std::atomic<uint32_t> g_last_getbytes_base{0};
+static std::atomic<uint32_t> g_last_getbytes_fallback{0};
+static std::atomic<uint32_t> g_last_getbytes_buffer{0};
 static std::atomic<uint32_t> g_last_getbytes_pix{0};
 static std::atomic<uint64_t> g_gl_last_render_seq{0};
 
@@ -418,16 +421,56 @@ public:
         long rowBytes = videoFrame->GetRowBytes();
         BMDPixelFormat pixfmt = videoFrame->GetPixelFormat();
         void* bytes = nullptr;
+        IDeckLinkVideoBuffer* videoBuffer = nullptr;
+        HRESULT buffer_qri = videoFrame->QueryInterface(IID_IDeckLinkVideoBuffer, (void**)&videoBuffer);
+        HRESULT buffer_start = E_NOINTERFACE;
+        HRESULT buffer_gb = E_NOINTERFACE;
+        bool buffer_access = false;
+        if (buffer_qri == S_OK && videoBuffer) {
+            buffer_start = videoBuffer->StartAccess(bmdBufferAccessRead);
+            if (buffer_start == S_OK) {
+                buffer_access = true;
+                buffer_gb = videoBuffer->GetBytes(&bytes);
+                if (buffer_gb != S_OK || !bytes) {
+                    bytes = nullptr;
+                    videoBuffer->EndAccess(bmdBufferAccessRead);
+                    buffer_access = false;
+                }
+            }
+        }
+        const REFIID try_iids[] = {
+            IID_IDeckLinkVideoInputFrame_v14_2_1,
+            IID_IDeckLinkVideoFrame_v14_2_1,
+        };
+        HRESULT qri_results[sizeof(try_iids) / sizeof(try_iids[0])] = {
+            E_NOINTERFACE,
+            E_NOINTERFACE,
+        };
+        HRESULT getbytes_results[sizeof(try_iids) / sizeof(try_iids[0])] = {
+            E_NOINTERFACE,
+            E_NOINTERFACE,
+        };
         IDeckLinkVideoFrame_v14_2_1* vf = nullptr;
-        HRESULT qrv = videoFrame->QueryInterface(IID_IDeckLinkVideoFrame_v14_2_1, (void**)&vf);
-        if (qrv == S_OK && vf) {
-            if (vf->GetBytes(&bytes) != S_OK || bytes == nullptr) {
-                vf->Release();
+        for (size_t i = 0; i < sizeof(try_iids) / sizeof(try_iids[0]); ++i) {
+            if (bytes) break;
+            void* qptr = nullptr;
+            HRESULT qri = videoFrame->QueryInterface(try_iids[i], &qptr);
+            qri_results[i] = qri;
+            if (qri != S_OK || !qptr) {
+                continue;
+            }
+            auto* tmp = static_cast<IDeckLinkVideoFrame_v14_2_1*>(qptr);
+            HRESULT gb = tmp->GetBytes(&bytes);
+            getbytes_results[i] = gb;
+            if (gb == S_OK && bytes != nullptr) {
+                vf = tmp;
+            } else {
+                tmp->Release();
                 bytes = nullptr;
             }
         }
 #if defined(__APPLE__)
-        else {
+        if (!bytes) {
             // เส้นทางเฉพาะ macOS: ดึง CVPixelBuffer แล้วอ่านตำแหน่งข้อมูลโดยตรง
             IDeckLinkMacVideoBuffer* macBuf = nullptr;
             if (videoFrame->QueryInterface(IID_IDeckLinkMacVideoBuffer, (void**)&macBuf) == S_OK && macBuf) {
@@ -453,19 +496,49 @@ public:
         }
 #endif
         if (!bytes) {
-            const uint32_t uqrv = (uint32_t)qrv;
+            const uint32_t ubase_q = (uint32_t)qri_results[0];
+            const uint32_t ubase_gb = (uint32_t)getbytes_results[0];
+            const uint32_t ufb_q = (uint32_t)qri_results[1];
+            const uint32_t ufb_gb = (uint32_t)getbytes_results[1];
             const uint32_t upix = (uint32_t)pixfmt;
-            uint32_t last_q = g_last_getbytes_qrv.load(std::memory_order_relaxed);
-            uint32_t last_p = g_last_getbytes_pix.load(std::memory_order_relaxed);
-            if (last_q != uqrv || last_p != upix) {
-                fprintf(stderr, "[shim] GetBytes failed (qrv=0x%08x, pix=0x%x)\n", (unsigned)qrv, (unsigned)pixfmt);
-                g_last_getbytes_qrv.store(uqrv, std::memory_order_relaxed);
+            const uint32_t ubuf = (uint32_t)buffer_qri ^ (uint32_t)buffer_start ^ (uint32_t)buffer_gb;
+            uint32_t last_base_q = g_last_getbytes_base.load(std::memory_order_relaxed);
+            uint32_t last_fb_q = g_last_getbytes_fallback.load(std::memory_order_relaxed);
+            uint32_t last_pix = g_last_getbytes_pix.load(std::memory_order_relaxed);
+            uint32_t last_buf = g_last_getbytes_buffer.load(std::memory_order_relaxed);
+            if (last_base_q != (ubase_q ^ ubase_gb) ||
+                last_fb_q != (ufb_q ^ ufb_gb) ||
+                last_pix != upix ||
+                last_buf != ubuf) {
+                fprintf(stderr,
+                        "[shim] GetBytes failed (buffer qri=0x%08x start=0x%08x gb=0x%08x; input_v14 qri=0x%08x gb=0x%08x; frame_v14 qri=0x%08x gb=0x%08x; pix=0x%x)\n",
+                        (unsigned)buffer_qri,
+                        (unsigned)buffer_start,
+                        (unsigned)buffer_gb,
+                        (unsigned)ubase_q,
+                        (unsigned)ubase_gb,
+                        (unsigned)ufb_q,
+                        (unsigned)ufb_gb,
+                        (unsigned)pixfmt);
+                g_last_getbytes_base.store(ubase_q ^ ubase_gb, std::memory_order_relaxed);
+                g_last_getbytes_fallback.store(ufb_q ^ ufb_gb, std::memory_order_relaxed);
+                g_last_getbytes_buffer.store(ubuf, std::memory_order_relaxed);
                 g_last_getbytes_pix.store(upix, std::memory_order_relaxed);
+            }
+            if (buffer_access && videoBuffer) {
+                videoBuffer->EndAccess(bmdBufferAccessRead);
+                buffer_access = false;
+            }
+            if (videoBuffer) {
+                videoBuffer->Release();
+                videoBuffer = nullptr;
             }
             if (vf) vf->Release();
             return S_OK;
         }
-        g_last_getbytes_qrv.store(0, std::memory_order_relaxed);
+        g_last_getbytes_base.store(0, std::memory_order_relaxed);
+        g_last_getbytes_fallback.store(0, std::memory_order_relaxed);
+        g_last_getbytes_buffer.store(0, std::memory_order_relaxed);
         g_last_getbytes_pix.store(0, std::memory_order_relaxed);
 
         {
@@ -522,6 +595,14 @@ public:
                 s_logged = true;
             }
             g_shared.seq++;
+        }
+        if (buffer_access && videoBuffer) {
+            videoBuffer->EndAccess(bmdBufferAccessRead);
+            buffer_access = false;
+        }
+        if (videoBuffer) {
+            videoBuffer->Release();
+            videoBuffer = nullptr;
         }
         if (vf) vf->Release();
         return S_OK;

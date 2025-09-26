@@ -29,3 +29,39 @@ fn main() -> Result<(), Box<dyn Error>> {
     session.close();
     Ok(())
 }
+
+
+// use std::error::Error;
+// use std::thread;
+// use std::time::Duration;
+
+// use decklink_rust::capture::CaptureSession;
+
+// fn main() -> Result<(), Box<dyn Error>> {
+//     let mut session = CaptureSession::open(0)?;
+//     println!("Opened capture session on device 0");
+
+//     let mut empty_attempts: u64 = 0;
+
+//     loop {
+//         match session.get_frame()? {
+//             Some(frame) => {
+//                 println!(
+//                     "Frame seq={} size={}x{} stride={} bytes buffer_ptr={:?} buffer_len={} bytes",
+//                     frame.seq,
+//                     frame.width,
+//                     frame.height,
+//                     frame.row_bytes,
+//                     frame.data_ptr,
+//                     frame.data_len,
+//                 );
+//                 empty_attempts = 0;
+//             }
+//             None => {
+//                 println!("No frame available yet ({} consecutive misses)", empty_attempts);
+//                 empty_attempts = empty_attempts.saturating_add(1);
+//             }
+//         }
+//         thread::sleep(Duration::from_millis(200));
+//     }
+// }

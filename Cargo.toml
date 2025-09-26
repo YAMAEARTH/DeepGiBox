@@ -30,3 +30,7 @@ path = "src/bin/capture_preview_gl.rs"
 [[bin]]
 name = "capture_test"
 path = "src/bin/capture_test.rs"
+
+[[bin]]
+name = "capture_bgra_dump"
+path = "src/bin/capture_bgra_dump.rs"
