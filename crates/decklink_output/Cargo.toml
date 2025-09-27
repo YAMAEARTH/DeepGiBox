@@ -1,0 +1,9 @@
+[package]
+name = "decklink_output"
+version = "0.1.0"
+edition = "2021"
+[dependencies]
+anyhow = "1"
+common_io = { path = "../common_io" }
+telemetry = { path = "../telemetry" }
+config = { path = "../config" }

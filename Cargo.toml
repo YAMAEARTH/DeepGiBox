@@ -1,0 +1,17 @@
+[workspace]
+members = [
+  "apps/runner",
+  "apps/playgrounds",
+  "crates/common_io",
+  "crates/decklink_input",
+  "crates/preprocess_cuda",
+  "crates/inference",
+  "crates/postprocess",
+  "crates/overlay_plan",
+  "crates/overlay_render",
+  "crates/decklink_output",
+  "crates/telemetry",
+  "crates/config",
+  "testsupport",
+]
+resolver = "2"
