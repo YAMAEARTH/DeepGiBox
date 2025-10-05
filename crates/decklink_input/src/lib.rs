@@ -1,23 +1,45 @@
-use anyhow::Result;
-use common_io::{Stage, RawFramePacket, FrameMeta, PixelFormat, ColorSpace, MemRef, MemLoc};
+pub mod capture;
 
-pub struct DeckLinkSource {}
-impl DeckLinkSource {
-    pub fn new(_dev:i32,_mode:&str,_pf:PixelFormat,_cs:ColorSpace)->Result<Self>{ Ok(Self{}) }
-    pub fn next_frame(&mut self)->Result<RawFramePacket>{
-        let meta = FrameMeta{ source_id:0,width:1920,height:1080,pixfmt:PixelFormat::YUV422_8,
-            colorspace:ColorSpace::BT709, frame_idx:0,pts_ns:0,t_capture_ns:0,stride_bytes:3840 };
-        let data = MemRef{ ptr:std::ptr::null_mut(), len:0, stride: meta.stride_bytes as usize, loc:MemLoc::Cpu };
-        Ok(RawFramePacket{meta,data})
-    }
+use libc::{c_char, int32_t};
+use std::ffi::CStr;
+use std::slice;
+
+#[repr(C)]
+struct DLDeviceList {
+    names: *mut *mut c_char,
+    count: int32_t,
 }
-pub fn from_path(_cfg:&str)->Result<DeckLinkStage>{ Ok(DeckLinkStage{}) }
-pub struct DeckLinkStage {}
-impl Stage<(),RawFramePacket> for DeckLinkStage {
-    fn process(&mut self,_:())->RawFramePacket{
-        let meta = FrameMeta{ source_id:0,width:1920,height:1080,pixfmt:PixelFormat::YUV422_8,
-            colorspace:ColorSpace::BT709, frame_idx:0,pts_ns:0,t_capture_ns:0,stride_bytes:3840 };
-        let data = MemRef{ ptr:std::ptr::null_mut(), len:0, stride: meta.stride_bytes as usize, loc:MemLoc::Cpu };
-        RawFramePacket{meta,data}
+
+extern "C" {
+    fn decklink_list_devices() -> DLDeviceList;
+    fn decklink_free_device_list(list: DLDeviceList);
+}
+
+// Safe Rust wrapper
+pub fn devicelist() -> Vec<String> {
+    let list = unsafe { decklink_list_devices() };
+    if list.names.is_null() || list.count <= 0 {
+        return Vec::new();
     }
+
+    let names_ptrs =
+        unsafe { slice::from_raw_parts(list.names as *const *const c_char, list.count as usize) };
+
+    let mut out = Vec::with_capacity(names_ptrs.len());
+    for &p in names_ptrs {
+        if p.is_null() {
+            continue;
+        }
+        let s = unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned();
+        out.push(s);
+    }
+
+    unsafe { decklink_free_device_list(list) };
+    out
+}
+
+// Optional C ABI export if needed by other languages
+#[no_mangle]
+pub extern "C" fn decklink_devicelist_count() -> i32 {
+    devicelist().len() as i32
 }
