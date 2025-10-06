@@ -25,19 +25,21 @@ fn yuv_to_rgb(y: u8, u: u8, v: u8) -> (u8, u8, u8) {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let session = CaptureSession::open(0)?;
+    let mut session = CaptureSession::open(0)?;
     println!("Opened capture session on device 0");
 
     for attempt in 0..60 {
-        if let Some(frame) = session.get_frame()? {
+        if let Some(packet) = session.get_frame()? {
             println!(
-                "Frame seq={} size={}x{} row_bytes={} buffer_len={} bytes",
-                frame.seq, frame.width, frame.height, frame.row_bytes, frame.data_len
+                "Frame idx={} size={}x{} stride={} buffer_len={} bytes pixfmt={:?} colorspace={:?}",
+                packet.meta.frame_idx, packet.meta.width, packet.meta.height,
+                packet.meta.stride_bytes, packet.data.len,
+                packet.meta.pixfmt, packet.meta.colorspace
             );
 
-            let stride = frame.row_bytes as usize;
-            let width = frame.width as usize;
-            let height = frame.height as usize;
+            let stride = packet.data.stride;
+            let width = packet.meta.width as usize;
+            let height = packet.meta.height as usize;
             if stride == 0 || width == 0 || height == 0 {
                 println!("Frame dimensions invalid (stride/width/height)");
             } else {
@@ -70,11 +72,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                         .saturating_mul(stride)
                         .saturating_add(start_x.saturating_mul(bytes_per_pixel));
                     let needed_bytes = sample_pixels.saturating_mul(bytes_per_pixel);
-                    if offset.saturating_add(needed_bytes) > frame.data_len {
+                    if offset.saturating_add(needed_bytes) > packet.data.len {
                         println!("Not enough data to sample center pixels (need {needed_bytes} bytes)");
                     } else {
                         let raw = unsafe {
-                            std::slice::from_raw_parts(frame.data_ptr.add(offset), needed_bytes)
+                            std::slice::from_raw_parts(packet.data.ptr.add(offset), needed_bytes)
                         };
                         for (pair_idx, chunk) in raw.chunks_exact(4).enumerate() {
                             let u = chunk[0];

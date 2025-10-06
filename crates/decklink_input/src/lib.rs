@@ -1,5 +1,8 @@
 pub mod capture;
 
+// Re-export common I/O types for convenience
+pub use common_io::{ColorSpace, FrameMeta, MemLoc, MemRef, PixelFormat, RawFramePacket};
+
 use libc::{c_char, int32_t};
 use std::ffi::CStr;
 use std::slice;

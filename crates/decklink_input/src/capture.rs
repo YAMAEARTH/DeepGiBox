@@ -1,4 +1,5 @@
 use std::fmt;
+use common_io::{ColorSpace, FrameMeta, MemLoc, MemRef, PixelFormat, RawFramePacket};
 
 #[repr(C)]
 #[derive(Default, Debug, Clone, Copy)]
@@ -16,20 +17,7 @@ extern "C" {
     fn decklink_capture_close();
 }
 
-/// ข้อมูลเฟรม DeckLink ดิบ (8-bit YUV, รูปแบบ UYVY ที่ DeckLink ส่งมาโดยตรง).
-///
-/// `data_ptr` points at a C++ shim-managed buffer with length `data_len` bytes
-/// (`row_bytes * height`). The buffer may be overwritten when a new frame arrives,
-/// so callers should finish processing or copy the data before requesting another frame.
-#[derive(Debug, Clone, Copy)]
-pub struct RawFrame {
-    pub data_ptr: *const u8,
-    pub data_len: usize,
-    pub width: u32,
-    pub height: u32,
-    pub row_bytes: u32,
-    pub seq: u64,
-}
+
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptureError {
@@ -54,19 +42,25 @@ impl std::error::Error for CaptureError {}
 
 pub struct CaptureSession {
     open: bool,
+    source_id: u32,
+    frame_count: u64,
 }
 
 impl CaptureSession {
     pub fn open(device_index: i32) -> Result<Self, CaptureError> {
         let opened = unsafe { decklink_capture_open(device_index) };
         if opened {
-            Ok(Self { open: true })
+            Ok(Self {
+                open: true,
+                source_id: device_index as u32,
+                frame_count: 0,
+            })
         } else {
             Err(CaptureError::OpenFailed)
         }
     }
 
-    pub fn get_frame(&self) -> Result<Option<RawFrame>, CaptureError> {
+    pub fn get_frame(&mut self) -> Result<Option<RawFramePacket>, CaptureError> {
         if !self.open {
             return Err(CaptureError::SessionClosed);
         }
@@ -88,14 +82,36 @@ impl CaptureSession {
             .checked_mul(height as usize)
             .ok_or(CaptureError::DataOverflow)?;
 
-        Ok(Some(RawFrame {
-            data_ptr: raw.data,
-            data_len: len,
+        // Capture timestamp (nanoseconds)
+        let t_capture_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+
+        // Build FrameMeta according to INSTRUCTION.md
+        let meta = FrameMeta {
+            source_id: self.source_id,
             width,
             height,
-            row_bytes: raw.row_bytes as u32,
-            seq: raw.seq,
-        }))
+            pixfmt: PixelFormat::YUV422_8,  // DeckLink YUV422 8-bit (UYVY)
+            colorspace: ColorSpace::BT709,   // BT.709 colorspace
+            frame_idx: self.frame_count,
+            pts_ns: raw.seq,  // Use sequence as PTS
+            t_capture_ns,
+            stride_bytes: raw.row_bytes as u32,
+        };
+
+        // Build MemRef for CPU data
+        let data = MemRef {
+            ptr: raw.data as *mut u8,
+            len,
+            stride: row_bytes,
+            loc: MemLoc::Cpu,
+        };
+
+        self.frame_count += 1;
+
+        Ok(Some(RawFramePacket { meta, data }))
     }
 
     pub fn close(&mut self) {
