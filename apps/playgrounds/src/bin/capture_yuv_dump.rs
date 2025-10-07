@@ -32,9 +32,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         if let Some(packet) = session.get_frame()? {
             println!(
                 "Frame idx={} size={}x{} stride={} buffer_len={} bytes pixfmt={:?} colorspace={:?}",
-                packet.meta.frame_idx, packet.meta.width, packet.meta.height,
-                packet.meta.stride_bytes, packet.data.len,
-                packet.meta.pixfmt, packet.meta.colorspace
+                packet.meta.frame_idx,
+                packet.meta.width,
+                packet.meta.height,
+                packet.meta.stride_bytes,
+                packet.data.len,
+                packet.meta.pixfmt,
+                packet.meta.colorspace
             );
 
             let stride = packet.data.stride;
@@ -73,7 +77,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                         .saturating_add(start_x.saturating_mul(bytes_per_pixel));
                     let needed_bytes = sample_pixels.saturating_mul(bytes_per_pixel);
                     if offset.saturating_add(needed_bytes) > packet.data.len {
-                        println!("Not enough data to sample center pixels (need {needed_bytes} bytes)");
+                        println!(
+                            "Not enough data to sample center pixels (need {needed_bytes} bytes)"
+                        );
                     } else {
                         let raw = unsafe {
                             std::slice::from_raw_parts(packet.data.ptr.add(offset), needed_bytes)

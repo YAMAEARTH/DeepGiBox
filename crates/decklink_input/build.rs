@@ -73,9 +73,7 @@ fn main() {
             .join("shim")
             .join("include")
             .join("DeckLinkAPIDispatch.cpp"),
-        shim_dir
-            .join("include")
-            .join("DeckLinkAPIDispatch.cpp"),
+        shim_dir.join("include").join("DeckLinkAPIDispatch.cpp"),
         sdk_root
             .join("rust")
             .join("include")

@@ -1,7 +1,6 @@
 use anyhow::Result;
 use common_io::{
-    Stage, TensorInputPacket, TensorDesc, MemRef, FrameMeta, 
-    DType, MemLoc, PixelFormat, ColorSpace
+    ColorSpace, DType, FrameMeta, MemLoc, MemRef, PixelFormat, Stage, TensorDesc, TensorInputPacket,
 };
 use image::io::Reader as ImageReader;
 use inference::InferenceEngine;
@@ -11,7 +10,6 @@ const MODEL_PATH: &str = "apps/playgrounds/YOLOv5.onnx";
 const IMAGE_PATH: &str = "apps/playgrounds/sample_img.jpg";
 const INPUT_WIDTH: u32 = 512;
 const INPUT_HEIGHT: u32 = 512;
-
 
 fn main() -> Result<()> {
     println!("=== Inference Engine Test ===");
@@ -26,11 +24,16 @@ fn main() -> Result<()> {
         eprintln!("Please provide a YOLO ONNX model:");
         eprintln!("  1. Export your YOLO model to ONNX format");
         eprintln!("  2. Place it at: {}", MODEL_PATH);
-        eprintln!("  3. Ensure input shape is 1x3x{}x{}", INPUT_HEIGHT, INPUT_WIDTH);
+        eprintln!(
+            "  3. Ensure input shape is 1x3x{}x{}",
+            INPUT_HEIGHT, INPUT_WIDTH
+        );
         eprintln!();
         eprintln!("For testing purposes, you can:");
         eprintln!("  - Use YOLOv5: https://github.com/ultralytics/yolov5");
-        eprintln!("  - Export with: python export.py --weights yolov5s.pt --include onnx --imgsz 512");
+        eprintln!(
+            "  - Export with: python export.py --weights yolov5s.pt --include onnx --imgsz 512"
+        );
         anyhow::bail!("Model file not found");
     }
 
@@ -42,7 +45,10 @@ fn main() -> Result<()> {
     // Step 1: Load and preprocess image (mock preprocessing)
     println!("Step 1: Loading and preprocessing image...");
     let preprocessed = mock_preprocess_image(IMAGE_PATH)?;
-    println!("  ✓ Image loaded and preprocessed to {}x{}", INPUT_WIDTH, INPUT_HEIGHT);
+    println!(
+        "  ✓ Image loaded and preprocessed to {}x{}",
+        INPUT_WIDTH, INPUT_HEIGHT
+    );
     println!("  ✓ Tensor shape: 1x3x{}x{}", INPUT_HEIGHT, INPUT_WIDTH);
     println!("  ✓ Total elements: {}", preprocessed.len());
     println!();
@@ -51,11 +57,9 @@ fn main() -> Result<()> {
     println!("Step 2: Creating TensorInputPacket...");
     let tensor_packet = create_tensor_packet(preprocessed)?;
     println!("  ✓ TensorInputPacket created");
-    println!("  ✓ Shape: {}x{}x{}x{}", 
-        tensor_packet.desc.n, 
-        tensor_packet.desc.c, 
-        tensor_packet.desc.h, 
-        tensor_packet.desc.w
+    println!(
+        "  ✓ Shape: {}x{}x{}x{}",
+        tensor_packet.desc.n, tensor_packet.desc.c, tensor_packet.desc.h, tensor_packet.desc.w
     );
     println!("  ✓ DType: {:?}", tensor_packet.desc.dtype);
     println!("  ✓ Device: GPU {}", tensor_packet.desc.device);
@@ -74,8 +78,11 @@ fn main() -> Result<()> {
     let start = std::time::Instant::now();
     let output = engine.process(tensor_packet);
     let duration = start.elapsed();
-    
-    println!("  ✓ Inference completed in {:.2}ms", duration.as_secs_f64() * 1000.0);
+
+    println!(
+        "  ✓ Inference completed in {:.2}ms",
+        duration.as_secs_f64() * 1000.0
+    );
     println!("  ✓ Frame idx: {}", output.from.frame_idx);
     println!("  ✓ Output ready for postprocessing");
     println!();
@@ -86,7 +93,7 @@ fn main() -> Result<()> {
     println!("  - Raw detections are ready for postprocess stage");
     println!("  - Postprocess will decode boxes, apply NMS, etc.");
     println!("  - Pipeline: Preprocess → Inference → Postprocess → Overlay");
-    
+
     Ok(())
 }
 
@@ -94,52 +101,48 @@ fn main() -> Result<()> {
 fn mock_preprocess_image(image_path: &str) -> Result<Vec<f32>> {
     let img = ImageReader::open(image_path)?.decode()?.to_rgb8();
     let (orig_w, orig_h) = img.dimensions();
-    
+
     println!("  Original image: {}x{}", orig_w, orig_h);
-    
+
     // Resize with letterboxing
     let scale = (INPUT_WIDTH as f32 / orig_w as f32).min(INPUT_HEIGHT as f32 / orig_h as f32);
     let new_w = (orig_w as f32 * scale) as u32;
     let new_h = (orig_h as f32 * scale) as u32;
-    
-    let resized = image::imageops::resize(
-        &img, 
-        new_w, 
-        new_h, 
-        image::imageops::FilterType::Lanczos3
-    );
-    
+
+    let resized =
+        image::imageops::resize(&img, new_w, new_h, image::imageops::FilterType::Lanczos3);
+
     // Create letterboxed image (gray background)
-    let mut letterboxed = image::RgbImage::from_pixel(
-        INPUT_WIDTH, 
-        INPUT_HEIGHT, 
-        image::Rgb([114u8, 114u8, 114u8])
-    );
-    
+    let mut letterboxed =
+        image::RgbImage::from_pixel(INPUT_WIDTH, INPUT_HEIGHT, image::Rgb([114u8, 114u8, 114u8]));
+
     let pad_x = (INPUT_WIDTH - new_w) / 2;
     let pad_y = (INPUT_HEIGHT - new_h) / 2;
-    
+
     // Overlay resized image
     image::imageops::overlay(&mut letterboxed, &resized, pad_x as i64, pad_y as i64);
-    
+
     // Convert to NCHW format and normalize to [0, 1]
     let mut tensor = vec![0.0f32; (INPUT_WIDTH * INPUT_HEIGHT * 3) as usize];
     let hw = (INPUT_WIDTH * INPUT_HEIGHT) as usize;
-    
+
     for y in 0..INPUT_HEIGHT {
         for x in 0..INPUT_WIDTH {
             let pixel = letterboxed.get_pixel(x, y);
             let idx = (y * INPUT_WIDTH + x) as usize;
-            
+
             // NCHW: [C, H, W]
-            tensor[idx] = pixel[0] as f32 / 255.0;              // R channel
-            tensor[hw + idx] = pixel[1] as f32 / 255.0;         // G channel
-            tensor[2 * hw + idx] = pixel[2] as f32 / 255.0;     // B channel
+            tensor[idx] = pixel[0] as f32 / 255.0; // R channel
+            tensor[hw + idx] = pixel[1] as f32 / 255.0; // G channel
+            tensor[2 * hw + idx] = pixel[2] as f32 / 255.0; // B channel
         }
     }
-    
-    println!("  Letterbox scale: {:.3}, pad: ({}, {})", scale, pad_x, pad_y);
-    
+
+    println!(
+        "  Letterbox scale: {:.3}, pad: ({}, {})",
+        scale, pad_x, pad_y
+    );
+
     Ok(tensor)
 }
 
@@ -157,7 +160,7 @@ fn create_tensor_packet(data: Vec<f32>) -> Result<TensorInputPacket> {
         t_capture_ns: 0,
         stride_bytes: INPUT_WIDTH * 4,
     };
-    
+
     // Create tensor descriptor
     let tensor_desc = TensorDesc {
         n: 1,
@@ -167,12 +170,12 @@ fn create_tensor_packet(data: Vec<f32>) -> Result<TensorInputPacket> {
         dtype: DType::Fp32,
         device: 0,
     };
-    
+
     // Leak the data to get a stable pointer (in real pipeline, this is managed by CUDA)
     let data_boxed = Box::new(data);
     let ptr = Box::leak(data_boxed).as_mut_ptr() as *mut u8;
     let len = (INPUT_WIDTH * INPUT_HEIGHT * 3 * std::mem::size_of::<f32>() as u32) as usize;
-    
+
     // Create memory reference
     let mem_ref = MemRef {
         ptr,
@@ -180,7 +183,7 @@ fn create_tensor_packet(data: Vec<f32>) -> Result<TensorInputPacket> {
         stride: (INPUT_WIDTH * 3 * std::mem::size_of::<f32>() as u32) as usize,
         loc: MemLoc::Gpu { device: 0 }, // Mock as GPU memory
     };
-    
+
     Ok(TensorInputPacket {
         from: frame_meta,
         desc: tensor_desc,

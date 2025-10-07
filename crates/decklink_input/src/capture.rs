@@ -1,5 +1,5 @@
-use std::fmt;
 use common_io::{ColorSpace, FrameMeta, MemLoc, MemRef, PixelFormat, RawFramePacket};
+use std::fmt;
 
 #[repr(C)]
 #[derive(Default, Debug, Clone, Copy)]
@@ -16,8 +16,6 @@ extern "C" {
     fn decklink_capture_get_frame(out: *mut RawCaptureFrame) -> bool;
     fn decklink_capture_close();
 }
-
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptureError {
@@ -93,10 +91,10 @@ impl CaptureSession {
             source_id: self.source_id,
             width,
             height,
-            pixfmt: PixelFormat::YUV422_8,  // DeckLink YUV422 8-bit (UYVY)
-            colorspace: ColorSpace::BT709,   // BT.709 colorspace
+            pixfmt: PixelFormat::YUV422_8, // DeckLink YUV422 8-bit (UYVY)
+            colorspace: ColorSpace::BT709, // BT.709 colorspace
             frame_idx: self.frame_count,
-            pts_ns: raw.seq,  // Use sequence as PTS
+            pts_ns: raw.seq, // Use sequence as PTS
             t_capture_ns,
             stride_bytes: raw.row_bytes as u32,
         };
