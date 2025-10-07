@@ -2,8 +2,11 @@
 name = "inference"
 version = "0.1.0"
 edition = "2021"
+
 [dependencies]
 anyhow = "1"
 common_io = { path = "../common_io" }
 telemetry = { path = "../telemetry" }
 config = { path = "../config" }
+ort = { version = "2.0.0-rc.10", features = ["tensorrt", "cuda"] }
+ndarray = "0.16"

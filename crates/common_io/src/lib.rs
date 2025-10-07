@@ -30,7 +30,11 @@ pub struct TensorDesc { pub n:u32, pub c:u32, pub h:u32, pub w:u32, pub dtype:DT
 #[derive(Clone, Debug)]
 pub struct TensorInputPacket { pub from: FrameMeta, pub desc: TensorDesc, pub data: MemRef }
 
-pub struct RawDetectionsPacket { pub from: FrameMeta }
+#[derive(Clone, Debug)]
+pub struct RawDetectionsPacket { 
+    pub from: FrameMeta,
+    pub raw_output: Vec<f32>,  // Pun:: added raw model output (e.g., YOLO predictions)
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct BBox { pub x:f32, pub y:f32, pub w:f32, pub h:f32 }
