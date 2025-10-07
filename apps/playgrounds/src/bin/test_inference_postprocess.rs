@@ -64,9 +64,12 @@ fn main() -> Result<()> {
         letterbox_pad: letterbox_info.pad,
         original_size: letterbox_info.original_size,
     };
-    let mut postprocess_stage = PostStage::new(config).with_temporal_smoothing(4);
+    let mut postprocess_stage = PostStage::new(config)
+        .with_temporal_smoothing(4)
+        .with_sort_tracking(30, 0.25, 0.3); // max_age=30, min_conf=0.25, iou_thresh=0.3
     println!("  ✓ Postprocess stage initialized (2 classes, 16128 anchors)");
     println!("  ✓ Confidence threshold: 0.35 (balanced filtering)");
+    println!("  ✓ SORT tracking enabled (max_age=30, iou=0.3)");
 
     // Step 6: Run Postprocess
     println!("Step 6: Running postprocess (decode, NMS, tracking)...");
@@ -81,15 +84,20 @@ fn main() -> Result<()> {
     if !detections.items.is_empty() {
         println!("Top 10 detections:");
         for (i, det) in detections.items.iter().take(10).enumerate() {
+            let track_info = det.track_id
+                .map(|id| format!(" [Track ID: {}]", id))
+                .unwrap_or_else(|| String::from(" [No track]"));
+            
             println!(
-                "  {}. Class {} - Score: {:.3} - BBox: ({:.1}, {:.1}, {:.1}, {:.1})",
+                "  {}. Class {} - Score: {:.3} - BBox: ({:.1}, {:.1}, {:.1}, {:.1}){}",
                 i + 1,
                 det.class_id,
                 det.score,
                 det.bbox.x,
                 det.bbox.y,
                 det.bbox.w,
-                det.bbox.h
+                det.bbox.h,
+                track_info
             );
         }
     } else {

@@ -16,7 +16,7 @@ pub struct InferenceEngine {
 
 impl InferenceEngine {
     pub fn new(model_path: impl AsRef<Path>) -> Result<Self> {
-        // Initialize ORT environment with TensorRT
+        // Initialize ORT environment with TensorRT (matching your old fast config)
         let _ = ort::init()
             .with_name("tensorrt_iobinding")
             .with_execution_providers([
@@ -31,9 +31,7 @@ impl InferenceEngine {
 
         let session = Session::builder()?
             .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)?
-            .commit_from_file(model_path.as_ref())?;
-
-        let cpu_allocator = Allocator::new(
+            .commit_from_file(model_path.as_ref())?;        let cpu_allocator = Allocator::new(
             &session,
             MemoryInfo::new(AllocationDevice::CPU, 0, AllocatorType::Device, MemoryType::Default)?,
         )?;
@@ -57,31 +55,76 @@ impl InferenceEngine {
         let shape = [desc.n as usize, desc.c as usize, desc.h as usize, desc.w as usize];
         let total_elements = shape.iter().product::<usize>();
 
-        // Create input tensor on GPU using staging approach
-        let input_tensor = match desc.dtype {
-            DType::Fp32 => {
-                // Step 1: Create CPU staging tensor and fill it
-                let mut staging = Tensor::<f32>::new(&Allocator::default(), shape)?;
-                let (_, staging_data) = staging.try_extract_tensor_mut::<f32>()?;
-                
+        // Create input tensor - optimized like your old fast code
+        let input_tensor = match (&data.loc, desc.dtype) {
+            // FAST PATH: Data already on GPU (zero-copy from preprocess_cuda)
+            (MemLoc::Gpu { device: gpu_id }, DType::Fp32) if *gpu_id == 0 => {
+                let tensor = Tensor::<f32>::new(&self.gpu_allocator, shape)?;
                 unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        data.ptr as *const f32,
-                        staging_data.as_mut_ptr(),
-                        total_elements,
+                    // GPU→GPU memcpy is extremely fast (~0.1ms)
+                    cudaMemcpy(
+                        tensor.data_ptr() as *mut std::ffi::c_void,
+                        data.ptr as *const std::ffi::c_void,
+                        total_elements * std::mem::size_of::<f32>(),
+                        cudaMemcpyDeviceToDevice,
                     );
                 }
-                
-                // Step 2: Create GPU tensor and copy from staging (H2D transfer)
-                let mut gpu_tensor = Tensor::<f32>::new(&self.gpu_allocator, shape)?;
-                staging.copy_into(&mut gpu_tensor)?;
-                
-                gpu_tensor
+                tensor
             }
-            DType::Fp16 => {
+            
+            // CPU input - use your old smart approach
+            (MemLoc::Cpu, DType::Fp32) => {
+                // Try to create GPU tensor first
+                let mut input_tensor = Tensor::<f32>::new(&self.gpu_allocator, shape)?;
+                
+                if input_tensor.memory_info().is_cpu_accessible() {
+                    // FAST: GPU tensor is CPU-accessible, direct copy
+                    let (_, tensor_data) = input_tensor.try_extract_tensor_mut::<f32>()?;
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            data.ptr as *const f32,
+                            tensor_data.as_mut_ptr(),
+                            total_elements,
+                        );
+                    }
+                } else {
+                    // FALLBACK: Need staging for H2D transfer
+                    let mut staging = Tensor::<f32>::new(&Allocator::default(), shape)?;
+                    let (_, staging_data) = staging.try_extract_tensor_mut::<f32>()?;
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            data.ptr as *const f32,
+                            staging_data.as_mut_ptr(),
+                            total_elements,
+                        );
+                    }
+                    staging.copy_into(&mut input_tensor)?;
+                }
+                
+                input_tensor
+            }
+            
+            (_, DType::Fp16) => {
                 anyhow::bail!("FP16 input not yet supported - use FP32 from preprocess");
             }
+            
+            (MemLoc::Gpu { device }, _) => {
+                anyhow::bail!("GPU device {} not supported (only device 0)", device);
+            }
         };
+
+        // Temporary CUDA FFI declarations (until proper CUDA binding)
+        #[link(name = "cudart")]
+        extern "C" {
+            fn cudaMemcpy(
+                dst: *mut std::ffi::c_void,
+                src: *const std::ffi::c_void,
+                count: usize,
+                kind: i32,
+            ) -> i32;
+        }
+        #[allow(non_upper_case_globals)]
+        const cudaMemcpyDeviceToDevice: i32 = 3;
 
         // Run inference with IO binding (GPU input → TensorRT compute → CPU output)
         let mut io_binding = self.session.create_binding()?;

@@ -1046,6 +1046,7 @@ dependencies = [
  "decklink_input",
  "image",
  "inference",
+ "ort",
  "overlay_plan",
  "overlay_render",
  "postprocess",
