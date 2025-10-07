@@ -40,7 +40,7 @@ DeckLinkInput
   → PreprocessCUDA (YUV/NV12/BGRA → RGB + resize + normalize, FP16/FP32)
       → TensorInputPacket{ 1×3×H×W, dtype(Fp16/Fp32), device=GPU }
   → Inference (TRT / ORT-TRT)
-      → RawDetectionsPacket
+      → RawDetectionsPacket **FIX Raw Detection i added raw_output to use the data in postprocessing
   → Postprocess (decode + threshold + NMS + optional tracking)
       → DetectionsPacket{ boxes, score, class_id, track_id? }
   → OverlayPlan (ops)
