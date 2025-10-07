@@ -32,14 +32,20 @@ fn main() -> Result<()> {
 
     // Step 1: Load and preprocess image
     println!("Step 1: Loading and preprocessing image...");
+    let preprocess_start = std::time::Instant::now();
     let preprocessed = mock_preprocess_image(IMAGE_PATH)?;
+    let preprocess_time = preprocess_start.elapsed();
     println!("  ✓ Image preprocessed to {}x{}", INPUT_WIDTH, INPUT_HEIGHT);
+    println!("  ✓ Preprocessing time: {:.2}ms", preprocess_time.as_secs_f64() * 1000.0);
     println!();
 
     // Step 2: Create TensorInputPacket
     println!("Step 2: Creating TensorInputPacket...");
+    let packet_start = std::time::Instant::now();
     let (tensor_packet, letterbox_info) = create_tensor_packet(preprocessed)?;
+    let packet_time = packet_start.elapsed();
     println!("  ✓ TensorInputPacket created");
+    println!("  ✓ Packet creation time: {:.2}ms", packet_time.as_secs_f64() * 1000.0);
     println!();
 
     // Step 3: Initialize Inference Engine
@@ -57,7 +63,7 @@ fn main() -> Result<()> {
     println!("Step 5: Initializing Postprocess Stage...");
     let config = PostprocessConfig {
         num_classes: 2,  // Custom model with only 2 classes
-        confidence_threshold: 0.35,  // Balanced: filter low-confidence while keeping real detections
+        confidence_threshold: 0.30,  // Balanced: filter low-confidence while keeping real detections
         nms_threshold: 0.45,
         max_detections: 100,
         letterbox_scale: letterbox_info.scale,

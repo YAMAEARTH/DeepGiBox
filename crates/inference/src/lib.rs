@@ -1,5 +1,5 @@
 use anyhow::Result;
-use common_io::{Stage, TensorInputPacket, RawDetectionsPacket, DType, MemLoc};
+use common_io::{Stage, TensorInputPacket, RawDetectionsPacket};
 use ort::{
     execution_providers::TensorRTExecutionProvider,
     memory::{AllocationDevice, Allocator, AllocatorType, MemoryInfo, MemoryType},
@@ -55,87 +55,47 @@ impl InferenceEngine {
         let shape = [desc.n as usize, desc.c as usize, desc.h as usize, desc.w as usize];
         let total_elements = shape.iter().product::<usize>();
 
-        // Create input tensor - optimized like your old fast code
-        let input_tensor = match (&data.loc, desc.dtype) {
-            // FAST PATH: Data already on GPU (zero-copy from preprocess_cuda)
-            (MemLoc::Gpu { device: gpu_id }, DType::Fp32) if *gpu_id == 0 => {
-                let tensor = Tensor::<f32>::new(&self.gpu_allocator, shape)?;
-                unsafe {
-                    // GPU→GPU memcpy is extremely fast (~0.1ms)
-                    cudaMemcpy(
-                        tensor.data_ptr() as *mut std::ffi::c_void,
-                        data.ptr as *const std::ffi::c_void,
-                        total_elements * std::mem::size_of::<f32>(),
-                        cudaMemcpyDeviceToDevice,
-                    );
-                }
-                tensor
+        // Create GPU tensor - handle both CPU-accessible and pure GPU memory
+        let tensor_start = std::time::Instant::now();
+        let input_tensor = unsafe {
+            let mut gpu_tensor = Tensor::<f32>::new(&self.gpu_allocator, shape)?;
+            
+            if gpu_tensor.memory_info().is_cpu_accessible() {
+                // GPU memory is CPU-accessible - direct copy!
+                let (_, tensor_data) = gpu_tensor.try_extract_tensor_mut::<f32>()?;
+                std::ptr::copy_nonoverlapping(
+                    data.ptr as *const f32,
+                    tensor_data.as_mut_ptr(),
+                    total_elements,
+                );
+            } else {
+                // Pure GPU memory - use staging tensor for CPU→GPU or GPU→GPU
+                let slice = std::slice::from_raw_parts(data.ptr as *const f32, total_elements);
+                let mut staging = Tensor::<f32>::new(&Allocator::default(), shape)?;
+                let (_, staging_data) = staging.try_extract_tensor_mut::<f32>()?;
+                staging_data.copy_from_slice(slice);
+                staging.copy_into(&mut gpu_tensor)?;
             }
             
-            // CPU input - use your old smart approach
-            (MemLoc::Cpu, DType::Fp32) => {
-                // Try to create GPU tensor first
-                let mut input_tensor = Tensor::<f32>::new(&self.gpu_allocator, shape)?;
-                
-                if input_tensor.memory_info().is_cpu_accessible() {
-                    // FAST: GPU tensor is CPU-accessible, direct copy
-                    let (_, tensor_data) = input_tensor.try_extract_tensor_mut::<f32>()?;
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            data.ptr as *const f32,
-                            tensor_data.as_mut_ptr(),
-                            total_elements,
-                        );
-                    }
-                } else {
-                    // FALLBACK: Need staging for H2D transfer
-                    let mut staging = Tensor::<f32>::new(&Allocator::default(), shape)?;
-                    let (_, staging_data) = staging.try_extract_tensor_mut::<f32>()?;
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            data.ptr as *const f32,
-                            staging_data.as_mut_ptr(),
-                            total_elements,
-                        );
-                    }
-                    staging.copy_into(&mut input_tensor)?;
-                }
-                
-                input_tensor
-            }
-            
-            (_, DType::Fp16) => {
-                anyhow::bail!("FP16 input not yet supported - use FP32 from preprocess");
-            }
-            
-            (MemLoc::Gpu { device }, _) => {
-                anyhow::bail!("GPU device {} not supported (only device 0)", device);
-            }
+            gpu_tensor
         };
-
-        // Temporary CUDA FFI declarations (until proper CUDA binding)
-        #[link(name = "cudart")]
-        extern "C" {
-            fn cudaMemcpy(
-                dst: *mut std::ffi::c_void,
-                src: *const std::ffi::c_void,
-                count: usize,
-                kind: i32,
-            ) -> i32;
-        }
-        #[allow(non_upper_case_globals)]
-        const cudaMemcpyDeviceToDevice: i32 = 3;
+        let tensor_time = tensor_start.elapsed();
 
         // Run inference with IO binding (GPU input → TensorRT compute → CPU output)
+        let binding_start = std::time::Instant::now();
         let mut io_binding = self.session.create_binding()?;
         io_binding.bind_input("images", &input_tensor)?;
         
-        // Bind output to CPU for easy extraction (adds ~2-3ms but simplifies postprocess)
+        // Bind output to CPU for easy extraction
         io_binding.bind_output_to_device("output", &self.cpu_allocator.memory_info())?;
+        let binding_time = binding_start.elapsed();
 
+        let inference_start = std::time::Instant::now();
         let outputs = self.session.run_binding(&io_binding)?;
+        let inference_time = inference_start.elapsed();
 
         // Extract predictions from CPU memory
+        let extract_start = std::time::Instant::now();
         let predictions = if let Some(value) = outputs.get("output") {
             value.try_extract_tensor::<f32>()?.1.to_vec()
         } else {
@@ -149,6 +109,13 @@ impl InferenceEngine {
                 .1
                 .to_vec()
         };
+        let extract_time = extract_start.elapsed();
+
+        // Print detailed timing breakdown
+        println!("    [Timing] Tensor staging: {:.2}ms", tensor_time.as_secs_f64() * 1000.0);
+        println!("    [Timing] IO binding setup: {:.2}ms", binding_time.as_secs_f64() * 1000.0);
+        println!("    [Timing] TensorRT execution: {:.2}ms", inference_time.as_secs_f64() * 1000.0);
+        println!("    [Timing] Output extraction: {:.2}ms", extract_time.as_secs_f64() * 1000.0);
 
         Ok(predictions)
     }
