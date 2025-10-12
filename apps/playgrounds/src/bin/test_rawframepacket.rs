@@ -2,7 +2,7 @@ use std::error::Error;
 use std::thread;
 use std::time::Duration;
 
-use decklink_input::capture::CaptureSession;
+use decklink_input::capture::{copy_frame_region_to_host, CaptureSession};
 use decklink_input::{ColorSpace, MemLoc, PixelFormat, RawFramePacket};
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -99,15 +99,28 @@ fn print_rawframepacket(packet: &RawFramePacket) {
     // Sample first few bytes if available
     if !packet.data.ptr.is_null() && packet.data.len > 0 {
         let sample_size = std::cmp::min(16, packet.data.len);
-        let sample = unsafe { std::slice::from_raw_parts(packet.data.ptr, sample_size) };
-        print!("║   first {} bytes  : ", sample_size);
-        for (i, &byte) in sample.iter().enumerate() {
-            if i > 0 && i % 4 == 0 {
-                print!(" ");
+        let mut buf = vec![0u8; sample_size];
+        let filled = match packet.data.loc {
+            MemLoc::Cpu => {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(packet.data.ptr, buf.as_mut_ptr(), sample_size);
+                }
+                true
             }
-            print!("{:02X}", byte);
+            MemLoc::Gpu { .. } => copy_frame_region_to_host(packet, 0, &mut buf).is_ok(),
+        };
+        if filled {
+            print!("║   first {} bytes  : ", sample_size);
+            for (i, &byte) in buf.iter().enumerate() {
+                if i > 0 && i % 4 == 0 {
+                    print!(" ");
+                }
+                print!("{:02X}", byte);
+            }
+            println!();
+        } else {
+            println!("║   first bytes     : <unavailable>");
         }
-        println!();
     }
 
     // Verify packet structure

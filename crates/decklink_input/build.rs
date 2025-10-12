@@ -37,6 +37,9 @@ fn main() {
         .file(shim_cpp.as_path())
         .warnings(true);
 
+    let mut extra_link_search: Vec<PathBuf> = Vec::new();
+    let mut extra_link_libs: Vec<&'static str> = Vec::new();
+
     match target_os.as_str() {
         "linux" => {
             println!("cargo:rustc-link-lib=dylib=DeckLinkAPI");
@@ -60,6 +63,62 @@ fn main() {
             include_candidates.push(sdk_root.join("Linux").join("include"));
             include_candidates.push(sdk_root.join("include"));
             include_candidates.push(PathBuf::from("/usr/include/DeckLink"));
+
+            // NVIDIA GPUDirect for Video paths
+            let dvp_include_env = env::var("DVP_INCLUDE_PATH").map(PathBuf::from).ok();
+            let dvp_lib_env = env::var("DVP_LIB_PATH").map(PathBuf::from).ok();
+            let gpudirect_root = env::var("GPUDIRECT_ROOT")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("/opt/NVIDIA_GPUDirect/gpudirect"));
+            let gpudirect_include_default =
+                gpudirect_root.join("sdk").join("linux").join("include");
+            let gpudirect_lib_default = gpudirect_root.join("sdk").join("linux").join("lib64");
+
+            if let Some(path) = dvp_include_env.filter(|p| p.exists()) {
+                include_candidates.push(path);
+            } else if gpudirect_include_default.exists() {
+                include_candidates.push(gpudirect_include_default);
+            } else {
+                println!(
+                    "cargo:warning=GPUDirect include path not found; set GPUDIRECT_ROOT or DVP_INCLUDE_PATH"
+                );
+            }
+
+            if let Some(path) = dvp_lib_env.filter(|p| p.exists()) {
+                extra_link_search.push(path);
+            } else if gpudirect_lib_default.exists() {
+                extra_link_search.push(gpudirect_lib_default);
+            } else {
+                println!(
+                    "cargo:warning=GPUDirect lib path not found; set GPUDIRECT_ROOT or DVP_LIB_PATH"
+                );
+            }
+
+            // CUDA toolkit paths
+            let cuda_root = env::var("CUDA_HOME")
+                .or_else(|_| env::var("CUDA_PATH"))
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("/usr/local/cuda"));
+            let cuda_include = cuda_root.join("include");
+            let cuda_lib64 = cuda_root.join("lib64");
+            if cuda_include.exists() {
+                include_candidates.push(cuda_include);
+            } else {
+                println!(
+                    "cargo:warning=CUDA include path not found at {}; set CUDA_HOME or CUDA_PATH",
+                    cuda_root.join("include").display()
+                );
+            }
+            if cuda_lib64.exists() {
+                extra_link_search.push(cuda_lib64);
+            } else {
+                println!(
+                    "cargo:warning=CUDA lib path not found at {}; set CUDA_HOME or CUDA_PATH",
+                    cuda_root.join("lib64").display()
+                );
+            }
+
+            extra_link_libs.extend_from_slice(&["dvp", "cuda", "cudart"]);
         }
         other => {
             panic!("Unsupported target OS for DeckLink capture shim: {}", other);
@@ -96,6 +155,13 @@ fn main() {
         build.include(dir);
     }
 
+    for dir in extra_link_search.iter().filter(|p| p.exists()) {
+        println!("cargo:rustc-link-search=native={}", dir.display());
+    }
+    for lib in extra_link_libs {
+        println!("cargo:rustc-link-lib=dylib={}", lib);
+    }
+
     // ให้ build.rs รันใหม่เมื่อไฟล์ shim หรือค่า env เปลี่ยน
     println!("cargo:rerun-if-changed={}", shim_cpp.display());
     println!(
@@ -103,6 +169,11 @@ fn main() {
         shim_dir.join("include").display()
     );
     println!("cargo:rerun-if-env-changed=DECKLINK_SDK_DIR");
+    println!("cargo:rerun-if-env-changed=GPUDIRECT_ROOT");
+    println!("cargo:rerun-if-env-changed=DVP_INCLUDE_PATH");
+    println!("cargo:rerun-if-env-changed=DVP_LIB_PATH");
+    println!("cargo:rerun-if-env-changed=CUDA_HOME");
+    println!("cargo:rerun-if-env-changed=CUDA_PATH");
 
     build.compile("shim");
 }

@@ -44,7 +44,7 @@ pub struct RawFramePacket {
 - `ptr`: pointer ไปยังข้อมูล
 - `len`: ขนาดข้อมูลทั้งหมด (stride × height)
 - `stride`: stride ต่อแถว
-- `loc`: **MemLoc::Cpu** (ข้อมูลอยู่ใน CPU memory)
+- `loc`: **MemLoc::Gpu** (ข้อมูลอยู่ในหน่วยความจำที่ DeckLink เขียนลง GPU ได้โดยตรงผ่าน GPUDirect; หากตั้ง `DECKLINK_INPUT_FORCE_CPU=1` จะบังคับให้ใช้ CPU)
 
 ### 4. การเปลี่ยนแปลงใน CaptureSession
 
@@ -60,7 +60,7 @@ pub struct CaptureSession {
 - เปลี่ยนจาก `&self` เป็น `&mut self` เพื่อนับเฟรม
 - คืนค่า `Option<RawFramePacket>` แทน `Option<RawFrame>`
 - สร้าง `FrameMeta` พร้อมข้อมูลครบถ้วน (YUV422_8, BT709, timestamps)
-- สร้าง `MemRef` สำหรับข้อมูลใน CPU
+- สร้าง `MemRef` สำหรับข้อมูลใน GPU (หรือ CPU เมื่อถูกบังคับ) โดยไม่ต้องคัดลอกจาก CPU ไป GPU
 
 ### 5. การ Re-export Types
 

@@ -1,6 +1,7 @@
 pub mod capture;
 
 // Re-export common I/O types for convenience
+pub use capture::{copy_frame_region_to_host, FrameCopyError};
 pub use common_io::{ColorSpace, FrameMeta, MemLoc, MemRef, PixelFormat, RawFramePacket};
 
 use libc::{c_char, int32_t};

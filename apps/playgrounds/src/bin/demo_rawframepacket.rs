@@ -187,11 +187,18 @@ fn verify_packet_structure(packet: &RawFramePacket) {
 
     // Check 6: Memory location
     checks_total += 1;
-    if matches!(packet.data.loc, MemLoc::Cpu) {
-        println!("✓ [6] Data is in CPU memory (as captured from DeckLink)");
-        checks_passed += 1;
-    } else {
-        println!("✗ [6] Data location is {:?}, expected CPU", packet.data.loc);
+    match packet.data.loc {
+        MemLoc::Cpu => {
+            println!("✓ [6] Data is in CPU memory (as captured from DeckLink)");
+            checks_passed += 1;
+        }
+        MemLoc::Gpu { device } => {
+            println!(
+                "✓ [6] Data is in GPU memory (device {}), ready for CUDA pipeline",
+                device
+            );
+            checks_passed += 1;
+        }
     }
 
     // Check 7: Pointer validity
