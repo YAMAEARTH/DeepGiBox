@@ -1,6 +1,10 @@
 use anyhow::Result;
+<<<<<<< HEAD
 use common_io::{Stage, TensorInputPacket, RawDetectionsPacket};
 use once_cell::sync::Lazy;
+=======
+use common_io::{RawDetectionsPacket, Stage, TensorInputPacket};
+>>>>>>> 7699291602b2cc44a62dd90899520d8f842bb7a1
 use ort::{
     execution_providers::TensorRTExecutionProvider,
     memory::{AllocationDevice, Allocator, AllocatorType, MemoryInfo, MemoryType},
@@ -35,19 +39,43 @@ pub struct InferenceEngine {
 
 impl InferenceEngine {
     pub fn new(model_path: impl AsRef<Path>) -> Result<Self> {
+<<<<<<< HEAD
         // Initialize ORT environment once (lazy initialization)
         Lazy::force(&ORT_ENVIRONMENT);
+=======
+        // Initialize ORT environment with TensorRT (matching your old fast config)
+        let _ = ort::init()
+            .with_name("tensorrt_iobinding")
+            .with_execution_providers([TensorRTExecutionProvider::default()
+                .with_device_id(0)
+                .with_fp16(true)
+                .with_engine_cache(true)
+                .with_engine_cache_path("./trt_cache")
+                .build()])
+            .commit();
+>>>>>>> 7699291602b2cc44a62dd90899520d8f842bb7a1
 
         let session = Session::builder()?
             .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)?
-            .commit_from_file(model_path.as_ref())?;        let cpu_allocator = Allocator::new(
+            .commit_from_file(model_path.as_ref())?;
+        let cpu_allocator = Allocator::new(
             &session,
-            MemoryInfo::new(AllocationDevice::CPU, 0, AllocatorType::Device, MemoryType::Default)?,
+            MemoryInfo::new(
+                AllocationDevice::CPU,
+                0,
+                AllocatorType::Device,
+                MemoryType::Default,
+            )?,
         )?;
 
         let gpu_allocator = Allocator::new(
             &session,
-            MemoryInfo::new(AllocationDevice::CUDA, 0, AllocatorType::Device, MemoryType::Default)?,
+            MemoryInfo::new(
+                AllocationDevice::CUDA,
+                0,
+                AllocatorType::Device,
+                MemoryType::Default,
+            )?,
         )?;
 
         Ok(Self {
@@ -61,14 +89,19 @@ impl InferenceEngine {
         let desc = &input_packet.desc;
         let data = &input_packet.data;
 
-        let shape = [desc.n as usize, desc.c as usize, desc.h as usize, desc.w as usize];
+        let shape = [
+            desc.n as usize,
+            desc.c as usize,
+            desc.h as usize,
+            desc.w as usize,
+        ];
         let total_elements = shape.iter().product::<usize>();
 
         // Create GPU tensor - handle both CPU-accessible and pure GPU memory
         let tensor_start = std::time::Instant::now();
         let input_tensor = unsafe {
             let mut gpu_tensor = Tensor::<f32>::new(&self.gpu_allocator, shape)?;
-            
+
             if gpu_tensor.memory_info().is_cpu_accessible() {
                 // GPU memory is CPU-accessible - direct copy!
                 let (_, tensor_data) = gpu_tensor.try_extract_tensor_mut::<f32>()?;
@@ -85,7 +118,7 @@ impl InferenceEngine {
                 staging_data.copy_from_slice(slice);
                 staging.copy_into(&mut gpu_tensor)?;
             }
-            
+
             gpu_tensor
         };
         let tensor_time = tensor_start.elapsed();
@@ -94,7 +127,7 @@ impl InferenceEngine {
         let binding_start = std::time::Instant::now();
         let mut io_binding = self.session.create_binding()?;
         io_binding.bind_input("images", &input_tensor)?;
-        
+
         // Bind output to CPU for easy extraction
         io_binding.bind_output_to_device("output", &self.cpu_allocator.memory_info())?;
         let binding_time = binding_start.elapsed();
@@ -121,10 +154,22 @@ impl InferenceEngine {
         let extract_time = extract_start.elapsed();
 
         // Print detailed timing breakdown
-        println!("    [Timing] Tensor staging: {:.2}ms", tensor_time.as_secs_f64() * 1000.0);
-        println!("    [Timing] IO binding setup: {:.2}ms", binding_time.as_secs_f64() * 1000.0);
-        println!("    [Timing] TensorRT execution: {:.2}ms", inference_time.as_secs_f64() * 1000.0);
-        println!("    [Timing] Output extraction: {:.2}ms", extract_time.as_secs_f64() * 1000.0);
+        println!(
+            "    [Timing] Tensor staging: {:.2}ms",
+            tensor_time.as_secs_f64() * 1000.0
+        );
+        println!(
+            "    [Timing] IO binding setup: {:.2}ms",
+            binding_time.as_secs_f64() * 1000.0
+        );
+        println!(
+            "    [Timing] TensorRT execution: {:.2}ms",
+            inference_time.as_secs_f64() * 1000.0
+        );
+        println!(
+            "    [Timing] Output extraction: {:.2}ms",
+            extract_time.as_secs_f64() * 1000.0
+        );
 
         Ok(predictions)
     }
@@ -140,26 +185,29 @@ impl Stage<TensorInputPacket, RawDetectionsPacket> for InferenceEngine {
         match self.run_inference(&input) {
             Ok(predictions) => {
                 let duration = start.elapsed();
-                
+
                 // Print output info for debugging
-                println!("  ✓ Inference time: {:.2}ms", duration.as_secs_f64() * 1000.0);
+                println!(
+                    "  ✓ Inference time: {:.2}ms",
+                    duration.as_secs_f64() * 1000.0
+                );
                 println!("  ✓ Raw predictions: {} values", predictions.len());
                 if predictions.len() >= 10 {
                     println!("  ✓ First 10: {:?}", &predictions[0..10]);
                 }
                 if predictions.len() > 10 {
-                    println!("  ✓ Last 10: {:?}", &predictions[predictions.len()-10..]);
+                    println!("  ✓ Last 10: {:?}", &predictions[predictions.len() - 10..]);
                 }
-                
+
                 // Return predictions for postprocess stage
-                RawDetectionsPacket { 
+                RawDetectionsPacket {
                     from: input.from,
                     raw_output: predictions,
                 }
             }
             Err(e) => {
                 eprintln!("Inference error: {}", e);
-                RawDetectionsPacket { 
+                RawDetectionsPacket {
                     from: input.from,
                     raw_output: Vec::new(),
                 }

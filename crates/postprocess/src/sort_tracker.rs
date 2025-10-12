@@ -16,8 +16,8 @@ struct Track {
     bbox: [f32; 4], // [x1, y1, x2, y2]
     class_id: usize,
     score: f32,
-    age: usize,           // Frames since last update
-    hits: usize,          // Total number of matches
+    age: usize,  // Frames since last update
+    hits: usize, // Total number of matches
     time_since_update: usize,
 }
 
@@ -100,9 +100,8 @@ impl SortTrackerWrapper {
         }
 
         // Remove dead tracks
-        self.tracks.retain(|_, track| {
-            track.time_since_update < self.max_age
-        });
+        self.tracks
+            .retain(|_, track| track.time_since_update < self.max_age);
 
         // Return active tracks (with minimum hits requirement)
         self.tracks
@@ -154,4 +153,3 @@ fn calculate_iou(bbox1: &[f32; 4], bbox2: &[f32; 4]) -> f32 {
 
     inter_area / union_area
 }
-

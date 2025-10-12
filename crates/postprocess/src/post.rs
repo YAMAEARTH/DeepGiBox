@@ -22,35 +22,35 @@ impl TemporalSmoother {
             frame_scores: VecDeque::new(),
         }
     }
-    
+
     pub fn add_frame_scores(&mut self, scores: Vec<f32>) {
         // Add new frame scores
         self.frame_scores.push_back(scores);
-        
+
         // Remove oldest frame if window is full
         if self.frame_scores.len() > self.window_size {
             self.frame_scores.pop_front();
         }
     }
-    
+
     pub fn get_smoothed_scores(&self, current_scores: &[f32]) -> Vec<f32> {
         if self.frame_scores.is_empty() {
             return current_scores.to_vec();
         }
-        
+
         let mut smoothed = Vec::with_capacity(current_scores.len());
-        
+
         for i in 0..current_scores.len() {
             let mut values = Vec::new();
-            
+
             for frame in &self.frame_scores {
                 if i < frame.len() {
                     values.push(frame[i]);
                 }
             }
-            
+
             values.push(current_scores[i]);
-            
+
             // Compute median
             let median = if values.is_empty() {
                 current_scores[i]
@@ -63,10 +63,10 @@ impl TemporalSmoother {
                     values[mid]
                 }
             };
-            
+
             smoothed.push(median);
         }
-        
+
         smoothed
     }
 }
@@ -94,50 +94,59 @@ pub fn postprocess_yolov5_with_temporal_smoothing(
     smoother: Option<&mut TemporalSmoother>,
 ) -> PostprocessingResult {
     let total_anchors = predictions.len() / (5 + cfg.num_classes);
-    
+
     let mut decoded = decode_predictions(predictions, cfg);
     let decoded_count = decoded.len();
-    
-    println!("    Postprocess stats: {} total anchors → {} passed confidence threshold ({:.1}%)",
-             total_anchors, decoded_count, 
-             (decoded_count as f32 / total_anchors as f32) * 100.0);
-    
+
+    println!(
+        "    Postprocess stats: {} total anchors → {} passed confidence threshold ({:.1}%)",
+        total_anchors,
+        decoded_count,
+        (decoded_count as f32 / total_anchors as f32) * 100.0
+    );
+
     // Apply temporal smoothing if smoother is provided
     if let Some(smoother) = smoother {
         // Extract current confidence scores
         let current_scores: Vec<f32> = decoded.iter().map(|c| c.detection.score).collect();
-        
+
         // Get smoothed scores
         let smoothed_scores = smoother.get_smoothed_scores(&current_scores);
-        
+
         // Update detection scores with smoothed values
         for (candidate, &smoothed_score) in decoded.iter_mut().zip(smoothed_scores.iter()) {
             candidate.detection.score = smoothed_score;
         }
-        
+
         // Debug: Print smoothing info for first few detections before moving current_scores
         if !current_scores.is_empty() && smoothed_scores.len() > 0 {
             let history_size = smoother.frame_scores.len();
-            if history_size >= 2 { // Only print when we have enough history for actual smoothing
-                println!("    Temporal smoothing active: {} frames in history", history_size);
+            if history_size >= 2 {
+                // Only print when we have enough history for actual smoothing
+                println!(
+                    "    Temporal smoothing active: {} frames in history",
+                    history_size
+                );
                 // Show smoothing effect for first detection
                 if current_scores.len() > 0 && smoothed_scores.len() > 0 {
-                    println!("    First detection: original={:.4}, smoothed={:.4}", 
-                             current_scores[0], smoothed_scores[0]);
+                    println!(
+                        "    First detection: original={:.4}, smoothed={:.4}",
+                        current_scores[0], smoothed_scores[0]
+                    );
                 }
             }
         }
-        
+
         // Add current scores to smoother's history
         smoother.add_frame_scores(current_scores);
     }
-    
+
     // NMS re-enabled to filter overlapping bounding boxes
     let retained = apply_nms(decoded, cfg);
     let nms_count = retained.len();
-    
+
     println!("    After NMS: {} detections retained", nms_count);
-    
+
     let detections = retained
         .iter()
         .map(|candidate| candidate.detection.clone())
@@ -234,7 +243,12 @@ fn apply_nms(candidates: Vec<Candidate>, cfg: &YoloPostConfig) -> Vec<Candidate>
         .filter(|candidate| keep.iter().any(|&kept| *kept == candidate.bbox))
         .collect();
 
-    retained.sort_by(|a, b| b.detection.score.partial_cmp(&a.detection.score).unwrap_or(std::cmp::Ordering::Equal));
+    retained.sort_by(|a, b| {
+        b.detection
+            .score
+            .partial_cmp(&a.detection.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     if cfg.max_detections > 0 {
         retained.truncate(cfg.max_detections);
     }
