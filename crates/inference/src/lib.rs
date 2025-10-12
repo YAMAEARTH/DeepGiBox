@@ -1,5 +1,6 @@
 use anyhow::Result;
 use common_io::{Stage, TensorInputPacket, RawDetectionsPacket};
+use once_cell::sync::Lazy;
 use ort::{
     execution_providers::TensorRTExecutionProvider,
     memory::{AllocationDevice, Allocator, AllocatorType, MemoryInfo, MemoryType},
@@ -7,6 +8,24 @@ use ort::{
     value::Tensor,
 };
 use std::path::Path;
+
+/// Global ORT environment - initialized once at first use
+static ORT_ENVIRONMENT: Lazy<()> = Lazy::new(|| {
+    ort::init()
+        .with_name("deepgibox_tensorrt")
+        .with_execution_providers([
+            TensorRTExecutionProvider::default()
+                .with_fp16(true)
+                .with_timing_cache(true)
+                .with_engine_cache(true)
+                .with_engine_cache_path("./trt_cache")
+                .build(),
+        ])
+        .commit()
+        .expect("Failed to initialize ORT environment");
+    
+    println!("[ORT] Environment initialized with TensorRT (FP16, caching enabled)");
+});
 
 pub struct InferenceEngine {
     session: Session,
@@ -16,18 +35,8 @@ pub struct InferenceEngine {
 
 impl InferenceEngine {
     pub fn new(model_path: impl AsRef<Path>) -> Result<Self> {
-        // Initialize ORT environment with TensorRT (matching your old fast config)
-        let _ = ort::init()
-            .with_name("tensorrt_iobinding")
-            .with_execution_providers([
-                TensorRTExecutionProvider::default()
-                    .with_device_id(0)
-                    .with_fp16(true)
-                    .with_engine_cache(true)
-                    .with_engine_cache_path("./trt_cache")
-                    .build(),
-            ])
-            .commit();
+        // Initialize ORT environment once (lazy initialization)
+        Lazy::force(&ORT_ENVIRONMENT);
 
         let session = Session::builder()?
             .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)?

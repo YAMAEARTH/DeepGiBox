@@ -632,6 +632,7 @@ dependencies = [
  "common_io",
  "config",
  "ndarray",
+ "once_cell",
  "ort",
  "telemetry",
 ]
