@@ -25,6 +25,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("✓ Opened capture session on device 0\n");
 
     // Try to capture a few frames
+    const TARGET_FRAMES: usize = 10;
     let mut frames_captured = 0;
     for attempt in 0..100 {
         match session.get_frame()? {
@@ -32,7 +33,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 frames_captured += 1;
                 print_rawframepacket(&packet);
 
-                if frames_captured >= 3 {
+                if frames_captured >= TARGET_FRAMES {
                     println!("\n✓ Successfully captured {} frames!", frames_captured);
                     return Ok(());
                 }
@@ -153,12 +154,8 @@ fn verify_packet(packet: &RawFramePacket) {
         MemLoc::Cpu => {
             println!("║   [✓] Data is in CPU memory");
         }
-        _ => {
-            println!(
-                "║   [✗] Data location is {:?} (expected CPU)",
-                packet.data.loc
-            );
-            all_ok = false;
+        MemLoc::Gpu { device } => {
+            println!("║   [✓] Data is in GPU memory (device {})", device);
         }
     }
 
