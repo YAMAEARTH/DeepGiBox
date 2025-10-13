@@ -1,10 +1,6 @@
 use anyhow::Result;
-<<<<<<< HEAD
-use common_io::{Stage, TensorInputPacket, RawDetectionsPacket};
-use once_cell::sync::Lazy;
-=======
 use common_io::{RawDetectionsPacket, Stage, TensorInputPacket};
->>>>>>> 7699291602b2cc44a62dd90899520d8f842bb7a1
+use once_cell::sync::Lazy;
 use ort::{
     execution_providers::TensorRTExecutionProvider,
     memory::{AllocationDevice, Allocator, AllocatorType, MemoryInfo, MemoryType},
@@ -39,21 +35,8 @@ pub struct InferenceEngine {
 
 impl InferenceEngine {
     pub fn new(model_path: impl AsRef<Path>) -> Result<Self> {
-<<<<<<< HEAD
         // Initialize ORT environment once (lazy initialization)
         Lazy::force(&ORT_ENVIRONMENT);
-=======
-        // Initialize ORT environment with TensorRT (matching your old fast config)
-        let _ = ort::init()
-            .with_name("tensorrt_iobinding")
-            .with_execution_providers([TensorRTExecutionProvider::default()
-                .with_device_id(0)
-                .with_fp16(true)
-                .with_engine_cache(true)
-                .with_engine_cache_path("./trt_cache")
-                .build()])
-            .commit();
->>>>>>> 7699291602b2cc44a62dd90899520d8f842bb7a1
 
         let session = Session::builder()?
             .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)?

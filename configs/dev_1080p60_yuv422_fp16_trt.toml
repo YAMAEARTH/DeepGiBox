@@ -8,6 +8,10 @@ colorspace = "BT709"
 size  = [512, 512]
 fp16  = true
 color = "BT709"
+chroma = "UYVY"
+mean = [0.0, 0.0, 0.0]
+std = [1.0, 1.0, 1.0]
+device = 0
 
 [inference]
 backend = "tensorrt"

@@ -6,6 +6,7 @@ edition = "2021"
 anyhow = "1"
 image = "0.24"
 ort = { version = "2.0.0-rc.10", features = ["tensorrt", "cuda"] }
+cudarc = "0.11.9"
 common_io = { path = "../../crates/common_io" }
 decklink_input = { path = "../../crates/decklink_input" }
 preprocess_cuda = { path = "../../crates/preprocess_cuda" }
