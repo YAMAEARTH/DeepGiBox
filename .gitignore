@@ -1,8 +1,10 @@
 # Project-specific ignores
 Samples/
 target/
+debug/
 Blackmagic DeckLink SDK.pdf
 Cargo.lock
+
 
 # macOS
 .DS_Store
@@ -16,3 +18,5 @@ Cargo.lock
 *.log
 tmp/
 *.tmp
+
+

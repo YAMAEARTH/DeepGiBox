@@ -1,5 +1,5 @@
-/home/kot/Documents/guptun/deepgibox/target/debug/deps/telemetry-97bed3a751df67d8.d: crates/telemetry/src/lib.rs
+/home/earth/Documents/Guptun/5/DeepGiBox/target/debug/deps/telemetry-97bed3a751df67d8.d: crates/telemetry/src/lib.rs
 
-/home/kot/Documents/guptun/deepgibox/target/debug/deps/libtelemetry-97bed3a751df67d8.rmeta: crates/telemetry/src/lib.rs
+/home/earth/Documents/Guptun/5/DeepGiBox/target/debug/deps/libtelemetry-97bed3a751df67d8.rmeta: crates/telemetry/src/lib.rs
 
 crates/telemetry/src/lib.rs:

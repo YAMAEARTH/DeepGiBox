@@ -5,6 +5,8 @@ DeepGIBox is a **Rust workspace** for a real‑time video AI overlay pipeline. I
 ## Quick Start
 ```bash
 cargo build
+
+แ
 cargo run -p runner -- --config configs/dev_1080p60_yuv422_fp16_trt.toml
 # or
 cargo run -p runner -- --config configs/dev_4k30_yuv422_fp16_trt.toml
@@ -73,3 +75,4 @@ Implement the real logic in each crate:
 - `overlay_plan` / `overlay_render` / `decklink_output`: build/compose and output.
 
 Playgrounds under `apps/playgrounds/src/bin/*.rs` demonstrate wiring with stubs; add your own files for experiments.
+
