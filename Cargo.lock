@@ -1080,6 +1080,7 @@ dependencies = [
  "common_io",
  "cudarc",
  "decklink_input",
+ "half",
  "image",
  "inference",
  "ort",
