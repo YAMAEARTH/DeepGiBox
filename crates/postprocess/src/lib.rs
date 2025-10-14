@@ -1,10 +1,10 @@
 use anyhow::Result;
-use common_io::{BBox, Detection, DetectionsPacket, RawDetectionsPacket, Stage};
+use common_io::{Stage, RawDetectionsPacket, DetectionsPacket, Detection, BBox};
 
 mod post;
 mod sort_tracker;
 
-use post::{postprocess_yolov5_with_temporal_smoothing, TemporalSmoother, YoloPostConfig};
+use post::{postprocess_yolov5_with_temporal_smoothing, YoloPostConfig, TemporalSmoother};
 use sort_tracker::SortTrackerWrapper;
 
 pub struct PostStage {
@@ -51,44 +51,34 @@ impl Stage<RawDetectionsPacket, DetectionsPacket> for PostStage {
 
     fn process(&mut self, input: RawDetectionsPacket) -> DetectionsPacket {
         let start = std::time::Instant::now();
-
+        
         // Process raw predictions (YOLO decode + NMS)
         let result = postprocess_yolov5_with_temporal_smoothing(
             &input.raw_output,
             &self.config,
             self.smoother.as_mut(),
         );
-
+        
         let duration = start.elapsed();
-        println!(
-            "  ✓ Postprocess time: {:.2}ms",
-            duration.as_secs_f64() * 1000.0
-        );
+        println!("  ✓ Postprocess time: {:.2}ms", duration.as_secs_f64() * 1000.0);
         println!("  ✓ Detections found: {}", result.detections.len());
-
+        
         // Apply SORT tracking if enabled
         let items = if let Some(tracker) = &mut self.tracker {
             self.current_epoch += 1;
-
+            
             // Convert detections to tracker format: (x1, y1, x2, y2, score, class_id)
             let detections_for_tracking: Vec<_> = result
                 .detections
                 .iter()
-                .map(|d| {
-                    (
-                        d.bbox[0], d.bbox[1], d.bbox[2], d.bbox[3], d.score, d.class_id,
-                    )
-                })
+                .map(|d| (d.bbox[0], d.bbox[1], d.bbox[2], d.bbox[3], d.score, d.class_id))
                 .collect();
-
+            
             // Update tracker and get tracked detections
             let tracked = tracker.update(&detections_for_tracking);
-
-            println!(
-                "  ✓ SORT tracking: {} active tracks",
-                tracker.get_active_track_count()
-            );
-
+            
+            println!("  ✓ SORT tracking: {} active tracks", tracker.get_active_track_count());
+            
             // Convert tracked detections to common_io::Detection format
             tracked
                 .iter()
@@ -109,16 +99,18 @@ impl Stage<RawDetectionsPacket, DetectionsPacket> for PostStage {
             result
                 .detections
                 .iter()
-                .map(|d| Detection {
-                    bbox: BBox {
-                        x: d.bbox[0],
-                        y: d.bbox[1],
-                        w: d.bbox[2] - d.bbox[0],
-                        h: d.bbox[3] - d.bbox[1],
-                    },
-                    score: d.score,
-                    class_id: d.class_id as i32,
-                    track_id: None,
+                .map(|d| {
+                    Detection {
+                        bbox: BBox {
+                            x: d.bbox[0],
+                            y: d.bbox[1],
+                            w: d.bbox[2] - d.bbox[0],
+                            h: d.bbox[3] - d.bbox[1],
+                        },
+                        score: d.score,
+                        class_id: d.class_id as i32,
+                        track_id: None,
+                    }
                 })
                 .collect()
         };
@@ -142,7 +134,7 @@ pub fn from_path(_cfg: &str) -> Result<PostStage> {
         letterbox_pad: (0.0, 0.0),
         original_size: (512, 512),
     };
-
+    
     Ok(PostStage::new(config).with_temporal_smoothing(4))
 }
 
