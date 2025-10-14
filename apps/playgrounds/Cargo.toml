@@ -10,6 +10,7 @@ cudarc = "0.11.9"
 half = "2.4"
 common_io = { path = "../../crates/common_io" }
 decklink_input = { path = "../../crates/decklink_input" }
+decklink_output = { path = "../../crates/decklink_output" }
 preprocess_cuda = { path = "../../crates/preprocess_cuda" }
 inference = { path = "../../crates/inference" }
 postprocess = { path = "../../crates/postprocess" }

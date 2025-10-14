@@ -36,24 +36,22 @@ fn main() -> Result<(), Box<dyn Error>> {
         let t_get = now_ns();
         let packet_option = session.get_frame()?;
         let get_ms = (now_ns() - t_get) as f64 / 1_000_000.0;
-        
+
         if let Some(packet) = packet_option {
             frame_count += 1;
             total_get_frame_ms += get_ms;
-            
+
             // === EXPLORE RawFramePacket ===
             let meta = &packet.meta;
             let data = &packet.data;
-            
+
             // Measure: Frame validation
             let t_validate = now_ns();
-            let is_valid = meta.width > 0 
-                && meta.height > 0 
-                && meta.stride_bytes > 0 
-                && data.len > 0;
+            let is_valid =
+                meta.width > 0 && meta.height > 0 && meta.stride_bytes > 0 && data.len > 0;
             let validate_ms = (now_ns() - t_validate) as f64 / 1_000_000.0;
             total_validation_ms += validate_ms;
-            
+
             // Measure: Simulate memory access/copy (read first and last 1KB)
             let t_memcpy = now_ns();
             if is_valid && data.len >= 2048 {
@@ -61,7 +59,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     // Read first 1KB
                     let _first = std::slice::from_raw_parts(data.ptr, 1024);
                     let _sum_first: u64 = _first.iter().map(|&b| b as u64).sum();
-                    
+
                     // Read last 1KB
                     let _last = std::slice::from_raw_parts(data.ptr.add(data.len - 1024), 1024);
                     let _sum_last: u64 = _last.iter().map(|&b| b as u64).sum();
@@ -69,9 +67,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             let memcpy_ms = (now_ns() - t_memcpy) as f64 / 1_000_000.0;
             total_memcpy_simulate_ms += memcpy_ms;
-            
+
             total_bytes += data.len as u64;
-            
+
             // Print detailed info every 10 frames
             if frame_count % 10 == 0 {
                 println!("\n--- Frame #{} ---", meta.frame_idx);
@@ -84,18 +82,22 @@ fn main() -> Result<(), Box<dyn Error>> {
                 println!("    frame_idx:      {}", meta.frame_idx);
                 println!("    pts_ns:         {}", meta.pts_ns);
                 println!("    t_capture_ns:   {}", meta.t_capture_ns);
-                
+
                 println!("  MemRef:");
                 println!("    ptr:            {:p}", data.ptr);
-                println!("    len:            {} bytes ({:.2} MB)", data.len, data.len as f64 / 1_048_576.0);
+                println!(
+                    "    len:            {} bytes ({:.2} MB)",
+                    data.len,
+                    data.len as f64 / 1_048_576.0
+                );
                 println!("    stride:         {}", data.stride);
                 println!("    loc:            {:?}", data.loc);
-                
+
                 println!("  Latencies:");
                 println!("    get_frame():    {:.6} ms", get_ms);
                 println!("    validation:     {:.6} ms", validate_ms);
                 println!("    memcpy(2KB):    {:.6} ms", memcpy_ms);
-                
+
                 // Calculate time since capture
                 let now_ns_unix = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -104,10 +106,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let latency_from_capture = (now_ns_unix - meta.t_capture_ns) as f64 / 1_000_000.0;
                 println!("    since capture:  {:.3} ms", latency_from_capture);
             }
-            
+
             // Record per-frame telemetry
             record_ms("frame.get", t_get);
-            
+
             if frame_count >= 50 {
                 break;
             }
@@ -115,44 +117,67 @@ fn main() -> Result<(), Box<dyn Error>> {
             // No frame available
             thread::sleep(Duration::from_micros(100));
         }
-        
+
         if attempt >= 199 {
-            println!("\n⚠ Warning: Reached max attempts with only {} frames", frame_count);
+            println!(
+                "\n⚠ Warning: Reached max attempts with only {} frames",
+                frame_count
+            );
             break;
         }
     }
 
     println!("\n{:=<100}", "");
     println!("\n=== Performance Summary ===");
-    
+
     if frame_count > 0 {
         let avg_get = total_get_frame_ms / frame_count as f64;
         let avg_validate = total_validation_ms / frame_count as f64;
         let avg_memcpy = total_memcpy_simulate_ms / frame_count as f64;
         let avg_total = avg_get + avg_validate + avg_memcpy;
         let avg_bytes = total_bytes / frame_count as u64;
-        
+
         println!("\nFrames captured:           {}", frame_count);
-        println!("Total data transferred:    {:.2} MB", total_bytes as f64 / 1_048_576.0);
-        println!("Average frame size:        {:.2} MB", avg_bytes as f64 / 1_048_576.0);
-        
+        println!(
+            "Total data transferred:    {:.2} MB",
+            total_bytes as f64 / 1_048_576.0
+        );
+        println!(
+            "Average frame size:        {:.2} MB",
+            avg_bytes as f64 / 1_048_576.0
+        );
+
         println!("\n--- Average Latencies ---");
         println!("get_frame():               {:.6} ms", avg_get);
         println!("validation:                {:.6} ms", avg_validate);
         println!("memcpy (2KB sample):       {:.6} ms", avg_memcpy);
         println!("total per frame:           {:.6} ms", avg_total);
-        
+
         println!("\n--- Throughput ---");
         let fps = 1000.0 / avg_total;
         let bandwidth_mbps = (avg_bytes as f64 * fps * 8.0) / 1_000_000.0;
-        
+
         println!("Theoretical max FPS:       {:.2}", fps);
         println!("Data bandwidth:            {:.2} Mbps", bandwidth_mbps);
-        
+
         println!("\n--- Frame Budget Check ---");
-        println!("16.67 ms (60 FPS):         {}", if avg_total < 16.67 { "✓ OK" } else { "✗ TOO SLOW" });
-        println!("33.33 ms (30 FPS):         {}", if avg_total < 33.33 { "✓ OK" } else { "✗ TOO SLOW" });
-        
+        println!(
+            "16.67 ms (60 FPS):         {}",
+            if avg_total < 16.67 {
+                "✓ OK"
+            } else {
+                "✗ TOO SLOW"
+            }
+        );
+        println!(
+            "33.33 ms (30 FPS):         {}",
+            if avg_total < 33.33 {
+                "✓ OK"
+            } else {
+                "✗ TOO SLOW"
+            }
+        );
+
         println!("\n--- Interpretation ---");
         if avg_get < 0.001 {
             println!("⚠ get_frame() < 0.001ms suggests it's reading pre-buffered data");

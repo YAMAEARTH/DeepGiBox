@@ -1,6 +1,7 @@
 #[derive(Clone, Copy, Debug)]
 pub enum PixelFormat {
     BGRA8,
+    RGB8,
     NV12,
     YUV422_8,
     P010,
