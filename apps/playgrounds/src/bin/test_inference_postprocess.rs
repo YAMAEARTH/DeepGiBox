@@ -7,7 +7,7 @@ use inference::InferenceEngine;
 use postprocess::{PostStage, PostprocessConfig};
 use std::path::Path;
 
-const MODEL_PATH: &str = "apps/playgrounds/YOLOv5.onnx";
+const MODEL_PATH: &str = "crates/inference/YOLOv5.onnx";
 const IMAGE_PATH: &str = "apps/playgrounds/sample_img.jpg";
 const INPUT_WIDTH: u32 = 512;
 const INPUT_HEIGHT: u32 = 512;

@@ -160,6 +160,8 @@ name = "config"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "serde",
+ "toml",
 ]
 
 [[package]]
@@ -655,6 +657,8 @@ dependencies = [
  "anyhow",
  "common_io",
  "config",
+ "cudarc",
+ "half",
  "ndarray",
  "once_cell",
  "ort",
@@ -1078,6 +1082,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "common_io",
+ "config",
  "cudarc",
  "decklink_input",
  "decklink_output",

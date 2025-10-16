@@ -9,6 +9,7 @@ ort = { version = "2.0.0-rc.10", features = ["tensorrt", "cuda"] }
 cudarc = "0.11.9"
 half = "2.4"
 common_io = { path = "../../crates/common_io" }
+config = { path = "../../crates/config" }
 decklink_input = { path = "../../crates/decklink_input" }
 decklink_output = { path = "../../crates/decklink_output" }
 preprocess_cuda = { path = "../../crates/preprocess_cuda" }

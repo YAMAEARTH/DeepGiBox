@@ -9,6 +9,16 @@ pub struct Detection {
     pub bbox: [f32; 4], // [left, top, right, bottom]
 }
 
+// Candidate struct used in NMS pipeline (guideline §5)
+#[derive(Clone)]
+pub struct Candidate {
+    pub detection: Detection,
+    pub bbox: Universal2DBox,
+}
+
+// Re-export config type alias for guideline compliance
+pub type PostprocessConfig = YoloPostConfig;
+
 // Temporal smoothing for video frame predictions
 pub struct TemporalSmoother {
     window_size: usize,
@@ -155,13 +165,8 @@ pub fn postprocess_yolov5_with_temporal_smoothing(
     PostprocessingResult { detections }
 }
 
-#[derive(Clone)]
-struct Candidate {
-    detection: Detection,
-    bbox: Universal2DBox,
-}
-
-fn decode_predictions(predictions: &[f32], cfg: &YoloPostConfig) -> Vec<Candidate> {
+// decode_predictions now uses pub Candidate defined at top
+pub fn decode_predictions(predictions: &[f32], cfg: &YoloPostConfig) -> Vec<Candidate> {
     let stride = 5 + cfg.num_classes;
     let inv_scale = if cfg.letterbox_scale > 0.0 {
         1.0 / cfg.letterbox_scale
@@ -226,7 +231,7 @@ fn decode_predictions(predictions: &[f32], cfg: &YoloPostConfig) -> Vec<Candidat
         .collect()
 }
 
-fn apply_nms(candidates: Vec<Candidate>, cfg: &YoloPostConfig) -> Vec<Candidate> {
+pub fn apply_nms(candidates: Vec<Candidate>, cfg: &YoloPostConfig) -> Vec<Candidate> {
     if candidates.is_empty() {
         return Vec::new();
     }

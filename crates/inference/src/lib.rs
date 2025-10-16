@@ -1,76 +1,187 @@
 use anyhow::Result;
-use common_io::{RawDetectionsPacket, Stage, TensorInputPacket};
+use common_io::{DType, RawDetectionsPacket, Stage, TensorInputPacket};
+use config::InferenceCfg;
 use once_cell::sync::Lazy;
 use ort::{
-    execution_providers::TensorRTExecutionProvider,
+    execution_providers::{CUDAExecutionProvider, TensorRTExecutionProvider},
     memory::{AllocationDevice, Allocator, AllocatorType, MemoryInfo, MemoryType},
     session::Session,
-    value::Tensor,
 };
-use std::path::Path;
+use telemetry::{now_ns, record_ms};
 
 /// Global ORT environment - initialized once at first use
 static ORT_ENVIRONMENT: Lazy<()> = Lazy::new(|| {
     ort::init()
-        .with_name("deepgibox_tensorrt")
-        .with_execution_providers([
-            TensorRTExecutionProvider::default()
-                .with_fp16(true)
-                .with_timing_cache(true)
-                .with_engine_cache(true)
-                .with_engine_cache_path("./trt_cache")
-                .build(),
-        ])
+        .with_name("deepgibox_inference")
         .commit()
         .expect("Failed to initialize ORT environment");
     
-    println!("[ORT] Environment initialized with TensorRT (FP16, caching enabled)");
+    println!("[ORT] Environment initialized");
 });
 
-pub struct InferenceEngine {
+pub struct OrtTrtEngine {
     session: Session,
-    gpu_allocator: Allocator,
-    cpu_allocator: Allocator,
+    device: u32,
+    fp16: bool,
+    input_name: String,
+    output_names: Vec<String>,
+    gpu_mem_info: MemoryInfo,
+    cpu_mem_info: MemoryInfo,
 }
 
-impl InferenceEngine {
-    pub fn new(model_path: impl AsRef<Path>) -> Result<Self> {
+impl OrtTrtEngine {
+    pub fn new(cfg: &InferenceCfg) -> Result<Self> {
         // Initialize ORT environment once (lazy initialization)
         Lazy::force(&ORT_ENVIRONMENT);
 
-        let session = Session::builder()?
-            .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)?
-            .commit_from_file(model_path.as_ref())?;
-        let cpu_allocator = Allocator::new(
-            &session,
-            MemoryInfo::new(
-                AllocationDevice::CPU,
-                0,
-                AllocatorType::Device,
-                MemoryType::Default,
-            )?,
+        println!("[Inference] Initializing with config:");
+        println!("  Model:         {}", cfg.model);
+        println!("  Device:        GPU {}", cfg.device);
+        println!("  FP16:          {}", cfg.fp16);
+        println!("  Engine Cache:  {}", cfg.engine_cache);
+        println!("  Timing Cache:  {}", cfg.timing_cache);
+
+        // Ensure cache directories exist
+        std::fs::create_dir_all(&cfg.engine_cache)?;
+        std::fs::create_dir_all(&cfg.timing_cache)?;
+
+        // Build session with TensorRT EP
+        let mut session_builder = Session::builder()?
+            .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)?;
+
+        // Configure TensorRT EP
+        let mut trt_provider = TensorRTExecutionProvider::default()
+            .with_device_id(cfg.device as i32)
+            .with_engine_cache(true)
+            .with_engine_cache_path(&cfg.engine_cache)
+            .with_timing_cache(true);
+
+        if cfg.fp16 {
+            trt_provider = trt_provider.with_fp16(true);
+        }
+
+        session_builder = session_builder.with_execution_providers([trt_provider.build()])?;
+
+        // Optional: Add CUDA EP as fallback
+        if cfg.enable_fallback_cuda.unwrap_or(true) {
+            let cuda_provider = CUDAExecutionProvider::default()
+                .with_device_id(cfg.device as i32);
+            session_builder = session_builder.with_execution_providers([cuda_provider.build()])?;
+        }
+
+        let session = session_builder.commit_from_file(&cfg.model)?;
+
+        // Get input/output names
+        let input_name = cfg.input_name.clone().unwrap_or_else(|| "images".to_string());
+        let output_names = cfg.output_names.clone().unwrap_or_else(|| vec!["output".to_string()]);
+
+        println!("[Inference] Model loaded:");
+        println!("  Input:  {}", input_name);
+        println!("  Outputs: {:?}", output_names);
+
+        // Create memory info for GPU and CPU
+        let gpu_mem_info = MemoryInfo::new(
+            AllocationDevice::CUDA,
+            cfg.device as i32,
+            AllocatorType::Device,
+            MemoryType::Default
+        )?;
+        
+        let cpu_mem_info = MemoryInfo::new(
+            AllocationDevice::CPU,
+            0,
+            AllocatorType::Device,
+            MemoryType::Default
         )?;
 
-        let gpu_allocator = Allocator::new(
-            &session,
-            MemoryInfo::new(
-                AllocationDevice::CUDA,
-                0,
-                AllocatorType::Device,
-                MemoryType::Default,
-            )?,
-        )?;
-
-        Ok(Self {
+        let mut engine = Self {
             session,
-            gpu_allocator,
-            cpu_allocator,
-        })
+            device: cfg.device,
+            fp16: cfg.fp16,
+            input_name,
+            output_names,
+            gpu_mem_info,
+            cpu_mem_info,
+        };
+
+        // Warmup
+        let warmup_runs = cfg.warmup_runs.unwrap_or(5);
+        if warmup_runs > 0 {
+            println!("[Inference] Warming up with {} runs...", warmup_runs);
+            engine.warmup(warmup_runs)?;
+            println!("[Inference] Warmup complete");
+        }
+
+        Ok(engine)
     }
 
-    fn run_inference(&mut self, input_packet: &TensorInputPacket) -> Result<Vec<f32>> {
+    fn warmup(&mut self, runs: usize) -> Result<()> {
+        use common_io::{FrameMeta, PixelFormat, ColorSpace, TensorDesc, MemRef, MemLoc};
+        use cudarc::driver::DevicePtr;
+        
+        // Create a dummy input tensor for warmup
+        let dummy_meta = FrameMeta {
+            source_id: 0,
+            frame_idx: 0,
+            width: 512,
+            height: 512,
+            pixfmt: PixelFormat::RGB8,
+            colorspace: ColorSpace::BT709,
+            pts_ns: 0,
+            t_capture_ns: 0,
+            stride_bytes: 512 * 3,
+        };
+
+        let shape = [1, 3, 512, 512];
+        let total_elements: usize = shape.iter().product();
+        let element_size = if self.fp16 { 2 } else { 4 };
+        let total_bytes = total_elements * element_size;
+
+        // Allocate GPU memory for dummy input
+        let device = cudarc::driver::CudaDevice::new(self.device as usize)?;
+        let dummy_buffer = device.alloc_zeros::<u8>(total_bytes)?;
+        let gpu_ptr = *dummy_buffer.device_ptr() as *mut u8;
+
+        let dummy_input = TensorInputPacket {
+            from: dummy_meta,
+            desc: TensorDesc {
+                n: 1,
+                c: 3,
+                h: 512,
+                w: 512,
+                dtype: if self.fp16 { DType::Fp16 } else { DType::Fp32 },
+                device: self.device,
+            },
+            data: MemRef {
+                ptr: gpu_ptr,
+                len: total_bytes,
+                stride: 512 * 3,
+                loc: MemLoc::Gpu { device: self.device },
+            },
+        };
+
+        for i in 0..runs {
+            let _ = self.run_inference(&dummy_input);
+            if i == 0 {
+                println!("  First run (building TRT engine - may take time)...");
+            }
+        }
+
+        // Clean up
+        drop(dummy_buffer);
+
+        Ok(())
+    }
+
+    fn run_inference(&mut self, input_packet: &TensorInputPacket) -> Result<(Vec<f32>, Vec<usize>)> {
+        let t_start = now_ns();
+        
         let desc = &input_packet.desc;
         let data = &input_packet.data;
+
+        // Validate input
+        assert_eq!(desc.n, 1, "Batch size must be 1");
+        assert!(matches!(desc.dtype, DType::Fp16 | DType::Fp32), "Only FP16/FP32 supported");
 
         let shape = [
             desc.n as usize,
@@ -80,119 +191,117 @@ impl InferenceEngine {
         ];
         let total_elements = shape.iter().product::<usize>();
 
-        // Create GPU tensor - handle both CPU-accessible and pure GPU memory
-        let tensor_start = std::time::Instant::now();
-        let input_tensor = unsafe {
-            let mut gpu_tensor = Tensor::<f32>::new(&self.gpu_allocator, shape)?;
+        // Check if we need to handle FP16 input
+        let use_fp16 = matches!(desc.dtype, DType::Fp16);
+        let is_gpu_memory = matches!(data.loc, common_io::MemLoc::Gpu { .. });
 
-            if gpu_tensor.memory_info().is_cpu_accessible() {
-                // GPU memory is CPU-accessible - direct copy!
-                let (_, tensor_data) = gpu_tensor.try_extract_tensor_mut::<f32>()?;
-                std::ptr::copy_nonoverlapping(
-                    data.ptr as *const f32,
-                    tensor_data.as_mut_ptr(),
-                    total_elements,
-                );
+        // Bind input - Current implementation uses CPU staging
+        // TODO: Implement true GPU-to-GPU I/O binding for zero-copy
+        let t_bind_start = now_ns();
+        let input_tensor = unsafe {
+            use ort::value::Tensor;
+            let mut staging = Tensor::<f32>::new(&Allocator::default(), shape)?;
+            let (_, staging_data) = staging.try_extract_tensor_mut::<f32>()?;
+            
+            if use_fp16 && is_gpu_memory {
+                // FP16 data on GPU - copy to CPU and convert
+                let mut cpu_fp16_raw = vec![0u16; total_elements];
+                cudarc::driver::result::memcpy_dtoh_sync(
+                    &mut cpu_fp16_raw,
+                    data.ptr as cudarc::driver::sys::CUdeviceptr,
+                )?;
+                
+                for (i, &raw_val) in cpu_fp16_raw.iter().enumerate() {
+                    let fp16_val = half::f16::from_bits(raw_val);
+                    staging_data[i] = fp16_val.to_f32();
+                }
+            } else if use_fp16 && !is_gpu_memory {
+                let fp16_slice = std::slice::from_raw_parts(data.ptr as *const half::f16, total_elements);
+                for (i, &fp16_val) in fp16_slice.iter().enumerate() {
+                    staging_data[i] = fp16_val.to_f32();
+                }
+            } else if !use_fp16 && is_gpu_memory {
+                cudarc::driver::result::memcpy_dtoh_sync(
+                    staging_data,
+                    data.ptr as cudarc::driver::sys::CUdeviceptr,
+                )?;
             } else {
-                // Pure GPU memory - use staging tensor for CPU→GPU or GPU→GPU
                 let slice = std::slice::from_raw_parts(data.ptr as *const f32, total_elements);
-                let mut staging = Tensor::<f32>::new(&Allocator::default(), shape)?;
-                let (_, staging_data) = staging.try_extract_tensor_mut::<f32>()?;
                 staging_data.copy_from_slice(slice);
-                staging.copy_into(&mut gpu_tensor)?;
             }
 
-            gpu_tensor
+            staging
         };
-        let tensor_time = tensor_start.elapsed();
+        record_ms("inference.bind", t_bind_start);
 
-        // Run inference with IO binding (GPU input → TensorRT compute → CPU output)
-        let binding_start = std::time::Instant::now();
+        // Create I/O binding
         let mut io_binding = self.session.create_binding()?;
-        io_binding.bind_input("images", &input_tensor)?;
+        io_binding.bind_input(&self.input_name, &input_tensor)?;
 
         // Bind output to CPU for easy extraction
-        io_binding.bind_output_to_device("output", &self.cpu_allocator.memory_info())?;
-        let binding_time = binding_start.elapsed();
+        for output_name in &self.output_names {
+            io_binding.bind_output_to_device(output_name, &self.cpu_mem_info)?;
+        }
 
-        let inference_start = std::time::Instant::now();
+        // Run inference
+        let t_run_start = now_ns();
         let outputs = self.session.run_binding(&io_binding)?;
-        let inference_time = inference_start.elapsed();
+        record_ms("inference.run", t_run_start);
 
-        // Extract predictions from CPU memory
-        let extract_start = std::time::Instant::now();
-        let predictions = if let Some(value) = outputs.get("output") {
-            value.try_extract_tensor::<f32>()?.1.to_vec()
+        // Extract outputs
+        let t_extract_start = now_ns();
+        let (predictions, output_shape) = if let Some(value) = outputs.get(&self.output_names[0]) {
+            let (shape, data) = value.try_extract_tensor::<f32>()?;
+            (data.to_vec(), shape.to_vec())
         } else {
-            outputs
+            let value = outputs
                 .values()
                 .next()
                 .ok_or_else(|| anyhow::anyhow!("No output tensor"))?
                 .try_upgrade()
-                .map_err(|_| anyhow::anyhow!("Cannot access output tensor"))?
-                .try_extract_tensor::<f32>()?
-                .1
-                .to_vec()
+                .map_err(|_| anyhow::anyhow!("Cannot access output tensor"))?;
+            let (shape, data) = value.try_extract_tensor::<f32>()?;
+            (data.to_vec(), shape.to_vec())
         };
-        let extract_time = extract_start.elapsed();
+        record_ms("inference.extract", t_extract_start);
 
-        // Print detailed timing breakdown
-        println!(
-            "    [Timing] Tensor staging: {:.2}ms",
-            tensor_time.as_secs_f64() * 1000.0
-        );
-        println!(
-            "    [Timing] IO binding setup: {:.2}ms",
-            binding_time.as_secs_f64() * 1000.0
-        );
-        println!(
-            "    [Timing] TensorRT execution: {:.2}ms",
-            inference_time.as_secs_f64() * 1000.0
-        );
-        println!(
-            "    [Timing] Output extraction: {:.2}ms",
-            extract_time.as_secs_f64() * 1000.0
-        );
+        // Record total inference time
+        record_ms("inference", t_start);
 
-        Ok(predictions)
+        // Convert shape from i64 to usize
+        let output_shape_usize: Vec<usize> = output_shape.iter().map(|&x| x as usize).collect();
+        Ok((predictions, output_shape_usize))
+    }
+
+    pub fn input_name(&self) -> &str {
+        &self.input_name
+    }
+
+    pub fn output_names(&self) -> &[String] {
+        &self.output_names
     }
 }
 
-impl Stage<TensorInputPacket, RawDetectionsPacket> for InferenceEngine {
+impl Stage<TensorInputPacket, RawDetectionsPacket> for OrtTrtEngine {
     fn name(&self) -> &'static str {
-        "InferenceEngine"
+        "OrtTrtEngine"
     }
 
     fn process(&mut self, input: TensorInputPacket) -> RawDetectionsPacket {
-        let start = std::time::Instant::now();
         match self.run_inference(&input) {
-            Ok(predictions) => {
-                let duration = start.elapsed();
-
-                // Print output info for debugging
-                println!(
-                    "  ✓ Inference time: {:.2}ms",
-                    duration.as_secs_f64() * 1000.0
-                );
-                println!("  ✓ Raw predictions: {} values", predictions.len());
-                if predictions.len() >= 10 {
-                    println!("  ✓ First 10: {:?}", &predictions[0..10]);
-                }
-                if predictions.len() > 10 {
-                    println!("  ✓ Last 10: {:?}", &predictions[predictions.len() - 10..]);
-                }
-
-                // Return predictions for postprocess stage
+            Ok((predictions, output_shape)) => {
                 RawDetectionsPacket {
                     from: input.from,
                     raw_output: predictions,
+                    output_shape,
                 }
             }
             Err(e) => {
-                eprintln!("Inference error: {}", e);
+                eprintln!("[Inference] Error: {}", e);
                 RawDetectionsPacket {
                     from: input.from,
                     raw_output: Vec::new(),
+                    output_shape: Vec::new(),
                 }
             }
         }
@@ -200,9 +309,16 @@ impl Stage<TensorInputPacket, RawDetectionsPacket> for InferenceEngine {
 }
 
 // Helper function to create from config path
-pub fn from_path(model_path: &str) -> Result<InferenceEngine> {
-    InferenceEngine::new(model_path)
+pub fn from_path(cfg_path: &str) -> Result<OrtTrtEngine> {
+    let app_cfg = config::AppConfig::from_file(cfg_path)?;
+    let inf_cfg = app_cfg.inference
+        .ok_or_else(|| anyhow::anyhow!("No [inference] section in config"))?;
+    OrtTrtEngine::new(&inf_cfg)
 }
 
-// Type alias for backwards compatibility
-pub type InferStage = InferenceEngine;
+// Backwards compatibility aliases
+pub type InferenceEngine = OrtTrtEngine;
+pub type InferStage = OrtTrtEngine;
+
+#[cfg(test)]
+mod tests;

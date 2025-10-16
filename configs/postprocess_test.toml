@@ -1,0 +1,29 @@
+# Postprocessing configuration following postprocessing_guideline.md
+# This config demonstrates all guideline-compliant options
+
+[postprocess]
+type = "yolo"           # Model type: "yolo" | "detr" | "seg" | "keypoints"
+score_thresh = 0.25     # Minimum confidence threshold (guideline §3.3)
+max_dets = 300          # Maximum total detections
+
+# NMS configuration (guideline §3.4)
+[postprocess.nms]
+type = "classwise"      # NMS type: "classwise" | "soft" | "diou" | "ciou"
+iou_thresh = 0.45       # IoU threshold for NMS
+max_per_class = 100     # Max detections per class
+max_total = 300         # Max total detections after NMS
+
+# Tracking configuration (guideline §3.5)
+[postprocess.tracking]
+enable = false          # Enable SORT tracking
+iou_match = 0.5         # IoU threshold for track matching
+max_age = 30            # Max frames to keep lost tracks
+min_confidence = 0.25   # Minimum confidence for tracking
+
+# Letterbox remapping (guideline §3.2)
+[postprocess.letterbox]
+scale = 1.0             # Scale factor (from preprocessing)
+pad_x = 0.0             # Horizontal padding
+pad_y = 0.0             # Vertical padding
+original_w = 512        # Original frame width
+original_h = 512        # Original frame height

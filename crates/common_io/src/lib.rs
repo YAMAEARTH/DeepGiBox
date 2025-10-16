@@ -86,6 +86,7 @@ pub struct TensorInputPacket {
 pub struct RawDetectionsPacket {
     pub from: FrameMeta,
     pub raw_output: Vec<f32>, // Pun:: added raw model output (e.g., YOLO predictions)
+    pub output_shape: Vec<usize>, // Shape of the model output tensor (e.g., [1, 25200, 85] for YOLOv5)
 }
 
 #[derive(Clone, Copy, Debug)]
