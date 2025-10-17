@@ -666,6 +666,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "inference_v2"
+version = "0.1.0"
+dependencies = [
+ "common_io",
+ "libloading",
+]
+
+[[package]]
 name = "integer-sqrt"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1089,6 +1097,7 @@ dependencies = [
  "half",
  "image",
  "inference",
+ "inference_v2",
  "ort",
  "overlay_plan",
  "overlay_render",

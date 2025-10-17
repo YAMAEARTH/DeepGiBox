@@ -6,6 +6,7 @@ members = [
   "crates/decklink_input",
   "crates/preprocess_cuda",
   "crates/inference",
+  "crates/inference_v2",
   "crates/postprocess",
   "crates/overlay_plan",
   "crates/overlay_render",
