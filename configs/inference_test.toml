@@ -1,0 +1,17 @@
+# DeepGIBox Inference Configuration Example
+# Following inference_guideline.md specification
+
+[inference]
+backend = "onnxruntime_trt"
+model = "crates/inference/YOLOv5.onnx"
+device = 0
+fp16 = true
+engine_cache = "./trt_cache"
+timing_cache = "./trt_cache"
+max_workspace_mb = 2048
+enable_fallback_cuda = true
+warmup_runs = 5
+
+# Input/Output names (optional, defaults shown)
+input_name = "images"
+output_names = ["output"]
