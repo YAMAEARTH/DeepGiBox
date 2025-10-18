@@ -1103,7 +1103,6 @@ dependencies = [
  "overlay_render",
  "postprocess",
  "preprocess_cuda",
- "rand",
  "telemetry",
  "testsupport",
 ]

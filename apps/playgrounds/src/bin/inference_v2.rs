@@ -3,16 +3,33 @@ use common_io::{
     ColorSpace, DType, FrameMeta, MemLoc, MemRef, PixelFormat, Stage, TensorDesc,
     TensorInputPacket, RawDetectionsPacket,
 };
-use cudarc::driver::{CudaDevice, CudaSlice};
+use cudarc::driver::{CudaDevice, CudaSlice, DevicePtr};
 use image::io::Reader as ImageReader;
 use inference_v2::TrtInferenceStage;
-use std::sync::Arc;
 
-const ENGINE_PATH: &str = "TRT_SHIM/optimized_YOLOv5.engine";
+const ENGINE_PATH: &str = "apps/playgrounds/optimized_YOLOv5.engine";
 const LIB_PATH: &str = "TRT_SHIM/libtrt_shim.so";
 const IMAGE_PATH: &str = "apps/playgrounds/sample_img.jpg";
 const INPUT_WIDTH: u32 = 640;
 const INPUT_HEIGHT: u32 = 640;
+
+fn print_engine_build_instructions() {
+    eprintln!("\n╔═══════════════════════════════════════════════════════════════════╗");
+    eprintln!("║  ⚠️  TensorRT Engine File Not Found                               ║");
+    eprintln!("╚═══════════════════════════════════════════════════════════════════╝\n");
+    eprintln!("The TensorRT engine file is required for GPU inference.");
+    eprintln!("You need to build it from an ONNX model.\n");
+    eprintln!("📝 Instructions:\n");
+    eprintln!("1. Export YOLOv5 to ONNX format (640x640 input):");
+    eprintln!("   python export.py --weights yolov5s.pt --include onnx --imgsz 640\n");
+    eprintln!("2. Build TensorRT engine:");
+    eprintln!("   trtexec --onnx=yolov5s.onnx \\");
+    eprintln!("           --saveEngine=TRT_SHIM/optimized_YOLOv5.engine \\");
+    eprintln!("           --fp16 \\");
+    eprintln!("           --workspace=4096\n");
+    eprintln!("3. Or use existing ONNX at: crates/inference/YOLOv5.onnx\n");
+    eprintln!("Once the engine file is ready, run this program again!\n");
+}
 
 fn main() -> Result<()> {
     println!("╔═══════════════════════════════════════════════════════════╗");
@@ -117,8 +134,15 @@ fn main() -> Result<()> {
     // ═══════════════════════════════════════════════════════════════════════
     println!("🔧 Step 5: Initializing TensorRT Inference Stage...");
     let start = std::time::Instant::now();
-    
-    let mut inference_stage = TrtInferenceStage::new(ENGINE_PATH, LIB_PATH)?;
+
+    let mut inference_stage = match TrtInferenceStage::new(ENGINE_PATH, LIB_PATH) {
+        Ok(stage) => stage,
+        Err(e) => {
+            eprintln!("❌ Error: {}", e);
+            print_engine_build_instructions();
+            return Err(anyhow::anyhow!("Failed to create inference stage"));
+        }
+    };
     let init_time = start.elapsed();
     
     println!("   ✓ TrtInferenceStage created");
