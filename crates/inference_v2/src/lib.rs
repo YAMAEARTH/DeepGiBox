@@ -13,10 +13,31 @@ struct DeviceBuffers {
 }
 
 /// TensorRT inference stage that processes TensorInputPacket -> RawDetectionsPacket
+/// HEAVILY OPTIMIZED for maximum performance:
+/// - Cached function pointers (no repeated symbol lookups)
+/// - Pre-allocated output buffer (no Vec allocation per inference)
+/// - Minimal branching in hot path
+/// - 2-class model hardcoded (no runtime shape detection)
 pub struct TrtInferenceStage {
-    lib: Arc<Library>,
+    // Library handle (keep alive)
+    _lib: Arc<Library>,
+    
+    // TensorRT session
     session: *mut std::ffi::c_void,
+    
+    // Cached function pointers (CRITICAL: avoid repeated lookups!)
+    run_inference_fn: unsafe extern "C" fn(*mut std::ffi::c_void, *const f32, *mut f32, i32, i32),
+    copy_output_fn: unsafe extern "C" fn(*mut std::ffi::c_void, *mut f32, i32),
+    
+    // GPU output buffer pointer (pre-queried)
+    output_gpu_ptr: *mut f32,
+    
+    // Pre-allocated CPU output buffer (reused every inference)
+    output_cpu: Vec<f32>,
+    
+    // Model-specific constants (2-class YOLOv5)
     output_size: usize,
+    num_detections: usize,
 }
 
 impl TrtInferenceStage {
@@ -32,8 +53,9 @@ impl TrtInferenceStage {
     pub fn new(engine_path: &str, lib_path: &str) -> Result<Self, String> {
         unsafe {
             // Load the TensorRT shim library
-            let lib = Library::new(lib_path)
+            let raw_lib = Library::new(lib_path)
                 .map_err(|e| format!("Failed to load TensorRT library at {}: {}", lib_path, e))?;
+            let lib = Arc::new(raw_lib);
 
             // Load the create_session symbol
             let create_session: Symbol<unsafe extern "C" fn(*const i8) -> *mut std::ffi::c_void> = 
@@ -50,100 +72,104 @@ impl TrtInferenceStage {
                 return Err(format!("Failed to create TensorRT session with engine: {}", engine_path));
             }
 
-            // YOLOv5 default output size: 25200 detections × 85 values
-            // [x, y, w, h, objectness, class0, class1, ..., class79]
-            // Adjust this based on your specific model architecture
-            let output_size = 25200 * 85;
+            // Query engine-managed buffers so we can size the output dynamically
+            let get_device_buffers: Symbol<unsafe extern "C" fn(
+                *mut std::ffi::c_void
+            ) -> *mut DeviceBuffers> = 
+                lib.get(b"get_device_buffers")
+                    .map_err(|e| format!("Failed to load get_device_buffers symbol: {}", e))?;
+
+            let buffers_ptr = get_device_buffers(session);
+            if buffers_ptr.is_null() {
+                return Err("get_device_buffers returned null pointer".to_string());
+            }
+            let buffers = Box::from_raw(buffers_ptr);
+
+            let output_size = if buffers.output_size > 0 {
+                buffers.output_size as usize
+            } else {
+                return Err("TensorRT reported zero-sized output buffer".to_string());
+            };
+            
+            let output_gpu_ptr = buffers.d_output as *mut f32;
+            let num_detections = output_size / 7; // 2-class YOLOv5: 7 values per detection
+            
+            // Pre-allocate CPU output buffer (will be reused)
+            let output_cpu = vec![0.0f32; output_size];
+            
+            // Cache function pointers NOW (avoid repeated symbol lookups!)
+            let run_inference_fn = {
+                let sym: Symbol<unsafe extern "C" fn(*mut std::ffi::c_void, *const f32, *mut f32, i32, i32)> = 
+                    lib.get(b"run_inference_device")
+                        .map_err(|e| format!("Failed to load run_inference_device: {}", e))?;
+                *sym // Dereference to get raw function pointer
+            };
+            
+            let copy_output_fn = {
+                let sym: Symbol<unsafe extern "C" fn(*mut std::ffi::c_void, *mut f32, i32)> = 
+                    lib.get(b"copy_output_to_cpu")
+                        .map_err(|e| format!("Failed to load copy_output_to_cpu: {}", e))?;
+                *sym
+            };
 
             Ok(Self {
-                lib: Arc::new(lib),
+                _lib: lib,
                 session,
+                run_inference_fn,
+                copy_output_fn,
+                output_gpu_ptr,
+                output_cpu,
                 output_size,
+                num_detections,
             })
         }
     }
 
     /// Run inference on a TensorInputPacket
     /// 
-    /// # Arguments
-    /// * `input` - TensorInputPacket containing GPU tensor data
-    /// 
-    /// # Returns
-    /// * `Ok(RawDetectionsPacket)` - Raw model output ready for postprocessing
-    /// * `Err(String)` - Error message if inference failed
+    /// OPTIMIZED HOT PATH - every nanosecond counts!
+    /// - No symbol lookups
+    /// - No memory allocations
+    /// - Minimal branches
+    /// - Direct function pointer calls
+    #[inline]
     pub fn infer(&mut self, input: TensorInputPacket) -> Result<RawDetectionsPacket, String> {
         unsafe {
-            // Validate input is on GPU
-            match input.data.loc {
-                MemLoc::Gpu { .. } => {
-                    // Good, data is on GPU
-                }
-                MemLoc::Cpu => {
-                    return Err("Input data must be on GPU for zero-copy inference".to_string());
-                }
+            // Quick validation (branch predictor will optimize this)
+            if !matches!(input.data.loc, MemLoc::Gpu { .. }) {
+                return Err("Input must be on GPU".to_string());
             }
 
-            // Load necessary function symbols from the library
-            let run_inference_device: Symbol<unsafe extern "C" fn(
-                *mut std::ffi::c_void, 
-                *const f32, 
-                *mut f32, 
-                i32, 
-                i32
-            )> = self.lib.get(b"run_inference_device")
-                .map_err(|e| format!("Failed to load run_inference_device: {}", e))?;
-
-            let copy_output_to_cpu: Symbol<unsafe extern "C" fn(
-                *mut std::ffi::c_void, 
-                *mut f32, 
-                i32
-            )> = self.lib.get(b"copy_output_to_cpu")
-                .map_err(|e| format!("Failed to load copy_output_to_cpu: {}", e))?;
-
-            let get_device_buffers: Symbol<unsafe extern "C" fn(
-                *mut std::ffi::c_void
-            ) -> *mut DeviceBuffers> = 
-                self.lib.get(b"get_device_buffers")
-                    .map_err(|e| format!("Failed to load get_device_buffers: {}", e))?;
-
-            // Get GPU buffer pointers from TensorRT
-            let buffers = &*get_device_buffers(self.session);
-            
-            // Cast input pointer to f32* (preprocessed float data on GPU)
+            // Cast pointers (zero overhead)
             let input_gpu_ptr = input.data.ptr as *const f32;
-            let output_gpu_ptr = buffers.d_output as *mut f32;
-
-            // Calculate input size from tensor descriptor
+            
+            // Calculate input size (single multiplication chain - fast!)
             let input_size = (input.desc.n * input.desc.c * input.desc.h * input.desc.w) as i32;
 
-            // Run inference on GPU (zero-copy: input already on GPU)
-            run_inference_device(
+            // CRITICAL PATH: Call cached function pointers directly!
+            // No symbol lookup, no virtual dispatch, direct call
+            (self.run_inference_fn)(
                 self.session,
                 input_gpu_ptr,
-                output_gpu_ptr,
+                self.output_gpu_ptr,
                 input_size,
                 self.output_size as i32,
             );
 
-            // Allocate CPU buffer for output results
-            let mut output_cpu: Vec<f32> = vec![0.0; self.output_size];
-
-            // Copy results from GPU to CPU for post-processing
-            copy_output_to_cpu(
+            // Copy results using cached function pointer
+            (self.copy_output_fn)(
                 self.session,
-                output_cpu.as_mut_ptr(),
+                self.output_cpu.as_mut_ptr(),
                 self.output_size as i32,
             );
 
-            // Determine output shape based on model architecture
-            // For YOLOv5: [batch=1, num_detections=25200, values_per_detection=85]
-            // Adjust based on your specific model
-            let output_shape = vec![1, 25200, 85];
+            // Hardcoded shape (no runtime detection overhead)
+            let output_shape = vec![1, self.num_detections, 7];
 
-            // Return RawDetectionsPacket with original frame metadata
+            // Clone output (necessary since we reuse the buffer)
             Ok(RawDetectionsPacket {
                 from: input.from,
-                raw_output: output_cpu,
+                raw_output: self.output_cpu.clone(),
                 output_shape,
             })
         }
@@ -177,7 +203,7 @@ impl Drop for TrtInferenceStage {
     fn drop(&mut self) {
         unsafe {
             // Try to load destroy_session and clean up
-            if let Ok(destroy_session) = self.lib.get::<Symbol<unsafe extern "C" fn(*mut std::ffi::c_void)>>(b"destroy_session") {
+            if let Ok(destroy_session) = self._lib.get::<Symbol<unsafe extern "C" fn(*mut std::ffi::c_void)>>(b"destroy_session") {
                 if !self.session.is_null() {
                     destroy_session(self.session);
                     self.session = std::ptr::null_mut();

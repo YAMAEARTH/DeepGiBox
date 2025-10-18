@@ -10,8 +10,10 @@ use inference_v2::TrtInferenceStage;
 const ENGINE_PATH: &str = "apps/playgrounds/optimized_YOLOv5.engine";
 const LIB_PATH: &str = "TRT_SHIM/libtrt_shim.so";
 const IMAGE_PATH: &str = "apps/playgrounds/sample_img.jpg";
-const INPUT_WIDTH: u32 = 640;
-const INPUT_HEIGHT: u32 = 640;
+// YOLOv5 input dimensions (MUST match the TensorRT engine!)
+// Check the actual model input size with: [TRT] ACTUAL ENGINE TENSOR DIMENSIONS
+const INPUT_WIDTH: u32 = 512;   // Changed from 640 to match engine (1, 3, 512, 512)
+const INPUT_HEIGHT: u32 = 512;  // Changed from 640 to match engine
 
 fn print_engine_build_instructions() {
     eprintln!("\n╔═══════════════════════════════════════════════════════════════════╗");
@@ -68,13 +70,13 @@ fn main() -> Result<()> {
     // ═══════════════════════════════════════════════════════════════════════
     println!("📤 Step 3: Uploading data to GPU...");
     let start = std::time::Instant::now();
-    
+
     let gpu_buffer: CudaSlice<f32> = cuda_device.htod_sync_copy(&preprocessed)?;
     let upload_time = start.elapsed();
-    
+
     let gpu_ptr = *gpu_buffer.device_ptr() as *mut u8;
     let gpu_len = preprocessed.len() * std::mem::size_of::<f32>();
-    
+
     println!("   ✓ Uploaded {} bytes to GPU", gpu_len);
     println!("   ✓ GPU pointer: {:#x}", gpu_ptr as usize);
     println!("   ✓ Upload time: {:.2}ms\n", upload_time.as_secs_f64() * 1000.0);
@@ -83,7 +85,7 @@ fn main() -> Result<()> {
     // STEP 4: Create TensorInputPacket
     // ═══════════════════════════════════════════════════════════════════════
     println!("📦 Step 4: Creating TensorInputPacket...");
-    
+
     let frame_meta = FrameMeta {
         source_id: 1,
         width: orig_w,
@@ -144,7 +146,7 @@ fn main() -> Result<()> {
         }
     };
     let init_time = start.elapsed();
-    
+
     println!("   ✓ TrtInferenceStage created");
     println!("   ✓ Engine loaded from: {}", ENGINE_PATH);
     println!("   ✓ Initialization time: {:.2}ms\n", init_time.as_secs_f64() * 1000.0);
@@ -154,11 +156,11 @@ fn main() -> Result<()> {
     // ═══════════════════════════════════════════════════════════════════════
     println!("⚡ Step 6: Running GPU-Only Inference...");
     println!("   Input: GPU pointer {:#x} (ZERO-COPY)", gpu_ptr as usize);
-    
+
     let start = std::time::Instant::now();
     let detections: RawDetectionsPacket = inference_stage.process(tensor_packet);
     let inference_time = start.elapsed();
-    
+
     println!("   ✓ Inference completed!");
     println!("   ✓ Inference time: {:.2}ms", inference_time.as_secs_f64() * 1000.0);
     println!("   ✓ Throughput: {:.1} FPS\n", 1000.0 / (inference_time.as_secs_f64() * 1000.0));
@@ -167,73 +169,109 @@ fn main() -> Result<()> {
     // STEP 7: Analyze Results
     // ═══════════════════════════════════════════════════════════════════════
     println!("📊 Step 7: Analyzing Detection Results...");
-    
+
     let output_shape = &detections.output_shape;
     let raw_output = &detections.raw_output;
-    
+
     println!("   Output shape: {:?}", output_shape);
     println!("   Total output elements: {}", raw_output.len());
-    
+
     let non_zero = raw_output.iter().filter(|&&x| x.abs() > 0.001).count();
     let max_val = raw_output.iter().fold(0.0f32, |a, &b| a.max(b));
     let min_val = raw_output.iter().fold(f32::INFINITY, |a, &b| a.min(b));
-    
+
     println!("   Non-zero values: {}/{} ({:.2}%)", 
              non_zero, raw_output.len(), 
              (non_zero as f64 / raw_output.len() as f64) * 100.0);
     println!("   Value range: [{:.4}, {:.4}]", min_val, max_val);
-    
-    // Parse YOLOv5 detections (25200 detections × 85 values)
-    if output_shape.len() >= 3 && output_shape[1] == 25200 && output_shape[2] == 85 {
-        println!("\n   🔍 Parsing YOLOv5 Detections (threshold: 0.5)...");
-        
-        let mut detection_count = 0;
-        let confidence_threshold = 0.5;
-        
-        for det_idx in 0..25200 {
-            let offset = det_idx * 85;
-            
-            if offset + 84 >= raw_output.len() {
-                break;
-            }
-            
-            let x = raw_output[offset];
-            let y = raw_output[offset + 1];
-            let w = raw_output[offset + 2];
-            let h = raw_output[offset + 3];
-            let objectness = raw_output[offset + 4];
-            
-            // Get class scores
-            let class_scores = &raw_output[offset + 5..offset + 85];
-            let (class_id, &class_score) = class_scores
-                .iter()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                .unwrap();
-            
-            let confidence = objectness * class_score;
-            
-            if confidence > confidence_threshold {
-                detection_count += 1;
-                
-                if detection_count <= 5 {
-                    println!("   Detection #{}: ", detection_count);
-                    println!("      bbox: ({:.1}, {:.1}, {:.1}, {:.1})", x, y, w, h);
-                    println!("      confidence: {:.4}", confidence);
-                    println!("      class: {} (score: {:.4})", class_id, class_score);
+
+    // Parse YOLOv5 detections (25200 detections × (classes + 5) values)
+    if output_shape.len() >= 3 {
+        let num_detections = output_shape[1];
+        let values_per_detection = output_shape[2];
+
+        if values_per_detection <= 5 {
+            println!(
+                "   ⚠️  Unexpected detection width: {}",
+                values_per_detection
+            );
+        } else {
+            let num_classes = values_per_detection - 5;
+            println!(
+                "\n   🔍 Parsing YOLOv5 Detections ({} classes, threshold: 0.5)...",
+                num_classes
+            );
+
+            let mut detection_count = 0;
+            let mut all_detections = Vec::new();
+            let confidence_threshold = 0.5;
+
+            for det_idx in 0..num_detections {
+                let offset = det_idx * values_per_detection;
+
+                if offset + values_per_detection > raw_output.len() {
+                    break;
+                }
+
+                let x = raw_output[offset];
+                let y = raw_output[offset + 1];
+                let w = raw_output[offset + 2];
+                let h = raw_output[offset + 3];
+                let objectness = raw_output[offset + 4];
+
+                // Get class scores
+                let class_scores = &raw_output[offset + 5..offset + values_per_detection];
+                if let Some((class_id, &class_score)) = class_scores
+                    .iter()
+                    .enumerate()
+                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                {
+                    let confidence = objectness * class_score;
+                    
+                    // Store all detections for top-k analysis
+                    all_detections.push((confidence, x, y, w, h, class_id, objectness, class_score));
+
+                    if confidence > confidence_threshold {
+                        detection_count += 1;
+
+                        if detection_count <= 5 {
+                            println!("   Detection #{}: ", detection_count);
+                            println!("      bbox: ({:.1}, {:.1}, {:.1}, {:.1})", x, y, w, h);
+                            println!("      confidence: {:.4}", confidence);
+                            println!("      class: {} (score: {:.4})", class_id, class_score);
+                            println!("      objectness: {:.4}", objectness);
+                        }
+                    }
                 }
             }
+
+            if detection_count > 5 {
+                println!("   ... and {} more detections", detection_count - 5);
+            }
+
+            println!("\n   ✅ Total detections found (>0.5): {}", detection_count);
+            
+            // Show top 5 detections regardless of threshold
+            all_detections.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+            println!("\n   📊 Top 5 Detections (by confidence):");
+            for (i, &(conf, x, y, w, h, class_id, obj, cls_score)) in all_detections.iter().take(5).enumerate() {
+                println!("   #{}: conf={:.4}, bbox=({:.1},{:.1},{:.1},{:.1}), class={}, obj={:.4}, cls={:.4}",
+                         i + 1, conf, x, y, w, h, class_id, obj, cls_score);
+            }
+            
+            // Show confidence distribution
+            let high_conf = all_detections.iter().filter(|(c, ..)| *c > 0.5).count();
+            let med_conf = all_detections.iter().filter(|(c, ..)| *c > 0.25 && *c <= 0.5).count();
+            let low_conf = all_detections.iter().filter(|(c, ..)| *c > 0.1 && *c <= 0.25).count();
+            println!("\n   📈 Confidence Distribution:");
+            println!("      >0.50: {} detections", high_conf);
+            println!("      0.25-0.50: {} detections", med_conf);
+            println!("      0.10-0.25: {} detections", low_conf);
         }
-        
-        if detection_count > 5 {
-            println!("   ... and {} more detections", detection_count - 5);
-        }
-        
-        println!("\n   ✅ Total detections found: {}", detection_count);
     } else {
         println!("   ⚠️  Unexpected output shape, skipping detection parsing");
     }
-    
+
     // ═══════════════════════════════════════════════════════════════════════
     // STEP 8: Performance Summary
     // ═══════════════════════════════════════════════════════════════════════
