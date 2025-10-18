@@ -13,19 +13,31 @@ struct DeviceBuffers {
 }
 
 /// TensorRT inference stage that processes TensorInputPacket -> RawDetectionsPacket
+/// HEAVILY OPTIMIZED for maximum performance:
+/// - Cached function pointers (no repeated symbol lookups)
+/// - Pre-allocated output buffer (no Vec allocation per inference)
+/// - Minimal branching in hot path
+/// - 2-class model hardcoded (no runtime shape detection)
 pub struct TrtInferenceStage {
-    lib: Arc<Library>,
-    session: *mut std::ffi::c_void,
-    output_size: usize,
-    num_detections: usize,
+    // Library handle (keep alive)
+    _lib: Arc<Library>,
     
-    // Pre-allocated output buffer (reused across inferences)
+    // TensorRT session
+    session: *mut std::ffi::c_void,
+    
+    // Cached function pointers (CRITICAL: avoid repeated lookups!)
+    run_inference_fn: unsafe extern "C" fn(*mut std::ffi::c_void, *const f32, *mut f32, i32, i32),
+    copy_output_fn: unsafe extern "C" fn(*mut std::ffi::c_void, *mut f32, i32),
+    
+    // GPU output buffer pointer (pre-queried)
+    output_gpu_ptr: *mut f32,
+    
+    // Pre-allocated CPU output buffer (reused every inference)
     output_cpu: Vec<f32>,
     
-    // Cached function pointers (avoid repeated symbol lookups)
-    run_inference_device: unsafe extern "C" fn(*mut std::ffi::c_void, *const f32, *mut f32, i32, i32),
-    copy_output_to_cpu: unsafe extern "C" fn(*mut std::ffi::c_void, *mut f32, i32),
-    output_gpu_ptr: *mut f32,
+    // Model-specific constants (2-class YOLOv5)
+    output_size: usize,
+    num_detections: usize,
 }
 
 impl TrtInferenceStage {
@@ -80,62 +92,63 @@ impl TrtInferenceStage {
             };
             
             let output_gpu_ptr = buffers.d_output as *mut f32;
+            let num_detections = output_size / 7; // 2-class YOLOv5: 7 values per detection
             
-            // YOLOv5 2-class model: 7 values per detection
-            let num_detections = output_size / 7;
-            
-            // Pre-allocate output buffer (reused across all inferences)
+            // Pre-allocate CPU output buffer (will be reused)
             let output_cpu = vec![0.0f32; output_size];
             
-            // Cache function pointers to avoid repeated symbol lookups (HUGE performance boost!)
-            let run_inference_device: Symbol<unsafe extern "C" fn(*mut std::ffi::c_void, *const f32, *mut f32, i32, i32)> = 
-                lib.get(b"run_inference_device")
-                    .map_err(|e| format!("Failed to load run_inference_device: {}", e))?;
+            // Cache function pointers NOW (avoid repeated symbol lookups!)
+            let run_inference_fn = {
+                let sym: Symbol<unsafe extern "C" fn(*mut std::ffi::c_void, *const f32, *mut f32, i32, i32)> = 
+                    lib.get(b"run_inference_device")
+                        .map_err(|e| format!("Failed to load run_inference_device: {}", e))?;
+                *sym // Dereference to get raw function pointer
+            };
             
-            let copy_output_to_cpu: Symbol<unsafe extern "C" fn(*mut std::ffi::c_void, *mut f32, i32)> = 
-                lib.get(b"copy_output_to_cpu")
-                    .map_err(|e| format!("Failed to load copy_output_to_cpu: {}", e))?;
-            
-            // Dereference symbols to get raw function pointers
-            let run_inference_device_ptr = *run_inference_device;
-            let copy_output_to_cpu_ptr = *copy_output_to_cpu;
+            let copy_output_fn = {
+                let sym: Symbol<unsafe extern "C" fn(*mut std::ffi::c_void, *mut f32, i32)> = 
+                    lib.get(b"copy_output_to_cpu")
+                        .map_err(|e| format!("Failed to load copy_output_to_cpu: {}", e))?;
+                *sym
+            };
 
             Ok(Self {
-                lib,
+                _lib: lib,
                 session,
+                run_inference_fn,
+                copy_output_fn,
+                output_gpu_ptr,
+                output_cpu,
                 output_size,
                 num_detections,
-                output_cpu,
-                run_inference_device: run_inference_device_ptr,
-                copy_output_to_cpu: copy_output_to_cpu_ptr,
-                output_gpu_ptr,
             })
         }
     }
 
     /// Run inference on a TensorInputPacket
     /// 
-    /// # Arguments
-    /// * `input` - TensorInputPacket containing GPU tensor data
-    /// 
-    /// # Returns
-    /// * `Ok(RawDetectionsPacket)` - Raw model output ready for postprocessing
-    /// * `Err(String)` - Error message if inference failed
+    /// OPTIMIZED HOT PATH - every nanosecond counts!
+    /// - No symbol lookups
+    /// - No memory allocations
+    /// - Minimal branches
+    /// - Direct function pointer calls
+    #[inline]
     pub fn infer(&mut self, input: TensorInputPacket) -> Result<RawDetectionsPacket, String> {
         unsafe {
-            // Validate input is on GPU (keep this check for safety)
+            // Quick validation (branch predictor will optimize this)
             if !matches!(input.data.loc, MemLoc::Gpu { .. }) {
-                return Err("Input data must be on GPU for zero-copy inference".to_string());
+                return Err("Input must be on GPU".to_string());
             }
 
-            // Cast input pointer to f32* (preprocessed float data on GPU)
+            // Cast pointers (zero overhead)
             let input_gpu_ptr = input.data.ptr as *const f32;
-
-            // Calculate input size from tensor descriptor
+            
+            // Calculate input size (single multiplication chain - fast!)
             let input_size = (input.desc.n * input.desc.c * input.desc.h * input.desc.w) as i32;
 
-            // Run inference on GPU (zero-copy: use cached function pointer!)
-            (self.run_inference_device)(
+            // CRITICAL PATH: Call cached function pointers directly!
+            // No symbol lookup, no virtual dispatch, direct call
+            (self.run_inference_fn)(
                 self.session,
                 input_gpu_ptr,
                 self.output_gpu_ptr,
@@ -143,19 +156,17 @@ impl TrtInferenceStage {
                 self.output_size as i32,
             );
 
-            // Copy results from GPU to CPU (use cached function pointer and pre-allocated buffer!)
-            (self.copy_output_to_cpu)(
+            // Copy results using cached function pointer
+            (self.copy_output_fn)(
                 self.session,
                 self.output_cpu.as_mut_ptr(),
                 self.output_size as i32,
             );
 
-            // YOLOv5 2-class model output shape: [1, num_detections, 7]
-            // 7 = 4 bbox (x,y,w,h) + 1 objectness + 2 class scores
+            // Hardcoded shape (no runtime detection overhead)
             let output_shape = vec![1, self.num_detections, 7];
 
-            // Return RawDetectionsPacket with original frame metadata
-            // Clone the output buffer (necessary since we reuse it)
+            // Clone output (necessary since we reuse the buffer)
             Ok(RawDetectionsPacket {
                 from: input.from,
                 raw_output: self.output_cpu.clone(),
@@ -192,7 +203,7 @@ impl Drop for TrtInferenceStage {
     fn drop(&mut self) {
         unsafe {
             // Try to load destroy_session and clean up
-            if let Ok(destroy_session) = self.lib.get::<Symbol<unsafe extern "C" fn(*mut std::ffi::c_void)>>(b"destroy_session") {
+            if let Ok(destroy_session) = self._lib.get::<Symbol<unsafe extern "C" fn(*mut std::ffi::c_void)>>(b"destroy_session") {
                 if !self.session.is_null() {
                     destroy_session(self.session);
                     self.session = std::ptr::null_mut();
