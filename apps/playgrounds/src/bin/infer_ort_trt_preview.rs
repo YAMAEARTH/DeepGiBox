@@ -2,7 +2,9 @@
 // Following inference_guideline.md specification
 
 use anyhow::Result;
-use common_io::{DType, FrameMeta, PixelFormat, ColorSpace, TensorDesc, TensorInputPacket, MemRef, MemLoc, Stage};
+use common_io::{
+    ColorSpace, DType, FrameMeta, MemLoc, MemRef, PixelFormat, Stage, TensorDesc, TensorInputPacket,
+};
 use cudarc::driver::DevicePtr;
 
 fn create_dummy_input_gpu(device: u32) -> Result<TensorInputPacket> {
@@ -57,7 +59,7 @@ fn main() -> Result<()> {
     println!("╚══════════════════════════════════════════════════════════╝\n");
 
     let cfg_path = "configs/inference_test.toml";
-    
+
     println!("📝 Loading config from: {}", cfg_path);
     let mut engine = inference::from_path(cfg_path)?;
 
@@ -67,24 +69,30 @@ fn main() -> Result<()> {
 
     println!("\n🎯 Running single inference pass...");
     let tin = create_dummy_input_gpu(0)?;
-    
+
     let result = telemetry::time_stage("inference_preview", &mut engine, tin);
-    
+
     println!("\n📊 Results:");
     println!("  Raw output size: {} values", result.raw_output.len());
     println!("  Output shape:    {:?}", result.output_shape);
-    
+
     if !result.raw_output.is_empty() {
-        let min = result.raw_output.iter().fold(f32::INFINITY, |a, &b| a.min(b));
-        let max = result.raw_output.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+        let min = result
+            .raw_output
+            .iter()
+            .fold(f32::INFINITY, |a, &b| a.min(b));
+        let max = result
+            .raw_output
+            .iter()
+            .fold(f32::NEG_INFINITY, |a, &b| a.max(b));
         let mean = result.raw_output.iter().sum::<f32>() / result.raw_output.len() as f32;
-        
+
         println!("  Min value:       {:.6}", min);
         println!("  Max value:       {:.6}", max);
         println!("  Mean value:      {:.6}", mean);
     }
 
     println!("\n✅ Preview complete!");
-    
+
     Ok(())
 }

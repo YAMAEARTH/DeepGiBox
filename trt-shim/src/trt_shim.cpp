@@ -289,6 +289,8 @@ struct InferenceSessionImpl {
     std::vector<void*> inputBuffers;
     std::vector<void*> outputBuffers;
     
+    int main_output_idx;  // Index of the main detection output (largest output)
+    
     ~InferenceSessionImpl() {
         // Cleanup GPU buffers
         for (auto buf : inputBuffers) cudaFree(buf);
@@ -398,19 +400,39 @@ InferenceSession create_session(const char* engine_path) {
     }
     
     // Allocate GPU buffers for all outputs
-    for (const auto& name : session->outputNames) {
+    int64_t largest_output_size = 0;
+    int largest_output_idx = 0;
+    
+    for (size_t i = 0; i < session->outputNames.size(); ++i) {
+        const auto& name = session->outputNames[i];
         auto dims = session->engine->getTensorShape(name);
         int64_t size = 1;
         for (int j = 0; j < dims.nbDims; j++) {
             size *= dims.d[j];
         }
+        
+        // Track the largest output (main detection output)
+        if (size > largest_output_size) {
+            largest_output_size = size;
+            largest_output_idx = i;
+        }
+        
         void* buffer;
         cudaMalloc(&buffer, size * sizeof(float));
         session->outputBuffers.push_back(buffer);
     }
     
+    // Store the main output index
+    session->main_output_idx = largest_output_idx;
+    
     std::cout << "✅ Session ready (inputs: " << session->inputNames.size() 
               << ", outputs: " << session->outputNames.size() << ")" << std::endl;
+    
+    if (!session->outputNames.empty()) {
+        std::cout << "✅ Main detection output: #" << largest_output_idx 
+                  << " '" << session->outputNames[largest_output_idx] 
+                  << "' (" << largest_output_size << " elements)" << std::endl;
+    }
     
     return static_cast<InferenceSession>(session);
 }
@@ -503,8 +525,8 @@ DeviceBuffers* get_device_buffers(InferenceSession session_ptr) {
     DeviceBuffers* buffers = new DeviceBuffers();
     buffers->d_input = session->inputBuffers.empty() ? nullptr : session->inputBuffers[0];
     
-    // Use LAST output buffer (final detection output, not intermediate outputs)
-    buffers->d_output = session->outputBuffers.empty() ? nullptr : session->outputBuffers.back();
+    // Use the main output buffer (identified during session creation)
+    buffers->d_output = session->outputBuffers.empty() ? nullptr : session->outputBuffers[session->main_output_idx];
     
     // Calculate sizes from tensor dimensions
     if (!session->inputNames.empty()) {
@@ -519,8 +541,7 @@ DeviceBuffers* get_device_buffers(InferenceSession session_ptr) {
     }
     
     if (!session->outputNames.empty()) {
-        // Use LAST output (final detection output)
-        auto dims = session->engine->getTensorShape(session->outputNames.back());
+        auto dims = session->engine->getTensorShape(session->outputNames[session->main_output_idx]);
         int64_t size = 1;
         for (int j = 0; j < dims.nbDims; j++) {
             size *= dims.d[j];
@@ -547,9 +568,8 @@ void copy_output_to_cpu(InferenceSession session_ptr, float* output_cpu, int out
         return;
     }
     
-    // Calculate actual size of LAST output tensor (final detection output)
-    // Use .back() to get the final concatenated output, not intermediate outputs
-    auto dims = session->engine->getTensorShape(session->outputNames.back());
+    // Calculate actual size of main detection output
+    auto dims = session->engine->getTensorShape(session->outputNames[session->main_output_idx]);
     int64_t actual_size = 1;
     for (int j = 0; j < dims.nbDims; j++) {
         actual_size *= dims.d[j];
@@ -558,9 +578,9 @@ void copy_output_to_cpu(InferenceSession session_ptr, float* output_cpu, int out
     // Use the smaller of the two to avoid buffer overflow
     int64_t copy_size = std::min((int64_t)output_size, actual_size);
     
-    // Copy from GPU output buffer to CPU (use .back() for final output)
-    cudaError_t err = cudaMemcpy(output_cpu, session->outputBuffers.back(), copy_size * sizeof(float), 
-               cudaMemcpyDeviceToHost);
+    // Copy from GPU output buffer to CPU (use main_output_idx)
+    cudaError_t err = cudaMemcpy(output_cpu, session->outputBuffers[session->main_output_idx], 
+                                  copy_size * sizeof(float), cudaMemcpyDeviceToHost);
     
     if (err != cudaSuccess) {
         std::cerr << "[ERROR] cudaMemcpy failed: " << cudaGetErrorString(err) << std::endl;
