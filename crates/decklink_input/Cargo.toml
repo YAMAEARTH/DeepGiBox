@@ -1,0 +1,15 @@
+[package]
+name = "decklink_input"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[dependencies]
+libc = "0.2"
+anyhow = "1"
+common_io = { path = "../common_io" }
+telemetry = { path = "../telemetry" }
+config = { path = "../config" }
+
+[build-dependencies]
+cc = "1"

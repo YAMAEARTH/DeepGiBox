@@ -1,0 +1,17 @@
+[package]
+name = "preprocess_cuda"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+common_io = { path = "../common_io" }
+telemetry = { path = "../telemetry" }
+config = { path = "../config" }
+cudarc = { version = "0.11", features = ["cuda-12040", "driver"] }
+half = { version = "2.4", features = ["bytemuck"] }
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+
+[build-dependencies]
+cc = "1.0"

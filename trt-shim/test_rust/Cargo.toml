@@ -1,0 +1,27 @@
+[package]
+name = "test_rust"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+# Empty workspace to prevent inheriting from parent
+
+[[bin]]
+name = "zero_copy"
+path = "src/zero_copy_example.rs"
+
+[[bin]]
+name = "test_rust"
+path = "src/main.rs"
+
+[[bin]]
+name = "tensor_packet"
+path = "src/tensor_packet_inference.rs"
+
+[[bin]]
+name = "tensor_packet_bench"
+path = "src/copy_tensor_packet_inference.rs"
+
+[dependencies]
+libloading = "0.8"
+image = "0.25"
