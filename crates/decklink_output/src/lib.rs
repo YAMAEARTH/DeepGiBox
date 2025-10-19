@@ -4,6 +4,9 @@ use config::AppConfig;
 use std::ptr::NonNull;
 use std::slice;
 
+pub mod keying;
+pub mod examples;
+
 pub fn from_path(cfg: &str) -> Result<OutputStage> {
     let config = AppConfig::from_file(cfg)?;
     Ok(OutputStage {

@@ -302,6 +302,7 @@ name = "decklink_output"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cc",
  "common_io",
  "config",
  "telemetry",
