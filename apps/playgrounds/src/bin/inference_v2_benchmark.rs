@@ -7,8 +7,8 @@ use cudarc::driver::{CudaDevice, CudaSlice, DevicePtr};
 use image::io::Reader as ImageReader;
 use inference_v2::TrtInferenceStage;
 
-const ENGINE_PATH: &str = "apps/playgrounds/optimized_YOLOv5.engine";
-const LIB_PATH: &str = "TRT_SHIM/libtrt_shim.so";
+const ENGINE_PATH: &str = "trt-shim/test_rust/assets/v7_optimized_YOLOv5.engine";
+const LIB_PATH: &str = "trt-shim/build/libtrt_shim.so";
 const IMAGE_PATH: &str = "apps/playgrounds/sample_img.jpg";
 const INPUT_WIDTH: u32 = 512;
 const INPUT_HEIGHT: u32 = 512;
