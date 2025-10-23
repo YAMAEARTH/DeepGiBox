@@ -69,7 +69,7 @@ fn main() {
             let dvp_lib_env = env::var("DVP_LIB_PATH").map(PathBuf::from).ok();
             let gpudirect_root = env::var("GPUDIRECT_ROOT")
                 .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from("/opt/NVIDIA_GPUDirect/gpudirect"));
+                .unwrap_or_else(|_| PathBuf::from("/opt/DVP/gpudirect"));
             let gpudirect_include_default =
                 gpudirect_root.join("sdk").join("linux").join("include");
             let gpudirect_lib_default = gpudirect_root.join("sdk").join("linux").join("lib64");
