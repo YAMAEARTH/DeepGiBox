@@ -4,12 +4,14 @@ Real-time internal keying system สำหรับ composite PNG overlay บน
 
 ## โครงสร้างระบบ
 
+## โครงสร้างระบบ
+
 ```
 DeckLink Capture (UYVY) → Background Layer (GPU)
                                   ↓
-PNG Image (RGBA) → BGRA → Chroma Key → Foreground Layer (GPU)
+PNG Image (RGBA) ────────→ Foreground Layer (GPU)
                                   ↓
-                          Composite (PNG over DeckLink)
+                          Alpha Composite (GPU)
                                   ↓
                           Output (BGRA on GPU)
 ```
@@ -21,14 +23,14 @@ PNG Image (RGBA) → BGRA → Chroma Key → Foreground Layer (GPU)
 - รองรับ GPU Direct (CUDA/DVP)
 - Format: UYVY (YUV 4:2:2)
 
-### 2. **decklink_output** - Keying & Composite
+### 2. **decklink_output** - Alpha Composite
 - โหลดภาพ PNG/JPEG เป็น BGRA
-- CUDA kernel สำหรับ chroma keying
+- Alpha composite บน GPU
 - Composite PNG over DeckLink video
 - Output: BGRA format
 
 ### 3. **internal_keying_demo** - Demo Application
-- ทดสอบ real-time keying
+- ทดสอบ real-time alpha composite
 - แสดง FPS และสถานะ
 
 ## การใช้งาน
@@ -137,9 +139,10 @@ error: identifier "_Float32" is undefined
 ## Performance Tips
 
 1. **ใช้ Release build** - `cargo build --release`
-2. **GPU memory อยู่บน device เดียวกัน** - ตรวจสอบว่า DeckLink และ CUDA ใช้ GPU เดียวกัน
-3. **CUDA streams** - ใช้ non-blocking streams (implemented แล้ว)
-4. **Frame buffering** - เพิ่ม ring buffer สำหรับ frames
+2. **ใช้ PNG ที่มี alpha channel** - ระบบออกแบบสำหรับ alpha composite
+3. **GPU memory อยู่บน device เดียวกัน** - ตรวจสอบว่า DeckLink และ CUDA ใช้ GPU เดียวกัน
+4. **CUDA streams** - ใช้ non-blocking streams (implemented แล้ว)
+5. **Frame buffering** - เพิ่ม ring buffer สำหรับ frames
 
 ## API Reference
 
@@ -149,11 +152,10 @@ error: identifier "_Float32" is undefined
 // Create session
 let session = OutputSession::new(width, height, &png_image)?;
 
-// Composite
+// Composite using PNG's alpha channel
 session.composite(
     decklink_uyvy_gpu_ptr,  // GPU pointer from DeckLink
     decklink_pitch,          // Row stride
-    ChromaKey::green_screen(),
 )?;
 
 // Get output (BGRA on GPU)

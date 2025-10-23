@@ -1,6 +1,6 @@
 use anyhow::Result;
 use decklink_input::{capture::CaptureSession, OutputDevice};
-use decklink_output::{BgraImage, ChromaKey, OutputSession};
+use decklink_output::{BgraImage, OutputSession};
 use std::thread;
 use std::time::Duration;
 
@@ -54,13 +54,9 @@ fn main() -> Result<()> {
     let mut output = OutputSession::new(width, height, &png_image)?;
     println!("   ✓ Output session ready: {}x{}", width, height);
     
-    // 5. Configure chroma key
-    let chroma_key = ChromaKey::green_screen();
-    println!("\n🎨 Chroma Key: RGB({}, {}, {}) threshold={}",
-        chroma_key.r, chroma_key.g, chroma_key.b, chroma_key.threshold);
-    
-    // 6. Process frames and output to SDI (GPU→SDI direct!)
+    // 5. Process frames and output to SDI (GPU→SDI direct!)
     println!("\n▶️  Processing frames → GPU→SDI Direct (Ctrl+C to stop)...");
+    println!("   Mode: ALPHA COMPOSITE (Fast - using PNG alpha channel)");
     println!("──────────────────────────────────────────────────────────");
     
     let mut frame_count = 0;
@@ -72,11 +68,10 @@ fn main() -> Result<()> {
             // Check if frame is on GPU
             match frame.data.loc {
                 common_io::MemLoc::Gpu { device } => {
-                    // Composite PNG over DeckLink on GPU
+                    // Composite using PNG's alpha channel
                     output.composite(
                         frame.data.ptr,
                         frame.data.stride,
-                        chroma_key,
                     )?;
                     
                     // Send directly from GPU to SDI (zero-copy!)
