@@ -18,6 +18,7 @@
 #include "DeckLinkAPIConfiguration.h"
 #include "DeckLinkAPIVideoFrame_v14_2_1.h"
 #include "DeckLinkAPIVideoInput_v14_2_1.h"
+#include "DeckLinkAPIVideoOutput_v14_2_1.h"
 #include "DeckLinkAPIScreenPreviewCallback_v14_2_1.h"
 #include "DeckLinkAPIMemoryAllocator_v14_2_1.h"
 
@@ -102,6 +103,12 @@ struct CaptureFrame {
 bool decklink_capture_open(int32_t device_index);
 bool decklink_capture_get_frame(CaptureFrame* out);
 void decklink_capture_close();
+
+// Output API (C ABI)
+bool decklink_output_open(int32_t device_index, int32_t width, int32_t height, double fps);
+bool decklink_output_send_frame(const uint8_t* bgra_data, int32_t width, int32_t height);
+bool decklink_output_send_frame_gpu(const uint8_t* gpu_bgra_data, int32_t gpu_pitch, int32_t width, int32_t height);
+void decklink_output_close();
 
 } // extern "C"
 
@@ -1365,4 +1372,251 @@ extern "C" uint64_t decklink_preview_gl_last_timestamp_ns() {
 
 extern "C" uint64_t decklink_preview_gl_last_latency_ns() {
     return g_gl_last_latency_ns.load(std::memory_order_relaxed);
+}
+
+// ---- Output implementation ----
+
+namespace {
+    static IDeckLinkIterator* g_output_iterator = nullptr;
+    static IDeckLink* g_output_device = nullptr;
+    static IDeckLinkOutput_v14_2_1* g_output = nullptr;
+    static BMDDisplayMode g_output_display_mode = bmdModeHD1080p6000;
+    static int32_t g_output_width = 0;
+    static int32_t g_output_height = 0;
+    static int32_t g_output_fps_num = 60;
+    static int32_t g_output_fps_den = 1;
+}
+
+extern "C" bool decklink_output_open(int32_t device_index, int32_t width, int32_t height, double fps) {
+    if (g_output) {
+        fprintf(stderr, "[shim][output] Already opened\n");
+        return true;
+    }
+
+    g_output_iterator = CreateDeckLinkIteratorInstance();
+    if (!g_output_iterator) {
+        fprintf(stderr, "[shim][output] Failed to create DeckLink iterator\n");
+        return false;
+    }
+
+    IDeckLink* dev = nullptr;
+    int32_t idx = 0;
+    while (g_output_iterator->Next(&dev) == S_OK && dev) {
+        if (idx == device_index) {
+            g_output_device = dev;
+            break;
+        }
+        dev->Release();
+        idx++;
+    }
+
+    if (!g_output_device) {
+        fprintf(stderr, "[shim][output] Device index %d not found\n", device_index);
+        g_output_iterator->Release();
+        g_output_iterator = nullptr;
+        return false;
+    }
+
+    HRESULT qri = g_output_device->QueryInterface(IID_IDeckLinkOutput_v14_2_1, (void**)&g_output);
+    if (qri != S_OK || !g_output) {
+        fprintf(stderr, "[shim][output] QueryInterface(IDeckLinkOutput_v14_2_1) failed hr=0x%08x\n", (unsigned)qri);
+        g_output_device->Release();
+        g_output_device = nullptr;
+        g_output_iterator->Release();
+        g_output_iterator = nullptr;
+        return false;
+    }
+
+    // Find matching display mode
+    IDeckLinkDisplayModeIterator* mode_it = nullptr;
+    if (g_output->GetDisplayModeIterator(&mode_it) != S_OK || !mode_it) {
+        fprintf(stderr, "[shim][output] Failed to get display mode iterator\n");
+        g_output->Release();
+        g_output = nullptr;
+        g_output_device->Release();
+        g_output_device = nullptr;
+        g_output_iterator->Release();
+        g_output_iterator = nullptr;
+        return false;
+    }
+
+    BMDDisplayMode chosen_mode = bmdModeUnknown;
+    IDeckLinkDisplayMode* mode = nullptr;
+    while (mode_it->Next(&mode) == S_OK && mode) {
+        long mode_width = mode->GetWidth();
+        long mode_height = mode->GetHeight();
+        BMDTimeValue frame_duration;
+        BMDTimeScale time_scale;
+        mode->GetFrameRate(&frame_duration, &time_scale);
+        double mode_fps = (double)time_scale / (double)frame_duration;
+
+        // Match resolution and framerate (with tolerance)
+        if (mode_width == width && mode_height == height && std::abs(mode_fps - fps) < 1.0) {
+            chosen_mode = mode->GetDisplayMode();
+            g_output_fps_num = (int32_t)time_scale;
+            g_output_fps_den = (int32_t)frame_duration;
+            mode->Release();
+            break;
+        }
+        mode->Release();
+    }
+    mode_it->Release();
+
+    if (chosen_mode == bmdModeUnknown) {
+        // Fallback: try 1080p60 for 1920x1080@60fps
+        if (width == 1920 && height == 1080 && std::abs(fps - 60.0) < 1.0) {
+            chosen_mode = bmdModeHD1080p6000;
+            g_output_fps_num = 60000;
+            g_output_fps_den = 1000;
+        } else {
+            fprintf(stderr, "[shim][output] No matching display mode found for %dx%d@%.2ffps\n", width, height, fps);
+            g_output->Release();
+            g_output = nullptr;
+            g_output_device->Release();
+            g_output_device = nullptr;
+            g_output_iterator->Release();
+            g_output_iterator = nullptr;
+            return false;
+        }
+    }
+
+    g_output_display_mode = chosen_mode;
+    g_output_width = width;
+    g_output_height = height;
+
+    HRESULT enable_hr = g_output->EnableVideoOutput(chosen_mode, bmdVideoOutputFlagDefault);
+    if (enable_hr != S_OK) {
+        fprintf(stderr, "[shim][output] EnableVideoOutput failed hr=0x%08x\n", (unsigned)enable_hr);
+        g_output->Release();
+        g_output = nullptr;
+        g_output_device->Release();
+        g_output_device = nullptr;
+        g_output_iterator->Release();
+        g_output_iterator = nullptr;
+        return false;
+    }
+
+    fprintf(stderr, "[shim][output] Opened device %d: %dx%d@%.2ffps (mode=%u)\n",
+            device_index, width, height, fps, (unsigned)chosen_mode);
+    return true;
+}
+
+extern "C" bool decklink_output_send_frame(const uint8_t* bgra_data, int32_t width, int32_t height) {
+    if (!g_output || !bgra_data) {
+        return false;
+    }
+
+    if (width != g_output_width || height != g_output_height) {
+        fprintf(stderr, "[shim][output] Frame dimension mismatch: expected %dx%d, got %dx%d\n",
+                g_output_width, g_output_height, width, height);
+        return false;
+    }
+
+    // Create video frame (BGRA format: bmdFormat8BitBGRA)
+    IDeckLinkMutableVideoFrame_v14_2_1* frame = nullptr;
+    int32_t row_bytes = width * 4; // BGRA = 4 bytes per pixel
+    HRESULT create_hr = g_output->CreateVideoFrame(width, height, row_bytes, bmdFormat8BitBGRA, bmdFrameFlagDefault, &frame);
+    if (create_hr != S_OK || !frame) {
+        fprintf(stderr, "[shim][output] CreateVideoFrame failed hr=0x%08x\n", (unsigned)create_hr);
+        return false;
+    }
+
+    // Copy BGRA data to frame
+    void* frame_bytes = nullptr;
+    HRESULT getbytes_hr = frame->GetBytes(&frame_bytes);
+    if (getbytes_hr != S_OK || !frame_bytes) {
+        fprintf(stderr, "[shim][output] GetBytes failed hr=0x%08x\n", (unsigned)getbytes_hr);
+        frame->Release();
+        return false;
+    }
+
+    std::memcpy(frame_bytes, bgra_data, (size_t)(row_bytes * height));
+
+    // Display frame synchronously
+    HRESULT display_hr = g_output->DisplayVideoFrameSync(frame);
+    frame->Release();
+
+    if (display_hr != S_OK) {
+        fprintf(stderr, "[shim][output] DisplayVideoFrameSync failed hr=0x%08x\n", (unsigned)display_hr);
+        return false;
+    }
+
+    return true;
+}
+
+extern "C" bool decklink_output_send_frame_gpu(const uint8_t* gpu_bgra_data, int32_t gpu_pitch, int32_t width, int32_t height) {
+    if (!g_output || !gpu_bgra_data) {
+        return false;
+    }
+
+    if (width != g_output_width || height != g_output_height) {
+        fprintf(stderr, "[shim][output] Frame dimension mismatch: expected %dx%d, got %dx%d\n",
+                g_output_width, g_output_height, width, height);
+        return false;
+    }
+
+    // Create video frame (BGRA format: bmdFormat8BitBGRA)
+    IDeckLinkMutableVideoFrame_v14_2_1* frame = nullptr;
+    int32_t row_bytes = width * 4; // BGRA = 4 bytes per pixel
+    HRESULT create_hr = g_output->CreateVideoFrame(width, height, row_bytes, bmdFormat8BitBGRA, bmdFrameFlagDefault, &frame);
+    if (create_hr != S_OK || !frame) {
+        fprintf(stderr, "[shim][output] CreateVideoFrame failed hr=0x%08x\n", (unsigned)create_hr);
+        return false;
+    }
+
+    // Get frame buffer pointer (CPU-side)
+    void* frame_bytes = nullptr;
+    HRESULT getbytes_hr = frame->GetBytes(&frame_bytes);
+    if (getbytes_hr != S_OK || !frame_bytes) {
+        fprintf(stderr, "[shim][output] GetBytes failed hr=0x%08x\n", (unsigned)getbytes_hr);
+        frame->Release();
+        return false;
+    }
+
+    // Copy directly from GPU to DeckLink frame buffer (GPU → CPU)
+    cudaError_t copy_err = cudaMemcpy2D(
+        frame_bytes,           // dst (CPU/DeckLink buffer)
+        row_bytes,             // dst pitch
+        gpu_bgra_data,         // src (GPU)
+        gpu_pitch,             // src pitch
+        row_bytes,             // width in bytes
+        height,                // height
+        cudaMemcpyDeviceToHost
+    );
+
+    if (copy_err != cudaSuccess) {
+        fprintf(stderr, "[shim][output] cudaMemcpy2D failed: %s\n", cudaGetErrorString(copy_err));
+        frame->Release();
+        return false;
+    }
+
+    // Display frame synchronously
+    HRESULT display_hr = g_output->DisplayVideoFrameSync(frame);
+    frame->Release();
+
+    if (display_hr != S_OK) {
+        fprintf(stderr, "[shim][output] DisplayVideoFrameSync failed hr=0x%08x\n", (unsigned)display_hr);
+        return false;
+    }
+
+    return true;
+}
+
+extern "C" void decklink_output_close() {
+    if (g_output) {
+        g_output->DisableVideoOutput();
+        g_output->Release();
+        g_output = nullptr;
+    }
+    if (g_output_device) {
+        g_output_device->Release();
+        g_output_device = nullptr;
+    }
+    if (g_output_iterator) {
+        g_output_iterator->Release();
+        g_output_iterator = nullptr;
+    }
+    g_output_width = 0;
+    g_output_height = 0;
+    g_output_display_mode = bmdModeUnknown;
 }

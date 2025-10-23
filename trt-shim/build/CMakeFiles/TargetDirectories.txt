@@ -1,3 +1,0 @@
-/home/earth/Documents/pun/DeepGiBox/trt-shim/build/CMakeFiles/trt_shim.dir
-/home/earth/Documents/pun/DeepGiBox/trt-shim/build/CMakeFiles/edit_cache.dir
-/home/earth/Documents/pun/DeepGiBox/trt-shim/build/CMakeFiles/rebuild_cache.dir

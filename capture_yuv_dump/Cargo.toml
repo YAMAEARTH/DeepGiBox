@@ -1,0 +1,11 @@
+[package]
+name = "capture_yuv_dump"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "capture_yuv_dump"
+path = "src/main.rs"
+
+[dependencies]
+decklink_input = { path = "../decklink_input" }

@@ -1,1 +1,0 @@
-/usr/bin/c++ -fPIC -shared -Wl,-soname,libtrt_shim.so -o libtrt_shim.so CMakeFiles/trt_shim.dir/src/trt_shim.cpp.o   -L/usr/local/TensorRT-8.6.1.6/targets/x86_64-linux-gnu/lib  -Wl,-rpath,/usr/local/TensorRT-8.6.1.6/targets/x86_64-linux-gnu/lib -lnvinfer -lnvonnxparser -lcudart 

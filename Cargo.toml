@@ -1,18 +1,15 @@
 [workspace]
 members = [
-  "apps/runner",
-  "apps/playgrounds",
-  "crates/common_io",
-  "crates/decklink_input",
-  "crates/preprocess_cuda",
-  "crates/inference",
-  "crates/inference_v2",
-  "crates/postprocess",
-  "crates/overlay_plan",
-  "crates/overlay_render",
-  "crates/decklink_output",
-  "crates/telemetry",
-  "crates/config",
-  "testsupport",
+    "decklink_input",
+    "decklink_output",
+    "common_io",
+    "telemetry",
+    "config",
+    "capture_yuv_dump",
+    "internal_keying_demo",
 ]
 resolver = "2"
+
+[profile.release]
+opt-level = 3
+lto = true

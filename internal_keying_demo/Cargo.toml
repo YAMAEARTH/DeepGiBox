@@ -1,0 +1,14 @@
+[package]
+name = "internal_keying_demo"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "internal_keying_demo"
+path = "src/main.rs"
+
+[dependencies]
+decklink_input = { path = "../decklink_input" }
+decklink_output = { path = "../decklink_output" }
+common_io = { path = "../common_io" }
+anyhow = "1"
