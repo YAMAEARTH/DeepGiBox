@@ -26,15 +26,24 @@ fn main() -> Result<()> {
                 let (cpu_packet, backing) = ensure_cpu_packet(packet)
                     .with_context(|| format!("prepare frame #{frame_idx} for output"))?;
 
-                output.submit(OutputRequest {
+                // Submit frame, skip if size doesn't match (e.g. during resolution change)
+                match output.submit(OutputRequest {
                     video: Some(&cpu_packet),
                     overlay: None,
-                })?;
-
-                submitted += 1;
-                if submitted == 1 || submitted % 30 == 0 {
-                    if let Some(out) = output.last_frame() {
-                        print_output_summary(out, submitted, frame_idx, pts);
+                }) {
+                    Ok(_) => {
+                        submitted += 1;
+                        if submitted == 1 || submitted % 30 == 0 {
+                            if let Some(out) = output.last_frame() {
+                                print_output_summary(out, submitted, frame_idx, pts);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        // Skip frames with wrong size (happens during format change)
+                        if submitted == 0 {
+                            println!("⏳ Waiting for correct frame size... ({})", e);
+                        }
                     }
                 }
 

@@ -1,0 +1,9 @@
+# Cargo configuration for DeepGiBox workspace
+# This file sets environment variables for all cargo commands
+
+[env]
+# GPUDirect DVP paths (required for DeckLink GPU capture)
+DVP_INCLUDE_PATH = { value = "DVP/include", relative = true }
+DVP_LIB_PATH = { value = "DVP/x86_64", relative = true }
+
+# SKIP_CUDA_BUILD removed - now using GCC 12.x which is compatible with CUDA 12.0
