@@ -473,13 +473,13 @@ fn main() -> Result<()> {
 
     // Latency breakdown accumulators
     let mut total_capture_ms = 0.0;
-    let mut total_h2d_ms = 0.0; // Host to Device transfer
     let mut total_preprocess_ms = 0.0;
     let mut total_inference_ms = 0.0;
     let mut total_postprocess_ms = 0.0;
     let mut total_plan_ms = 0.0;
     let mut total_render_ms = 0.0;
-    let mut total_keying_ms = 0.0; // Internal keying (GPU composite + output)
+    let mut total_keying_ms = 0.0; // Internal keying (GPU composite + DeckLink output)
+    let mut total_hardware_latency_ms = 0.0; // Hardware timestamp: capture -> output
 
     // GPU buffer pool to avoid repeated allocations
     let mut gpu_buffers: Vec<CudaSlice<u8>> = Vec::new();
@@ -527,7 +527,6 @@ fn main() -> Result<()> {
         println!("      → Location: {:?}", raw_frame.data.loc);
 
         // Copy CPU data to GPU if needed
-        let h2d_start = Instant::now();
         let raw_frame_gpu = if matches!(raw_frame.data.loc, MemLoc::Cpu) {
             // Allocate GPU buffer and copy data
             let cpu_data =
@@ -552,18 +551,10 @@ fn main() -> Result<()> {
         } else {
             raw_frame.clone()
         };
-        let h2d_time = h2d_start.elapsed();
-        total_h2d_ms += h2d_time.as_secs_f64() * 1000.0;
-        println!("  ✓ Time: {:.2}ms", h2d_time.as_secs_f64() * 1000.0);
-        println!(
-            "  ✓ Transferred {} bytes to GPU device 0",
-            raw_frame_gpu.data.len
-        );
-        println!("  ✓ New location: {:?}", raw_frame_gpu.data.loc);
 
         // Step 3: Preprocessing
         println!();
-        println!("⚙️  Step 3: CUDA Preprocessing");
+        println!("⚙️  Step 2: CUDA Preprocessing");
         let preprocess_start = Instant::now();
         // Clone raw_frame_gpu because we need it later for internal keying
         let tensor_packet = match preprocessor.process_checked(raw_frame_gpu.clone()) {
@@ -590,7 +581,7 @@ fn main() -> Result<()> {
 
         // Step 4: Inference V2
         println!();
-        println!("🧠 Step 4: TensorRT Inference V2");
+        println!("🧠 Step 3: TensorRT Inference V2");
         let inference_start = Instant::now();
         let raw_detections = inference_stage.process(tensor_packet);
         let inference_time = inference_start.elapsed();
@@ -639,7 +630,7 @@ fn main() -> Result<()> {
 
         // Step 5: Postprocessing (NMS + Tracking) - ENABLED
         println!();
-        println!("🎯 Step 5: Postprocessing (NMS + Tracking)");
+        println!("🎯 Step 4: Postprocessing (NMS + Tracking)");
         let postprocess_start = Instant::now();
         let detections = post_stage.process(raw_detections);
         let postprocess_time = postprocess_start.elapsed();
@@ -689,7 +680,7 @@ fn main() -> Result<()> {
 
         // Step 6: Overlay Planning
         println!();
-        println!("🎨 Step 6: Overlay Planning");
+        println!("🎨 Step 5: Overlay Planning");
         let plan_start = Instant::now();
         let overlay_plan = plan_stage.process(detections);
         let plan_time = plan_start.elapsed();
@@ -719,7 +710,7 @@ fn main() -> Result<()> {
 
         // Step 7: Overlay Rendering
         println!();
-        println!("🖼️  Step 7: Overlay Rendering");
+        println!("🖼️  Step 6: Overlay Rendering");
         let render_start = Instant::now();
         let overlay_frame = render_stage.process(overlay_plan);
         let render_time = render_start.elapsed();
@@ -736,9 +727,9 @@ fn main() -> Result<()> {
         println!("      → Frame index: {}", overlay_frame.from.frame_idx);
         println!("      → Status: Ready for DeckLink output (internal keying)");
 
-        // Step 7.5: Internal Keying (GPU Composite + DeckLink Output)
+        // Step 7.5: Internal Keying (GPU Composite)
         println!();
-        println!("🎬 Step 7.5: Internal Keying (GPU Composite → SDI Output)");
+        println!("🎬 Step 7: Internal Keying (GPU Composite + DeckLink Output)");
         let keying_start = Instant::now();
         
         // Convert overlay ARGB to BGRA for compositor
@@ -779,7 +770,7 @@ fn main() -> Result<()> {
             },
         };
         
-        // Submit composited BGRA frame to DeckLink output
+        // Submit to DeckLink output
         let output_request = OutputRequest {
             video: Some(&composited_packet),
             overlay: None,
@@ -790,31 +781,93 @@ fn main() -> Result<()> {
         let keying_time = keying_start.elapsed();
         total_keying_ms += keying_time.as_secs_f64() * 1000.0;
         println!("  ✓ Time: {:.2}ms", keying_time.as_secs_f64() * 1000.0);
-        println!("  ✓ Pipeline: Background (GPU) → CUDA Composite → BGRA (GPU) → DeckLink SDI");
+        println!("  ✓ Pipeline: Overlay ARGB → BGRA → GPU Composite → DeckLink SDI");
         println!("  ✓ Overlay dimensions: {}×{}", bgra_overlay.width, bgra_overlay.height);
         println!("  ✓ Output format: BGRA8 on GPU");
         println!("  ✓ Frame submitted to DeckLink output");
+
+        // Calculate hardware-to-hardware latency (using timestamps)
+        let output_complete_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        let hardware_latency_ns = output_complete_ns - raw_frame_gpu.meta.t_capture_ns;
+        let hardware_latency_ms = hardware_latency_ns as f64 / 1_000_000.0;
+        total_hardware_latency_ms += hardware_latency_ms;
 
         let pipeline_time = pipeline_start.elapsed();
         let pipeline_ms = pipeline_time.as_secs_f64() * 1000.0;
         total_latency_ms += pipeline_ms;
 
+        // Print detailed latency breakdown
         println!();
-        println!(
-            "  ⏱️  End-to-End: {:.2}ms ({:.1} FPS)",
-            pipeline_ms,
-            1000.0 / pipeline_ms
-        );
+        println!("════════════════════════════════════════════════════════════");
+        println!("⏱️  LATENCY BREAKDOWN - Frame #{}", frame_count);
+        println!("════════════════════════════════════════════════════════════");
+        println!("  1. 📹 Capture:           {:6.2}ms ({:4.1}%)", 
+            capture_time.as_secs_f64() * 1000.0,
+            (capture_time.as_secs_f64() * 1000.0 / pipeline_ms) * 100.0);
+        println!("  2. ⚙️  Preprocessing:     {:6.2}ms ({:4.1}%)", 
+            preprocess_time.as_secs_f64() * 1000.0,
+            (preprocess_time.as_secs_f64() * 1000.0 / pipeline_ms) * 100.0);
+        println!("  3. 🧠 Inference:         {:6.2}ms ({:4.1}%)", 
+            inference_time.as_secs_f64() * 1000.0,
+            (inference_time.as_secs_f64() * 1000.0 / pipeline_ms) * 100.0);
+        println!("  4. 🎯 Postprocessing:    {:6.2}ms ({:4.1}%)", 
+            postprocess_time.as_secs_f64() * 1000.0,
+            (postprocess_time.as_secs_f64() * 1000.0 / pipeline_ms) * 100.0);
+        println!("  5. 🎨 Overlay Planning:  {:6.2}ms ({:4.1}%)", 
+            plan_time.as_secs_f64() * 1000.0,
+            (plan_time.as_secs_f64() * 1000.0 / pipeline_ms) * 100.0);
+        println!("  6. 🖼️  Overlay Rendering: {:6.2}ms ({:4.1}%)", 
+            render_time.as_secs_f64() * 1000.0,
+            (render_time.as_secs_f64() * 1000.0 / pipeline_ms) * 100.0);
+        println!("  7. 🎬 Keying + Output:   {:6.2}ms ({:4.1}%)", 
+            keying_time.as_secs_f64() * 1000.0,
+            (keying_time.as_secs_f64() * 1000.0 / pipeline_ms) * 100.0);
+        println!("────────────────────────────────────────────────────────────");
+        println!("  🔴 END-TO-END (N2N):    {:6.2}ms ({:.1} FPS)", 
+            pipeline_ms, 1000.0 / pipeline_ms);
+        println!("  🔴 HARDWARE LATENCY:    {:6.2}ms (capture timestamp → output)", 
+            hardware_latency_ms);
+        println!("════════════════════════════════════════════════════════════");
         println!();
 
         frame_count += 1;
 
-        // Print stats every 60 frames
+        // Print cumulative stats every 60 frames
         if frame_count % 60 == 0 {
             let elapsed = pipeline_start_time.elapsed().as_secs_f64();
             let avg_fps = frame_count as f64 / elapsed;
-            println!("📊 Stats after {} frames | Avg FPS: {:.2} | Elapsed: {:.1}s", 
-                frame_count, avg_fps, elapsed);
+            
+            println!();
+            println!("╔══════════════════════════════════════════════════════════╗");
+            println!("║  📊 CUMULATIVE STATISTICS - {} FRAMES                    ", frame_count);
+            println!("╚══════════════════════════════════════════════════════════╝");
+            println!();
+            println!("  ⏱️  Average Latency per Stage:");
+            println!("  ─────────────────────────────────────────────────────────");
+            println!("  1. 📹 Capture:           {:6.2}ms avg", total_capture_ms / frame_count as f64);
+            println!("  2. ⚙️  Preprocessing:     {:6.2}ms avg", total_preprocess_ms / frame_count as f64);
+            println!("  3. 🧠 Inference:         {:6.2}ms avg", total_inference_ms / frame_count as f64);
+            println!("  4. 🎯 Postprocessing:    {:6.2}ms avg", total_postprocess_ms / frame_count as f64);
+            println!("  5. 🎨 Overlay Planning:  {:6.2}ms avg", total_plan_ms / frame_count as f64);
+            println!("  6. 🖼️  Overlay Rendering: {:6.2}ms avg", total_render_ms / frame_count as f64);
+            println!("  7. 🎬 Keying + Output:   {:6.2}ms avg", total_keying_ms / frame_count as f64);
+            println!("  ─────────────────────────────────────────────────────────");
+            println!("  🔴 END-TO-END (N2N):    {:6.2}ms avg ({:.2} FPS avg)", 
+                total_latency_ms / frame_count as f64,
+                1000.0 / (total_latency_ms / frame_count as f64));
+            println!("  🔴 HARDWARE LATENCY:    {:6.2}ms avg (capture → output)", 
+                total_hardware_latency_ms / frame_count as f64);
+            println!();
+            println!("  📈 Performance Metrics:");
+            println!("  ─────────────────────────────────────────────────────────");
+            println!("  Total frames processed:  {}", frame_count);
+            println!("  Total elapsed time:      {:.2}s", elapsed);
+            println!("  Real-time FPS:           {:.2} FPS", avg_fps);
+            println!("  ─────────────────────────────────────────────────────────");
+            println!();
         }
     }
 
