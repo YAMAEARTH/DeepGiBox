@@ -15,6 +15,7 @@ fn create_mock_detection_packet() -> RawDetectionsPacket {
         pts_ns: 1000000,
         t_capture_ns: 1000000,
         stride_bytes: 1920 * 3,
+            crop_region: None,
     };
 
     // Mock YOLO output for 512x512 input

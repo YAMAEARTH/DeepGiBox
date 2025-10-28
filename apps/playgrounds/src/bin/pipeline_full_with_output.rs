@@ -346,6 +346,7 @@ fn main() -> Result<()> {
                 pixfmt: common_io::PixelFormat::BGRA8,
                 colorspace: raw_frame.meta.colorspace,
                 stride_bytes: overlay_stride as u32,
+            crop_region: None,
                 frame_idx: raw_frame.meta.frame_idx,
                 pts_ns: raw_frame.meta.pts_ns,
                 t_capture_ns: raw_frame.meta.t_capture_ns,

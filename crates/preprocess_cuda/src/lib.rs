@@ -14,6 +14,36 @@ pub enum ChromaOrder {
     YUY2 = 1,
 }
 
+/// Camera-specific crop regions
+/// Crop region format: [y_start:y_end, x_start:x_end] -> (x, y, width, height)
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+pub enum CropRegion {
+    /// FUJI: [0:1080, 0:1376] -> crop left portion (1376×1080)
+    #[serde(rename = "fuji")]
+    Fuji,
+    /// OLYMPUS: [0:1080, 548:1920] -> crop center portion (1372×1080)
+    #[serde(rename = "olympus")]
+    Olympus,
+    /// PENTAX: [0:1080, 0:1376] -> crop left portion (1376×1080)
+    #[serde(rename = "pentax")]
+    Pentax,
+    /// No cropping (use full frame)
+    #[serde(rename = "none")]
+    None,
+}
+
+impl CropRegion {
+    /// Get crop coordinates (x, y, width, height) for 1920×1080 input
+    pub fn get_coords(&self) -> (u32, u32, u32, u32) {
+        match self {
+            CropRegion::Fuji => (0, 0, 1376, 1080),
+            CropRegion::Olympus => (548, 0, 1372, 1080),
+            CropRegion::Pentax => (0, 0, 1376, 1080),
+            CropRegion::None => (0, 0, 1920, 1080), // Full frame
+        }
+    }
+}
+
 /// Configuration for preprocessing
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct PreprocessConfig {
@@ -29,6 +59,8 @@ pub struct PreprocessConfig {
     pub std: [f32; 3],
     #[serde(default = "default_chroma")]
     pub chroma: String,
+    #[serde(default = "default_crop")]
+    pub crop_region: CropRegion,
 }
 
 fn default_size() -> [u32; 2] {
@@ -49,6 +81,9 @@ fn default_std() -> [f32; 3] {
 fn default_chroma() -> String {
     "UYVY".to_string()
 }
+fn default_crop() -> CropRegion {
+    CropRegion::None
+}
 
 /// Main preprocessing stage with GPU acceleration
 pub struct Preprocessor {
@@ -58,6 +93,7 @@ pub struct Preprocessor {
     pub mean: [f32; 3], // RGB mean
     pub std: [f32; 3],  // RGB std
     pub chroma: ChromaOrder,
+    pub crop_region: CropRegion, // Camera-specific crop region
 
     // Frame validation (for production video streams)
     pub expected_input_size: Option<(u32, u32)>, // None = accept any size
@@ -94,6 +130,19 @@ impl Preprocessor {
         std: [f32; 3],
         chroma: ChromaOrder,
     ) -> Result<Self> {
+        Self::with_crop_region(size, fp16, device, mean, std, chroma, CropRegion::None)
+    }
+
+    /// Create with crop region
+    pub fn with_crop_region(
+        size: (u32, u32),
+        fp16: bool,
+        device: u32,
+        mean: [f32; 3],
+        std: [f32; 3],
+        chroma: ChromaOrder,
+        crop_region: CropRegion,
+    ) -> Result<Self> {
         // Initialize CUDA device
         let cuda_device = CudaDevice::new(device as usize)
             .map_err(|e| anyhow!("Failed to initialize CUDA device {}: {:?}", device, e))?;
@@ -127,6 +176,7 @@ impl Preprocessor {
             mean,
             std,
             chroma,
+            crop_region,
             expected_input_size: Some((1920, 1080)), // Default for production video
             skip_invalid_frames: true,               // Skip frames with unexpected size by default
             cuda_device,
@@ -202,6 +252,13 @@ impl Preprocessor {
 
         let chroma_order = self.chroma as i32;
 
+        // Get crop region coordinates
+        let (crop_x, crop_y, crop_w, crop_h) = self.crop_region.get_coords();
+        let crop_x_i32 = crop_x as i32;
+        let crop_y_i32 = crop_y as i32;
+        let crop_w_i32 = crop_w as i32;
+        let crop_h_i32 = crop_h as i32;
+
         // For NV12, we need to calculate UV plane offset
         let (uv_plane_ptr, uv_stride) = if pixfmt == 1 {
             let y_plane_size = (in_h * in_stride) as usize;
@@ -246,6 +303,10 @@ impl Preprocessor {
             &fp16_val as *const _ as *mut std::ffi::c_void,
             &uv_ptr as *const _ as *mut std::ffi::c_void,
             &uv_stride as *const _ as *mut std::ffi::c_void,
+            &crop_x_i32 as *const _ as *mut std::ffi::c_void,
+            &crop_y_i32 as *const _ as *mut std::ffi::c_void,
+            &crop_w_i32 as *const _ as *mut std::ffi::c_void,
+            &crop_h_i32 as *const _ as *mut std::ffi::c_void,
         ];
 
         // Launch kernel using Vec of params
@@ -349,8 +410,19 @@ impl Preprocessor {
             },
         };
 
+        // Add crop region to metadata for downstream coordinate transformation
+        let crop_info = if matches!(self.crop_region, CropRegion::None) {
+            None
+        } else {
+            let (cx, cy, cw, ch) = self.crop_region.get_coords();
+            Some((cx, cy, cw, ch))
+        };
+        
+        let mut output_meta = input.meta;
+        output_meta.crop_region = crop_info;
+
         TensorInputPacket {
-            from: input.meta,
+            from: output_meta,
             desc,
             data,
         }

@@ -72,6 +72,7 @@ fn main() -> Result<()> {
         pts_ns: 0,
         t_capture_ns: 0,
         stride_bytes: INPUT_WIDTH * 4,
+            crop_region: None,
     };
 
     let tensor_desc = TensorDesc {

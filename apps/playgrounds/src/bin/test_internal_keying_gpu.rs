@@ -100,6 +100,7 @@ fn main() -> Result<()> {
                             pts_ns: frame.meta.pts_ns,
                             t_capture_ns: frame.meta.t_capture_ns,
                             stride_bytes: output_pitch as u32,
+            crop_region: None,
                         },
                         data: MemRef {
                             ptr: output_bgra_ptr as *mut u8,

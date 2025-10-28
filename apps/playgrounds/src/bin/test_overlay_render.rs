@@ -50,6 +50,7 @@ fn sample_packet() -> DetectionsPacket {
         pts_ns: 0,
         t_capture_ns: 0,
         stride_bytes: 1920 * 4,
+            crop_region: None,
     };
 
     let detections = vec![

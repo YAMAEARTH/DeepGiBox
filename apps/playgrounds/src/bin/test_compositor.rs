@@ -140,6 +140,7 @@ fn create_fake_uyvy_frame(width: u32, height: u32) -> Result<RawFramePacket> {
             pts_ns: 0,
             t_capture_ns: 0,
             stride_bytes: stride as u32,
+            crop_region: None,
         },
         data: MemRef {
             ptr: dev_ptr as *mut u8,

@@ -47,6 +47,7 @@ pub struct FrameMeta {
     pub pts_ns: u64,
     pub t_capture_ns: u64,
     pub stride_bytes: u32,
+    pub crop_region: Option<(u32, u32, u32, u32)>,
 }
 
 #[derive(Clone, Debug)]

@@ -10,6 +10,7 @@ use anyhow::{anyhow, Result};
 use common_io::{MemLoc, MemRef, Stage};
 use cudarc::driver::{CudaDevice, CudaSlice, DevicePtr};
 use decklink_input::capture::CaptureSession;
+use decklink_output::{BgraImage, OutputSession, OutputRequest};
 use inference_v2::TrtInferenceStage;
 use overlay_plan::PlanStage;
 use overlay_render::RenderStage;
@@ -20,6 +21,41 @@ use image::{RgbaImage, Rgba, RgbImage};
 use std::fs::File;
 use std::io::Write;
 
+
+/// Convert OverlayFramePacket (ARGB) to BgraImage for internal keying
+fn overlay_to_bgra(overlay: &common_io::OverlayFramePacket) -> Result<BgraImage> {
+    let width = overlay.from.width;  // Keep as u32
+    let height = overlay.from.height;  // Keep as u32
+    
+    // Get ARGB data from CPU
+    let argb_data = if matches!(overlay.argb.loc, MemLoc::Cpu) {
+        unsafe { std::slice::from_raw_parts(overlay.argb.ptr, overlay.argb.len) }
+    } else {
+        return Err(anyhow!("Overlay data must be on CPU for conversion"));
+    };
+    
+    // Convert ARGB → BGRA
+    let mut bgra_data = Vec::with_capacity(argb_data.len());
+    for chunk in argb_data.chunks_exact(4) {
+        let a = chunk[0];  // Alpha
+        let r = chunk[1];  // Red
+        let g = chunk[2];  // Green
+        let b = chunk[3];  // Blue
+        
+        // BGRA order
+        bgra_data.push(b);
+        bgra_data.push(g);
+        bgra_data.push(r);
+        bgra_data.push(a);
+    }
+    
+    Ok(BgraImage {
+        width,
+        height,
+        data: bgra_data,
+        pitch: (width as usize) * 4,
+    })
+}
 
 /// Save OverlayFramePacket as PNG image file with bounding boxes
 fn save_overlay_as_image(
@@ -390,13 +426,49 @@ fn main() -> Result<()> {
     println!("  ✓ Overlay rendering ready");
     println!();
 
+    // 5.5 Initialize Internal Keying (GPU Compositor + DeckLink Output)
+    println!("🔧 Step 5.5: Initialize Internal Keying");
+    
+    // Wait for first frame to get dimensions
+    println!("  ⏳ Waiting for first frame to determine dimensions...");
+    let (width, height) = loop {
+        if let Some(frame) = capture.get_frame()? {
+            let w = frame.meta.width;
+            let h = frame.meta.height;
+            
+            // Check if frame has stable HD resolution
+            if w >= 1920 && h >= 1080 {
+                println!("   ✓ Got frame: {}x{}", w, h);
+                break (w, h);
+            } else {
+                println!("   ⏳ Frame {}x{} (waiting for HD resolution)...", w, h);
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    
+    // Create dummy BgraImage for initial setup (will be replaced with actual overlay)
+    let dummy_bgra = BgraImage {
+        width,
+        height,
+        data: vec![0u8; width as usize * height as usize * 4],
+        pitch: width as usize * 4,
+    };
+    
+    let mut gpu_compositor = OutputSession::new(width, height, &dummy_bgra)?;
+    println!("  ✓ GPU Compositor initialized: {}x{}", width, height);
+    
+    // Initialize DeckLink output
+    let mut decklink_out = decklink_output::from_path("configs/dev_1080p60_yuv422_fp16_trt.toml")?;
+    println!("  ✓ DeckLink output initialized");
+    println!();
+
     // 6. Process frames
-    println!("🎬 Step 6: Processing Frames...");
+    println!("🎬 Step 6: Processing Frames (Infinite Loop - Press Ctrl+C to stop)...");
     println!("════════════════════════════════════════════════════════════");
     println!();
 
-    let frames_to_process = 10;
-    let mut frame_count = 0;
+    let mut frame_count = 0u64;
     let mut total_latency_ms = 0.0;
 
     // Latency breakdown accumulators
@@ -407,11 +479,15 @@ fn main() -> Result<()> {
     let mut total_postprocess_ms = 0.0;
     let mut total_plan_ms = 0.0;
     let mut total_render_ms = 0.0;
+    let mut total_keying_ms = 0.0; // Internal keying (GPU composite + output)
 
     // GPU buffer pool to avoid repeated allocations
     let mut gpu_buffers: Vec<CudaSlice<u8>> = Vec::new();
+    
+    // Track start time for FPS calculation
+    let pipeline_start_time = Instant::now();
 
-    while frame_count < frames_to_process {
+    loop {  // Changed to infinite loop
         let pipeline_start = Instant::now();
 
         // Capture frame
@@ -489,7 +565,8 @@ fn main() -> Result<()> {
         println!();
         println!("⚙️  Step 3: CUDA Preprocessing");
         let preprocess_start = Instant::now();
-        let tensor_packet = match preprocessor.process_checked(raw_frame_gpu) {
+        // Clone raw_frame_gpu because we need it later for internal keying
+        let tensor_packet = match preprocessor.process_checked(raw_frame_gpu.clone()) {
             Some(packet) => packet,
             None => {
                 println!("  ⚠️  Skipping init frame (waiting for stable resolution)\n");
@@ -510,13 +587,6 @@ fn main() -> Result<()> {
         println!(
             "      → Operations: YUV422→RGB, Resize 1920×1080→512×512, Normalize, FP16 convert"
         );
-
-        // Save preprocessed tensor as image
-        let preprocess_img_path = format!("output/test/preprocess_frame_{:04}.png", frame_count);
-        match save_preprocessed_tensor(&tensor_packet, &cuda_device, &preprocess_img_path) {
-            Ok(_) => println!("      → Saved preprocessed image: {}", preprocess_img_path),
-            Err(e) => println!("      ⚠️  Failed to save preprocessed image: {}", e),
-        }
 
         // Step 4: Inference V2
         println!();
@@ -565,13 +635,6 @@ fn main() -> Result<()> {
                 "         {}. [idx={}] x={:.1}, y={:.1}, w={:.1}, h={:.1}, obj={:.4}, cls0={:.4}, cls1={:.4}",
                 rank + 1, idx, x, y, w, h, obj_conf, class0_conf, class1_conf
             );
-        }
-
-        // Save inference output
-        let inference_txt_path = format!("output/test/inference_frame_{:04}.txt", frame_count);
-        match save_inference_output(&raw_detections, &inference_txt_path) {
-            Ok(_) => println!("      → Saved inference output: {}", inference_txt_path),
-            Err(e) => println!("      ⚠️  Failed to save inference output: {}", e),
         }
 
         // Step 5: Postprocessing (NMS + Tracking) - ENABLED
@@ -624,13 +687,6 @@ fn main() -> Result<()> {
             }
         }
 
-        // Save postprocess output
-        let postprocess_txt_path = format!("output/test/postprocess_frame_{:04}.txt", frame_count);
-        match save_postprocess_output(&detections, &postprocess_txt_path) {
-            Ok(_) => println!("      → Saved postprocess output: {}", postprocess_txt_path),
-            Err(e) => println!("      ⚠️  Failed to save postprocess output: {}", e),
-        }
-
         // Step 6: Overlay Planning
         println!();
         println!("🎨 Step 6: Overlay Planning");
@@ -680,56 +736,64 @@ fn main() -> Result<()> {
         println!("      → Frame index: {}", overlay_frame.from.frame_idx);
         println!("      → Status: Ready for DeckLink output (internal keying)");
 
-        // Step 8: Save images (original, overlay, and comparison)
+        // Step 7.5: Internal Keying (GPU Composite + DeckLink Output)
         println!();
-        println!("💾 Step 8: Save Images");
-        let save_start = Instant::now();
+        println!("🎬 Step 7.5: Internal Keying (GPU Composite → SDI Output)");
+        let keying_start = Instant::now();
         
-        let original_path = format!("output/test/original_frame_{:04}.png", frame_count);
-        let overlay_path = format!("output/test/overlay_frame_{:04}.png", frame_count);
-        let comparison_path = format!("output/test/comparison_frame_{:04}.png", frame_count);
+        // Convert overlay ARGB to BGRA for compositor
+        let bgra_overlay = overlay_to_bgra(&overlay_frame)?;
         
-        let mut save_success = true;
+        // Recreate compositor with new overlay (OutputSession doesn't have update method)
+        gpu_compositor = OutputSession::new(width, height, &bgra_overlay)?;
         
-        // Save original frame (without bounding boxes)
-        // Need to copy GPU data to CPU first if needed
-        let mut cpu_buffer: Vec<u8>;
-        let raw_frame_cpu = if !matches!(raw_frame.data.loc, MemLoc::Cpu) {
-            // Copy from GPU to CPU using existing cuda_device
-            cpu_buffer = vec![0u8; raw_frame.data.len];
-            
-            // Use cudarc to copy device memory to host
-            unsafe {
-                cudarc::driver::result::memcpy_dtoh_sync(
-                    &mut cpu_buffer,
-                    raw_frame.data.ptr as cudarc::driver::sys::CUdeviceptr,
-                )?;
-            }
-            
-            common_io::RawFramePacket {
-                meta: raw_frame.meta.clone(),
-                data: MemRef {
-                    ptr: cpu_buffer.as_ptr() as *mut u8,
-                    len: cpu_buffer.len(),
-                    stride: raw_frame.data.stride,
-                    loc: MemLoc::Cpu,
-                },
-            }
-        } else {
-            cpu_buffer = Vec::new(); // Empty buffer for CPU case
-            raw_frame.clone()
+        // Composite overlay on top of background using CUDA kernel
+        gpu_compositor.composite(
+            raw_frame_gpu.data.ptr,
+            raw_frame_gpu.data.stride,
+        )?;
+        
+        // Get composited BGRA output from GPU
+        let output_bgra_ptr = gpu_compositor.output_gpu_ptr();
+        let output_pitch = gpu_compositor.output_pitch();
+        
+        // Create frame packet for composited BGRA output
+        let composited_packet = common_io::RawFramePacket {
+            meta: common_io::FrameMeta {
+                source_id: raw_frame_gpu.meta.source_id,
+                width,
+                height,
+                pixfmt: common_io::PixelFormat::BGRA8,
+                colorspace: common_io::ColorSpace::SRGB,
+                frame_idx: raw_frame_gpu.meta.frame_idx,
+                pts_ns: raw_frame_gpu.meta.pts_ns,
+                t_capture_ns: raw_frame_gpu.meta.t_capture_ns,
+                stride_bytes: output_pitch as u32,
+            crop_region: None,
+            },
+            data: MemRef {
+                ptr: output_bgra_ptr as *mut u8,
+                len: output_pitch * height as usize,
+                stride: output_pitch,
+                loc: common_io::MemLoc::Gpu { device: 0 },
+            },
         };
         
+        // Submit composited BGRA frame to DeckLink output
+        let output_request = OutputRequest {
+            video: Some(&composited_packet),
+            overlay: None,
+        };
         
-        // Save overlay frame (with bounding boxes)
-        match save_overlay_as_image(&overlay_frame, &overlay_path) {
-            Ok(_) => println!("  ✓ Saved overlay: {}", overlay_path),
-            Err(e) => {
-                println!("  ⚠️  Failed to save overlay: {}", e);
-                save_success = false;
-            }
-        }
-    
+        decklink_out.submit(output_request)?;
+        
+        let keying_time = keying_start.elapsed();
+        total_keying_ms += keying_time.as_secs_f64() * 1000.0;
+        println!("  ✓ Time: {:.2}ms", keying_time.as_secs_f64() * 1000.0);
+        println!("  ✓ Pipeline: Background (GPU) → CUDA Composite → BGRA (GPU) → DeckLink SDI");
+        println!("  ✓ Overlay dimensions: {}×{}", bgra_overlay.width, bgra_overlay.height);
+        println!("  ✓ Output format: BGRA8 on GPU");
+        println!("  ✓ Frame submitted to DeckLink output");
 
         let pipeline_time = pipeline_start.elapsed();
         let pipeline_ms = pipeline_time.as_secs_f64() * 1000.0;
@@ -745,139 +809,16 @@ fn main() -> Result<()> {
 
         frame_count += 1;
 
-        // Small delay to prevent overwhelming the output
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        // Print stats every 60 frames
+        if frame_count % 60 == 0 {
+            let elapsed = pipeline_start_time.elapsed().as_secs_f64();
+            let avg_fps = frame_count as f64 / elapsed;
+            println!("📊 Stats after {} frames | Avg FPS: {:.2} | Elapsed: {:.1}s", 
+                frame_count, avg_fps, elapsed);
+        }
     }
 
-    // Summary
-    println!("════════════════════════════════════════════════════════════");
-    println!("╔══════════════════════════════════════════════════════════╗");
-    println!("║                 PIPELINE SUMMARY                         ║");
-    println!("╠══════════════════════════════════════════════════════════╣");
-    println!(
-        "║ Frames Processed:  {:2}                                   ║",
-        frames_to_process
-    );
-    println!("╠══════════════════════════════════════════════════════════╣");
-    println!("║ Average Latency Breakdown:                               ║");
-    println!(
-        "║   Capture:        {:.2} ms                           ║",
-        total_capture_ms / frames_to_process as f64
-    );
-    println!(
-        "║   H2D Transfer:   {:.2} ms                            ║",
-        total_h2d_ms / frames_to_process as f64
-    );
-    println!(
-        "║   Preprocess:     {:.2} ms                           ║",
-        total_preprocess_ms / frames_to_process as f64
-    );
-    println!(
-        "║   Inference V2:   {:.2} ms                           ║",
-        total_inference_ms / frames_to_process as f64
-    );
-    println!(
-        "║   Postprocess:    {:.2} ms                            ║",
-        total_postprocess_ms / frames_to_process as f64
-    );
-    println!(
-        "║   Overlay Plan:   {:.2} ms                            ║",
-        total_plan_ms / frames_to_process as f64
-    );
-    println!(
-        "║   Overlay Render: {:.2} ms                            ║",
-        total_render_ms / frames_to_process as f64
-    );
-    println!("╠══════════════════════════════════════════════════════════╣");
-    println!(
-        "║   TOTAL E2E:      {:.2} ms                          ║",
-        total_latency_ms / frames_to_process as f64
-    );
-    println!(
-        "║   Average FPS:    {:.1}                              ║",
-        1000.0 * frames_to_process as f64 / total_latency_ms
-    );
-    println!("╠══════════════════════════════════════════════════════════╣");
-    println!("╠══════════════════════════════════════════════════════════╣");
-    println!("║ Pipeline Components:                                     ║");
-    println!("║   ✓ DeckLink Capture (YUV422_8, test_rawframepacket)    ║");
-    println!("║   ✓ CUDA Preprocessing (512×512 FP16)                    ║");
-    println!("║   ✓ TensorRT Inference V2 (configs/model engine)         ║");
-    println!("║   ✓ Postprocessing (NMS + SORT Tracking)                 ║");
-    println!("║   ✓ Overlay Planning (Bounding boxes + Labels)           ║");
-    println!("║   ✓ Overlay Rendering (ARGB output)                      ║");
-    println!("║   ✓ Image Export (3 types: original, overlay, compare)   ║");
-    println!("║   ✓ Step Output Export (preprocess, inference, postproc) ║");
-    println!("╠══════════════════════════════════════════════════════════╣");
-    println!("║ Output Files:                                             ║");
-    println!(
-        "║   📁 {} frames × 6 files = {} total files              ║",
-        frames_to_process,
-        frames_to_process * 6
-    );
-    println!("║                                                           ║");
-    println!("║   Images (per frame):                                     ║");
-    println!("║   1. output/test/original_frame_*.png                     ║");
-    println!("║      → Original YUV422 frame (no overlay)                 ║");
-    println!("║   2. output/test/preprocess_frame_*.png                   ║");
-    println!("║      → Preprocessed tensor (512×512 RGB, denormalized)    ║");
-    println!("║   3. output/test/overlay_frame_*.png                      ║");
-    println!("║      → With bounding boxes, labels, confidence, tracks    ║");
-    println!("║   4. output/test/comparison_frame_*.png                   ║");
-    println!("║      → Side-by-side: Original | Overlay (2× width)       ║");
-    println!("║                                                           ║");
-    println!("║   Text outputs (per frame):                               ║");
-    println!("║   5. output/test/inference_frame_*.txt                    ║");
-    println!("║      → Raw TensorRT inference output (all detections)     ║");
-    println!("║   6. output/test/postprocess_frame_*.txt                  ║");
-    println!("║      → Final detections after NMS + tracking              ║");
-    println!("╠══════════════════════════════════════════════════════════╣");
-    println!("║ Status: All outputs saved successfully!                   ║");
-    println!("╚══════════════════════════════════════════════════════════╝");
-    println!();
-    println!("✅ Pipeline test completed successfully!");
-    println!();
-    println!("📂 Output files:");
-    println!("   Images:");
-    println!("   • output/test/original_frame_*.png    - Original frames (1920×1080)");
-    println!("   • output/test/preprocess_frame_*.png  - Preprocessed tensor (512×512)");
-    println!("   • output/test/overlay_frame_*.png     - With bounding boxes");
-    println!("   • output/test/comparison_frame_*.png  - Side-by-side comparison");
-    println!();
-    println!("   Text outputs:");
-    println!("   • output/test/inference_frame_*.txt   - Raw inference output");
-    println!("   • output/test/postprocess_frame_*.txt - Final detections");
-    println!();
-    println!("💡 Next steps:");
-    println!("   1. View preprocess images to verify preprocessing quality");
-    println!("   2. Check inference/postprocess txt files for detection data");
-    println!("   3. Compare original vs overlay to see detection accuracy");
-    println!();
-    println!("╠══════════════════════════════════════════════════════════╣");
-    println!("║ Output:                                                   ║");
-    println!(
-        "║   📁 {} frames saved to output/test/overlay_frame_*.png ║",
-        frames_to_process
-    );
-    println!("║   🎨 Each image contains:                                 ║");
-    println!("║      • Bounding boxes around detected objects             ║");
-    println!("║      • Class labels (Hyper/Neo)                           ║");
-    println!("║      • Confidence scores                                  ║");
-    println!("║      • Tracking IDs                                       ║");
-    println!("╠══════════════════════════════════════════════════════════╣");
-    println!("║ Status: Images saved successfully!                        ║");
-    println!("╚══════════════════════════════════════════════════════════╝");
-    println!();
-    println!("✅ Pipeline test completed successfully!");
-    println!();
-    println!("� Output files:");
-    println!("   • Check output/overlay_frame_*.png for bounding box images");
-    println!();
-    println!("💡 Next steps:");
-    println!("   1. View saved images to verify detection quality");
-    println!("   2. Connect OverlayFramePacket to DeckLink output");
-    println!("   3. Enable internal keying for final output");
-    println!();
-
+    // This code will never be reached (infinite loop)
+    #[allow(unreachable_code)]
     Ok(())
 }

@@ -11,6 +11,7 @@ pub fn make_dummy_frame(w: u32, h: u32) -> RawFramePacket {
         pts_ns: 0,
         t_capture_ns: 0,
         stride_bytes: w * 2,
+            crop_region: None,
     };
     let data = MemRef {
         ptr: std::ptr::null_mut(),
@@ -35,6 +36,7 @@ pub fn make_gpu_dummy_yuv422(w: u32, h: u32) -> RawFramePacket {
         pts_ns: 0,
         t_capture_ns: 0,
         stride_bytes: w * 2,
+            crop_region: None,
     };
     let data = MemRef {
         ptr: std::ptr::null_mut(),
@@ -57,6 +59,7 @@ pub fn make_gpu_dummy_nv12(w: u32, h: u32) -> RawFramePacket {
         pts_ns: 0,
         t_capture_ns: 0,
         stride_bytes: w,
+            crop_region: None,
     };
     let data = MemRef {
         ptr: std::ptr::null_mut(),
@@ -79,6 +82,7 @@ pub fn make_gpu_dummy_bgra8(w: u32, h: u32) -> RawFramePacket {
         pts_ns: 0,
         t_capture_ns: 0,
         stride_bytes: w * 4,
+            crop_region: None,
     };
     let data = MemRef {
         ptr: std::ptr::null_mut(),

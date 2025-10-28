@@ -150,6 +150,7 @@ impl CaptureSession {
             pts_ns: raw.seq, // Use sequence as PTS
             t_capture_ns,
             stride_bytes: raw.row_bytes as u32,
+            crop_region: None,
         };
 
         // Build MemRef for the selected memory location

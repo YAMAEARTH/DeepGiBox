@@ -238,16 +238,23 @@ extern "C" __global__ void fused_preprocess_kernel(
     float std_r, float std_g, float std_b,
     bool fp16_output,
     const unsigned char* uv_plane,  // For NV12 only
-    int uv_stride                    // For NV12 only
+    int uv_stride,                   // For NV12 only
+    int crop_x, int crop_y,          // Crop region offset
+    int crop_w, int crop_h           // Crop region size
 ) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     
     if (x >= out_w || y >= out_h) return;
 
-    // 1) Map output coords to input coords (bilinear)
-    float sx = (x + 0.5f) * ((float)in_w / (float)out_w) - 0.5f;
-    float sy = (y + 0.5f) * ((float)in_h / (float)out_h) - 0.5f;
+    // 1) Map output coords (512×512) to crop region, then to input coords
+    // First: output pixel → crop region pixel (bilinear)
+    float sx_crop = (x + 0.5f) * ((float)crop_w / (float)out_w) - 0.5f;
+    float sy_crop = (y + 0.5f) * ((float)crop_h / (float)out_h) - 0.5f;
+    
+    // Second: crop region pixel → input pixel (add offset)
+    float sx = sx_crop + (float)crop_x;
+    float sy = sy_crop + (float)crop_y;
 
     float R, G, B;
 

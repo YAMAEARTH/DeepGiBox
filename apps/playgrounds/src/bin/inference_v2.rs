@@ -9,9 +9,9 @@ use inference_v2::TrtInferenceStage;
 
 const ENGINE_PATH: &str = "trt-shim/test_rust/assets/v7_optimized_YOLOv5.engine";
 const LIB_PATH: &str = "trt-shim/build/libtrt_shim.so";
-// const IMAGE_PATH: &str = "apps/playgrounds/sample_img.jpg";
+const IMAGE_PATH: &str = "apps/playgrounds/sample_img.jpg";
 // const IMAGE_PATH: &str = "/home/earth/Documents/Guptun/6/DeepGiBox/output/test/preprocess_frame_0000.png";  // Don't use this - already preprocessed!
-const IMAGE_PATH: &str = "/home/earth/Documents/Guptun/6/DeepGiBox/output/test/original_frame_0000.png";  // Use original 1920×1080 frame
+// const IMAGE_PATH: &str = "/home/earth/Documents/Guptun/6/DeepGiBox/output/test/original_frame_0000.png";  // Use original 1920×1080 frame
 // YOLOv5 input dimensions (MUST match the TensorRT engine!)
 // Check the actual model input size with: [TRT] ACTUAL ENGINE TENSOR DIMENSIONS
 const INPUT_WIDTH: u32 = 512;   // Changed from 640 to match engine (1, 3, 512, 512)
@@ -100,6 +100,7 @@ fn main() -> Result<()> {
             .duration_since(std::time::UNIX_EPOCH)?
             .as_nanos() as u64,
         stride_bytes: orig_w * 3,
+            crop_region: None,
     };
 
     let tensor_desc = TensorDesc {

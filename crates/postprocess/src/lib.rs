@@ -71,9 +71,10 @@ impl Stage<RawDetectionsPacket, DetectionsPacket> for PostStage {
     fn process(&mut self, input: RawDetectionsPacket) -> DetectionsPacket {
         let start = std::time::Instant::now();
 
-        // Update config with actual frame dimensions from packet
+        // Update config with actual frame dimensions and crop region from packet
         let mut config = self.config;
         config.original_size = (input.from.width, input.from.height);
+        config.crop_region = input.from.crop_region;
         
         // ⚠️ IMPORTANT: CUDA preprocessor uses STRETCH RESIZE (not letterbox)
         // The preprocessing kernel in preprocess.cu does simple bilinear resize:
@@ -84,8 +85,13 @@ impl Stage<RawDetectionsPacket, DetectionsPacket> for PostStage {
         
         // Debug: Show stretch resize parameters (for first few frames)
         if input.from.frame_idx <= 5 {
-            println!("    Stretch Resize [{}x{} → 512x512]: direct scale (no letterbox)", 
-                     input.from.width, input.from.height);
+            if let Some((cx, cy, cw, ch)) = config.crop_region {
+                println!("    Crop+Stretch Resize [crop {}×{} at ({},{}) → 512x512]: scale to crop dims + offset", 
+                         cw, ch, cx, cy);
+            } else {
+                println!("    Stretch Resize [{}x{} → 512x512]: direct scale (no letterbox)", 
+                         input.from.width, input.from.height);
+            }
         }
 
         // Process raw predictions (YOLO decode + NMS)
@@ -183,6 +189,8 @@ impl Postprocess {
             letterbox_pad: (cfg.letterbox.pad_x, cfg.letterbox.pad_y),
             original_size: (cfg.letterbox.original_w, cfg.letterbox.original_h),
             use_stretch_resize: true,  // CUDA preprocessor uses stretch resize, not letterbox
+            skip_sigmoid: false,  // Default: apply sigmoid (for models that output logits)
+            crop_region: None,  // No crop by default (set per-frame in process())
         };
 
         Ok(Self {
@@ -407,13 +415,15 @@ pub fn from_path(_cfg: &str) -> Result<PostStage> {
     // Therefore: num_classes = 7 - 5 = 2
     let config = YoloPostConfig {
         num_classes: 2, // ✅ FIXED: Changed from 80 to 2 to match actual model output
-        confidence_threshold: 0.35, // ✅ OPTIMIZED: Increased from 0.25 to reduce false positives
+        confidence_threshold: 0.25, // ✅ Standard YOLO threshold (was 0.35, too high!)
         nms_threshold: 0.45,
         max_detections: 100,
         letterbox_scale: 1.0,
         letterbox_pad: (0.0, 0.0),
         original_size: (512, 512),
         use_stretch_resize: true,  // CUDA preprocessor uses stretch resize, not letterbox
+        skip_sigmoid: true,  // v7_optimized model outputs probabilities, not logits
+        crop_region: None,  // No crop by default (set per-frame in process())
     };
 
     Ok(PostStage::new(config).with_temporal_smoothing(4))

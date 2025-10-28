@@ -18,6 +18,7 @@ fn create_dummy_input_gpu(device: u32) -> Result<TensorInputPacket> {
         pts_ns: 0,
         t_capture_ns: 0,
         stride_bytes: 512 * 3,
+            crop_region: None,
     };
 
     let shape = [1_usize, 3, 512, 512];

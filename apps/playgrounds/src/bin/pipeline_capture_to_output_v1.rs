@@ -15,7 +15,7 @@ use inference_v2::TrtInferenceStage;
 use overlay_plan::PlanStage;
 use overlay_render::RenderStage;
 use postprocess;
-use preprocess_cuda::Preprocessor;
+use preprocess_cuda::{Preprocessor, CropRegion};
 use std::time::Instant;
 use image::{RgbaImage, Rgba, RgbImage};
 use std::fs::File;
@@ -408,12 +408,24 @@ fn main() -> Result<()> {
 
     // 2. Initialize Preprocessor
     println!("⚙️  Step 2: Initialize Preprocessor");
-    let mut preprocessor = Preprocessor::new(
-        (512, 512), // Output size (matching YOLOv5 engine input)
-        true,       // FP16 for better performance
-        0,          // GPU device 0
+    
+    // Load crop region from config or use default
+    // For now, using OLYMPUS as default (can be made configurable)
+    let crop_region = CropRegion::Olympus; // Change this to Fuji or Pentax as needed
+    
+    let mut preprocessor = Preprocessor::with_crop_region(
+        (512, 512),                    // Output size (matching YOLOv5 engine input)
+        true,                          // FP16 for better performance
+        0,                             // GPU device 0
+        [0.0, 0.0, 0.0],              // mean
+        [1.0, 1.0, 1.0],              // std
+        preprocess_cuda::ChromaOrder::UYVY,  // chroma order
+        crop_region,                   // crop region
     )?;
+    
+    let (cx, cy, cw, ch) = crop_region.get_coords();
     println!("  ✓ Preprocessor ready (512x512, FP16, GPU 0)");
+    println!("  ✓ Crop region: {:?} => [{}, {}, {}×{}]", crop_region, cx, cy, cw, ch);
     println!();
 
     // 2.5 Initialize CUDA device for CPU->GPU transfer
@@ -796,6 +808,7 @@ fn main() -> Result<()> {
                 pts_ns: raw_frame.meta.pts_ns,
                 t_capture_ns: raw_frame.meta.t_capture_ns,
                 stride_bytes: output_pitch as u32,
+            crop_region: None,
             },
             data: MemRef {
                 ptr: output_bgra_ptr as *mut u8,

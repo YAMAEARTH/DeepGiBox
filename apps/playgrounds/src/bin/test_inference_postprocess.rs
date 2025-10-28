@@ -197,6 +197,7 @@ fn create_gpu_tensor_packet(cpu_data: Vec<f32>) -> Result<TensorInputPacket> {
         pts_ns: 0,
         t_capture_ns: 0,
         stride_bytes: INPUT_WIDTH * 4,
+            crop_region: None,
     };
     
     // Create tensor descriptor

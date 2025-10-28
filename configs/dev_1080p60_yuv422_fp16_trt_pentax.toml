@@ -12,9 +12,8 @@ chroma = "UYVY"
 mean = [0.0, 0.0, 0.0]
 std = [1.0, 1.0, 1.0]
 device = 0
-# Crop region for different cameras before scaling to 512x512
-# Options: "fuji" [0:1080, 0:1376], "olympus" [0:1080, 548:1920], "pentax" [0:1080, 0:1376], "none" (full frame)
-crop_region = "none"
+# PENTAX camera: Crop left portion [0:1080, 0:1376] = 1376×1080 → 512×512
+crop_region = "pentax"
 
 [inference]
 backend = "tensorrt"

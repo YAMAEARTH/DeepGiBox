@@ -130,6 +130,7 @@ impl OrtTrtEngine {
             pts_ns: 0,
             t_capture_ns: 0,
             stride_bytes: 512 * 3,
+            crop_region: None,
         };
 
         let shape = [1, 3, 512, 512];
