@@ -25,7 +25,16 @@ telemetry = { path = "../../crates/telemetry", optional = true }
 testsupport = { path = "../../testsupport", optional = true }
 
 [features]
-default = []
+default = [
+    "decklink_input",
+    "decklink_output",
+    "preprocess_cuda",
+    "inference",
+    "overlay_plan",
+    "overlay_render",
+    "telemetry",
+    "testsupport",
+]
 full = [
     "decklink_input",
     "decklink_output",

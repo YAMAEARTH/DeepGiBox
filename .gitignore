@@ -1,6 +1,7 @@
 # Project-specific ignores
 Samples/
 target/
+output/
 target/debug/
 Blackmagic DeckLink SDK.pdf
 Cargo.lock
