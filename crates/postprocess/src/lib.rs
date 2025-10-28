@@ -71,10 +71,27 @@ impl Stage<RawDetectionsPacket, DetectionsPacket> for PostStage {
     fn process(&mut self, input: RawDetectionsPacket) -> DetectionsPacket {
         let start = std::time::Instant::now();
 
+        // Update config with actual frame dimensions from packet
+        let mut config = self.config;
+        config.original_size = (input.from.width, input.from.height);
+        
+        // ⚠️ IMPORTANT: CUDA preprocessor uses STRETCH RESIZE (not letterbox)
+        // The preprocessing kernel in preprocess.cu does simple bilinear resize:
+        //   float sx = (x + 0.5f) * ((float)in_w / (float)out_w) - 0.5f;
+        // This means no aspect ratio preservation, no padding.
+        // Therefore, we should NOT calculate letterbox parameters here.
+        // The postprocessing will use stretch resize coordinate transformation.
+        
+        // Debug: Show stretch resize parameters (for first few frames)
+        if input.from.frame_idx <= 5 {
+            println!("    Stretch Resize [{}x{} → 512x512]: direct scale (no letterbox)", 
+                     input.from.width, input.from.height);
+        }
+
         // Process raw predictions (YOLO decode + NMS)
         let result = postprocess_yolov5_with_temporal_smoothing(
             &input.raw_output,
-            &self.config,
+            &config,
             self.smoother.as_mut(),
         );
 
@@ -165,6 +182,7 @@ impl Postprocess {
             letterbox_scale: cfg.letterbox.scale,
             letterbox_pad: (cfg.letterbox.pad_x, cfg.letterbox.pad_y),
             original_size: (cfg.letterbox.original_w, cfg.letterbox.original_h),
+            use_stretch_resize: true,  // CUDA preprocessor uses stretch resize, not letterbox
         };
 
         Ok(Self {
@@ -201,8 +219,50 @@ impl Postprocess {
     fn decode(&mut self, raw: &RawDetectionsPacket) -> (Vec<post::Candidate>, u64) {
         let t0 = now_ns();
         
+        // Update config with actual frame dimensions from packet
+        let mut config = self.yolo_config;
+        config.original_size = (raw.from.width, raw.from.height);
+
+        // Derive number of classes dynamically from the inference output when possible.
+        // TensorRT stage currently produces [1, N, values_per_det] where
+        // values_per_det = 5 (box/objectness) + num_classes. When this value
+        // doesn't match the static config (default 80), decoding mixes anchors
+        // together and yields garbage bounding boxes. This happens with the
+        // current 2-class model (values_per_det = 7).
+        if let Some(values_per_det) = infer_values_per_candidate(raw) {
+            let derived_classes = values_per_det.saturating_sub(5);
+            if derived_classes > 0 && derived_classes != config.num_classes {
+                println!(
+                    "    Adjusting YOLO class count: inferred {} classes (was {})",
+                    derived_classes, config.num_classes
+                );
+                self.yolo_config.num_classes = derived_classes;
+                config.num_classes = derived_classes;
+            }
+        }
+        
+        // Calculate letterbox parameters based on actual preprocessing
+        // Assuming model input is always 512x512 (from yolo_config)
+        let model_w = 512.0;
+        let model_h = 512.0;
+        let orig_w = raw.from.width as f32;
+        let orig_h = raw.from.height as f32;
+        
+        let scale = (model_w / orig_w).min(model_h / orig_h);
+        let new_w = (orig_w * scale).round();
+        let new_h = (orig_h * scale).round();
+        let pad_x = (model_w - new_w) / 2.0;
+        let pad_y = (model_h - new_h) / 2.0;
+        
+        config.letterbox_scale = scale;
+        config.letterbox_pad = (pad_x, pad_y);
+        
+        // Debug: Show letterbox parameters
+        println!("    Letterbox params: scale={:.4}, pad=({:.1}, {:.1}), orig_size={}x{}", 
+                 scale, pad_x, pad_y, raw.from.width, raw.from.height);
+        
         // For YOLO: raw_output is flattened [N, (cx,cy,w,h,obj,cls...)]
-        let candidates = post::decode_predictions(&raw.raw_output, &self.yolo_config);
+        let candidates = post::decode_predictions(&raw.raw_output, &config);
         
         (candidates, t0)
     }
@@ -340,16 +400,52 @@ impl Stage<RawDetectionsPacket, DetectionsPacket> for Postprocess {
 
 // Helper function to create from config
 pub fn from_path(_cfg: &str) -> Result<PostStage> {
-    // Default YOLO config for 512x512 input
+    // Optimized YOLO config for 512x512 input
+    // ⚠️ CRITICAL: num_classes MUST match the model output!
+    // For YOLOv5 model with output shape [1, 16128, 7]:
+    // 7 values per detection = [cx, cy, w, h, objectness, class0, class1]
+    // Therefore: num_classes = 7 - 5 = 2
     let config = YoloPostConfig {
-        num_classes: 80, // COCO dataset
-        confidence_threshold: 0.25,
+        num_classes: 2, // ✅ FIXED: Changed from 80 to 2 to match actual model output
+        confidence_threshold: 0.35, // ✅ OPTIMIZED: Increased from 0.25 to reduce false positives
         nms_threshold: 0.45,
         max_detections: 100,
         letterbox_scale: 1.0,
         letterbox_pad: (0.0, 0.0),
         original_size: (512, 512),
+        use_stretch_resize: true,  // CUDA preprocessor uses stretch resize, not letterbox
     };
 
     Ok(PostStage::new(config).with_temporal_smoothing(4))
+}
+
+/// Infer the number of raw values per candidate detection from the inference output.
+/// Returns Some(values_per_candidate) when the tensor shape provides enough information.
+fn infer_values_per_candidate(raw: &RawDetectionsPacket) -> Option<usize> {
+    // Prefer the last dimension of the output tensor (e.g., [1, N, 7]).
+    if let Some(&values_per_det) = raw.output_shape.last() {
+        if values_per_det >= 5 {
+            return Some(values_per_det);
+        }
+    }
+
+    // Fallback: derive from total float count and remaining dimensions (batch * anchors).
+    if !raw.output_shape.is_empty() {
+        let len = raw.output_shape.len();
+        // Multiply every dimension except the last; default to 1 when shape has a single dim.
+        let denom: usize = if len >= 2 {
+            raw.output_shape[..len - 1].iter().product()
+        } else {
+            raw.output_shape[0]
+        };
+
+        if denom > 0 {
+            let values_per_det = raw.raw_output.len() / denom;
+            if values_per_det >= 5 {
+                return Some(values_per_det);
+            }
+        }
+    }
+
+    None
 }

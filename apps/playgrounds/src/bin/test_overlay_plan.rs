@@ -111,22 +111,28 @@ fn print_overlay_plan(packet: &OverlayPlanPacket) {
     
     for (idx, op) in packet.ops.iter().enumerate() {
         match op {
-            DrawOp::Rect { xywh, thickness } => {
+            DrawOp::Rect { xywh, thickness, color } => {
                 println!(
-                    "  [{}] Rect: ({:.1}, {:.1}, {:.1}, {:.1}) thickness={}",
-                    idx, xywh.0, xywh.1, xywh.2, xywh.3, thickness
+                    "  [{}] Rect: ({:.1}, {:.1}, {:.1}, {:.1}) thickness={} color=rgba({},{},{},{})",
+                    idx, xywh.0, xywh.1, xywh.2, xywh.3, thickness, color.1, color.2, color.3, color.0
                 );
             }
-            DrawOp::Label { anchor, text, font_px } => {
+            DrawOp::FillRect { xywh, color } => {
                 println!(
-                    "  [{}] Label: \"{}\" @ ({:.1}, {:.1}) font_px={}",
-                    idx, text, anchor.0, anchor.1, font_px
+                    "  [{}] FillRect: ({:.1}, {:.1}, {:.1}, {:.1}) color=rgba({},{},{},{})",
+                    idx, xywh.0, xywh.1, xywh.2, xywh.3, color.1, color.2, color.3, color.0
                 );
             }
-            DrawOp::Poly { pts, thickness } => {
+            DrawOp::Label { anchor, text, font_px, color } => {
                 println!(
-                    "  [{}] Poly: {} points, thickness={}",
-                    idx, pts.len(), thickness
+                    "  [{}] Label: \"{}\" @ ({:.1}, {:.1}) font_px={} color=rgba({},{},{},{})",
+                    idx, text, anchor.0, anchor.1, font_px, color.1, color.2, color.3, color.0
+                );
+            }
+            DrawOp::Poly { pts, thickness, color } => {
+                println!(
+                    "  [{}] Poly: {} points, thickness={} color=rgba({},{},{},{})",
+                    idx, pts.len(), thickness, color.1, color.2, color.3, color.0
                 );
             }
         }

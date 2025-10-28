@@ -439,7 +439,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     
     // Create a simple config
     use config::InferenceCfg;
-    let model_path = "crates/inference/YOLOv5.onnx";
+    let model_path = "configs/model/YOLOv5.onnx";
     
     if !std::path::Path::new(model_path).exists() {
         println!("❌ Model file not found: {}", model_path);

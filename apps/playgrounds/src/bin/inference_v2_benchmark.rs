@@ -1,7 +1,7 @@
 use anyhow::Result;
 use common_io::{
-    ColorSpace, DType, FrameMeta, MemLoc, MemRef, PixelFormat, Stage, TensorDesc,
-    TensorInputPacket, RawDetectionsPacket,
+    ColorSpace, DType, FrameMeta, MemLoc, MemRef, PixelFormat, RawDetectionsPacket, Stage,
+    TensorDesc, TensorInputPacket,
 };
 use cudarc::driver::{CudaDevice, CudaSlice, DevicePtr};
 use image::io::Reader as ImageReader;
@@ -104,86 +104,110 @@ fn main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to create TensorRT inference stage: {}", e))?;
     let init_time = start.elapsed();
     println!("   ✓ TrtInferenceStage created");
-    println!("   ✓ Initialization time: {:.2}ms\n", init_time.as_secs_f64() * 1000.0);
+    println!(
+        "   ✓ Initialization time: {:.2}ms\n",
+        init_time.as_secs_f64() * 1000.0
+    );
 
     // ═══════════════════════════════════════════════════════════════════════
     // STEP 6: Warmup Runs (exclude from benchmark)
     // ═══════════════════════════════════════════════════════════════════════
     println!("🔥 Step 6: Warmup Phase ({} runs)...", WARMUP_RUNS);
     let mut warmup_times = Vec::new();
-    
+
     for i in 0..WARMUP_RUNS {
         let start = std::time::Instant::now();
         let _detections: RawDetectionsPacket = inference_stage.process(tensor_packet.clone());
         let elapsed = start.elapsed();
         warmup_times.push(elapsed.as_secs_f64() * 1000.0);
-        
-        print!("   Run {}/{}: {:.2}ms", i + 1, WARMUP_RUNS, elapsed.as_secs_f64() * 1000.0);
+
+        print!(
+            "   Run {}/{}: {:.2}ms",
+            i + 1,
+            WARMUP_RUNS,
+            elapsed.as_secs_f64() * 1000.0
+        );
         if i == 0 {
             print!(" ← FIRST RUN (may include cold start)");
         }
         println!();
     }
-    
+
     let warmup_avg = warmup_times.iter().sum::<f64>() / warmup_times.len() as f64;
     let warmup_min = warmup_times.iter().fold(f64::INFINITY, |a, &b| a.min(b));
     let warmup_max = warmup_times.iter().fold(0.0f64, |a, &b| a.max(b));
-    
+
     println!("   ✓ Warmup complete!");
     println!("   ✓ First run: {:.2}ms", warmup_times[0]);
-    println!("   ✓ Warmup avg: {:.2}ms (min: {:.2}ms, max: {:.2}ms)\n", warmup_avg, warmup_min, warmup_max);
+    println!(
+        "   ✓ Warmup avg: {:.2}ms (min: {:.2}ms, max: {:.2}ms)\n",
+        warmup_avg, warmup_min, warmup_max
+    );
 
     // ═══════════════════════════════════════════════════════════════════════
     // STEP 7: Benchmark Runs (measure steady-state performance)
     // ═══════════════════════════════════════════════════════════════════════
     println!("⚡ Step 7: Benchmark Phase ({} runs)...", BENCHMARK_RUNS);
     let mut bench_times = Vec::new();
-    
+
     let bench_start = std::time::Instant::now();
     for i in 0..BENCHMARK_RUNS {
         let start = std::time::Instant::now();
         let _detections: RawDetectionsPacket = inference_stage.process(tensor_packet.clone());
         let elapsed = start.elapsed();
         bench_times.push(elapsed.as_secs_f64() * 1000.0);
-        
+
         if i < 5 || i >= BENCHMARK_RUNS - 5 {
-            println!("   Run {}/{}: {:.2}ms", i + 1, BENCHMARK_RUNS, elapsed.as_secs_f64() * 1000.0);
+            println!(
+                "   Run {}/{}: {:.2}ms",
+                i + 1,
+                BENCHMARK_RUNS,
+                elapsed.as_secs_f64() * 1000.0
+            );
         } else if i == 5 {
             println!("   ... (runs 6-{}) ...", BENCHMARK_RUNS - 5);
         }
     }
     let bench_total = bench_start.elapsed();
-    
+
     // ═══════════════════════════════════════════════════════════════════════
     // STEP 8: Statistical Analysis
     // ═══════════════════════════════════════════════════════════════════════
     println!("\n📊 Step 8: Statistical Analysis");
-    
+
     // Sort for percentile calculations
     let mut sorted = bench_times.clone();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    
+
     let bench_avg = bench_times.iter().sum::<f64>() / bench_times.len() as f64;
     let bench_min = sorted[0];
     let bench_max = sorted[sorted.len() - 1];
     let bench_p50 = sorted[sorted.len() / 2];
     let bench_p95 = sorted[(sorted.len() as f64 * 0.95) as usize];
     let bench_p99 = sorted[(sorted.len() as f64 * 0.99) as usize];
-    
+
     // Calculate standard deviation
-    let variance = bench_times.iter()
+    let variance = bench_times
+        .iter()
         .map(|&x| (x - bench_avg).powi(2))
-        .sum::<f64>() / bench_times.len() as f64;
+        .sum::<f64>()
+        / bench_times.len() as f64;
     let std_dev = variance.sqrt();
-    
+
     println!("\n   🔥 COLD START ANALYSIS:");
     println!("   ┌─────────────────────────┬───────────┐");
-    println!("   │ First run (warmup)      │ {:>7.2}ms │", warmup_times[0]);
+    println!(
+        "   │ First run (warmup)      │ {:>7.2}ms │",
+        warmup_times[0]
+    );
     println!("   │ Subsequent warmup runs  │ {:>7.2}ms │", warmup_avg);
     println!("   │ Benchmark steady-state  │ {:>7.2}ms │", bench_avg);
-    println!("   │ Overhead (cold start)   │ {:>7.2}ms │", warmup_times[0] - bench_avg);
+    println!(
+        "   │ Overhead (cold start)   │ {:>7.2}ms │",
+        warmup_times[0] - bench_avg
+    );
     println!("   └─────────────────────────┴───────────┘");
-    
+
     println!("\n   ⚡ BENCHMARK STATISTICS ({} runs):", BENCHMARK_RUNS);
     println!("   ┌─────────────────────────┬───────────┐");
     println!("   │ Average (mean)          │ {:>7.2}ms │", bench_avg);
@@ -194,28 +218,55 @@ fn main() -> Result<()> {
     println!("   │ 99th percentile         │ {:>7.2}ms │", bench_p99);
     println!("   │ Std deviation           │ {:>7.2}ms │", std_dev);
     println!("   └─────────────────────────┴───────────┘");
-    
+
     println!("\n   📈 THROUGHPUT:");
     println!("   ┌─────────────────────────┬───────────┐");
-    println!("   │ Average FPS             │ {:>7.1}   │", 1000.0 / bench_avg);
-    println!("   │ Peak FPS (min latency)  │ {:>7.1}   │", 1000.0 / bench_min);
-    println!("   │ Total time ({} runs)   │ {:>7.2}ms │", BENCHMARK_RUNS, bench_total.as_secs_f64() * 1000.0);
-    println!("   │ Actual throughput       │ {:>7.1}   │", BENCHMARK_RUNS as f64 / bench_total.as_secs_f64());
+    println!(
+        "   │ Average FPS             │ {:>7.1}   │",
+        1000.0 / bench_avg
+    );
+    println!(
+        "   │ Peak FPS (min latency)  │ {:>7.1}   │",
+        1000.0 / bench_min
+    );
+    println!(
+        "   │ Total time ({} runs)   │ {:>7.2}ms │",
+        BENCHMARK_RUNS,
+        bench_total.as_secs_f64() * 1000.0
+    );
+    println!(
+        "   │ Actual throughput       │ {:>7.1}   │",
+        BENCHMARK_RUNS as f64 / bench_total.as_secs_f64()
+    );
     println!("   └─────────────────────────┴───────────┘");
 
     println!("\n💡 VERDICT:");
     if (warmup_times[0] - bench_avg).abs() > 5.0 {
-        println!("   ⚠️  Cold start detected! First run was {:.2}ms slower", warmup_times[0] - bench_avg);
-        println!("   ✅ Steady-state performance: {:.2}ms ({:.1} FPS)", bench_avg, 1000.0 / bench_avg);
+        println!(
+            "   ⚠️  Cold start detected! First run was {:.2}ms slower",
+            warmup_times[0] - bench_avg
+        );
+        println!(
+            "   ✅ Steady-state performance: {:.2}ms ({:.1} FPS)",
+            bench_avg,
+            1000.0 / bench_avg
+        );
     } else {
         println!("   ✅ No significant cold start overhead");
-        println!("   ✅ Consistent performance: {:.2}ms ({:.1} FPS)", bench_avg, 1000.0 / bench_avg);
+        println!(
+            "   ✅ Consistent performance: {:.2}ms ({:.1} FPS)",
+            bench_avg,
+            1000.0 / bench_avg
+        );
     }
-    
+
     if std_dev > 1.0 {
         println!("   ⚠️  High variance detected ({:.2}ms std dev)", std_dev);
     } else {
-        println!("   ✅ Low variance ({:.2}ms std dev) - very stable!", std_dev);
+        println!(
+            "   ✅ Low variance ({:.2}ms std dev) - very stable!",
+            std_dev
+        );
     }
 
     println!("\n╔═══════════════════════════════════════════════════════════╗");
@@ -238,19 +289,11 @@ fn preprocess_image_cpu(img: &image::RgbImage, target_w: u32, target_h: u32) -> 
     let new_h = (orig_h as f32 * scale) as u32;
 
     // Resize image
-    let resized = image::imageops::resize(
-        img,
-        new_w,
-        new_h,
-        image::imageops::FilterType::Lanczos3,
-    );
+    let resized = image::imageops::resize(img, new_w, new_h, image::imageops::FilterType::Lanczos3);
 
     // Create letterboxed image with gray padding
-    let mut letterboxed = image::RgbImage::from_pixel(
-        target_w,
-        target_h,
-        image::Rgb([114u8, 114u8, 114u8]),
-    );
+    let mut letterboxed =
+        image::RgbImage::from_pixel(target_w, target_h, image::Rgb([114u8, 114u8, 114u8]));
 
     let pad_x = (target_w - new_w) / 2;
     let pad_y = (target_h - new_h) / 2;

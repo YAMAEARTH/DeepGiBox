@@ -39,15 +39,6 @@ pub fn fast_classwise_nms(
         return Vec::new();
     }
     
-    // Early exit for sparse frames
-    if candidates.len() < 50 {
-        // Very few boxes, unlikely to have significant overlaps
-        let mut result: Vec<_> = candidates.iter().cloned().collect();
-        result.sort_by(|a, b| b.detection.score.partial_cmp(&a.detection.score).unwrap());
-        result.truncate(max_total);
-        return result;
-    }
-    
     // Group by class (use Vec instead of HashMap for speed with few classes)
     let max_class = candidates.iter().map(|c| c.detection.class_id).max().unwrap_or(0);
     let num_classes = (max_class + 1).min(100); // Cap at 100 classes

@@ -96,6 +96,9 @@ pub struct YoloPostConfig {
     pub letterbox_scale: f32,
     pub letterbox_pad: (f32, f32),
     pub original_size: (u32, u32),
+    /// If true, use stretch resize coordinate transformation (no letterbox)
+    /// If false, use letterbox coordinate transformation (default)
+    pub use_stretch_resize: bool,
 }
 
 pub fn postprocess_yolov5_with_temporal_smoothing(
@@ -166,6 +169,7 @@ pub fn postprocess_yolov5_with_temporal_smoothing(
 }
 
 // decode_predictions now uses pub Candidate defined at top
+// Optimized with early rejection and reduced allocations
 pub fn decode_predictions(predictions: &[f32], cfg: &YoloPostConfig) -> Vec<Candidate> {
     let stride = 5 + cfg.num_classes;
     let inv_scale = if cfg.letterbox_scale > 0.0 {
@@ -175,26 +179,63 @@ pub fn decode_predictions(predictions: &[f32], cfg: &YoloPostConfig) -> Vec<Cand
     };
     let (pad_x, pad_y) = cfg.letterbox_pad;
     let (orig_w, orig_h) = (cfg.original_size.0 as f32, cfg.original_size.1 as f32);
+    
+    // Pre-allocate with reasonable capacity to avoid reallocation
+    let estimated_capacity = (predictions.len() / stride / 10).max(100).min(1000);
+    let mut candidates = Vec::with_capacity(estimated_capacity);
 
-    predictions
-        .chunks(stride)
-        .filter_map(|chunk| {
-            if chunk.len() < stride {
-                return None;
-            }
+    for chunk in predictions.chunks(stride) {
+        if chunk.len() < stride {
+            continue;
+        }
 
-            let objectness = sigmoid(chunk[4]);
-            let (best_class, class_conf) = best_class(chunk[5..].iter().copied());
-            let score = objectness * class_conf;
-            if score < cfg.confidence_threshold {
-                return None;
-            }
+        // Early rejection: Check objectness first (cheapest operation)
+        let objectness_raw = chunk[4];
+        // Quick sigmoid approximation check for early rejection
+        // If raw value < -5, sigmoid < 0.007, definitely below threshold
+        if objectness_raw < -5.0 {
+            continue;
+        }
 
-            let cx = chunk[0];
-            let cy = chunk[1];
-            let w = chunk[2].abs();
-            let h = chunk[3].abs();
+        let objectness = sigmoid(objectness_raw);
+        // Early rejection: objectness alone must be above threshold/2 to have chance
+        if objectness < cfg.confidence_threshold * 0.5 {
+            continue;
+        }
 
+        let (best_class, class_conf) = best_class(chunk[5..].iter().copied());
+        let score = objectness * class_conf;
+        if score < cfg.confidence_threshold {
+            continue;
+        }
+
+        let cx = chunk[0];
+        let cy = chunk[1];
+        let w = chunk[2].abs();
+        let h = chunk[3].abs();
+
+        // Early rejection: unreasonably small or large boxes
+        if w < 1.0 || h < 1.0 || w > orig_w * 2.0 || h > orig_h * 2.0 {
+            continue;
+        }
+
+        // Coordinate transformation: model space (512×512) → image space (original size)
+        let (left, top, right, bottom) = if cfg.use_stretch_resize {
+            // Stretch resize: direct scale (no padding)
+            // model_coord → image_coord: img = model * (orig_size / model_size)
+            const MODEL_SIZE: f32 = 512.0;
+            let scale_x = orig_w / MODEL_SIZE;
+            let scale_y = orig_h / MODEL_SIZE;
+            
+            let left = (cx - w * 0.5) * scale_x;
+            let top = (cy - h * 0.5) * scale_y;
+            let right = (cx + w * 0.5) * scale_x;
+            let bottom = (cy + h * 0.5) * scale_y;
+            
+            (left, top, right, bottom)
+        } else {
+            // Letterbox: remove padding then scale
+            // model_coord → remove_pad → scale_up: img = (model - pad) / letterbox_scale
             let mut left = cx - w * 0.5 - pad_x;
             let mut top = cy - h * 0.5 - pad_y;
             let mut right = cx + w * 0.5 - pad_x;
@@ -204,31 +245,35 @@ pub fn decode_predictions(predictions: &[f32], cfg: &YoloPostConfig) -> Vec<Cand
             top *= inv_scale;
             right *= inv_scale;
             bottom *= inv_scale;
+            
+            (left, top, right, bottom)
+        };
 
-            left = left.clamp(0.0, orig_w);
-            top = top.clamp(0.0, orig_h);
-            right = right.clamp(0.0, orig_w);
-            bottom = bottom.clamp(0.0, orig_h);
+        let left = left.clamp(0.0, orig_w);
+        let top = top.clamp(0.0, orig_h);
+        let right = right.clamp(0.0, orig_w);
+        let bottom = bottom.clamp(0.0, orig_h);
 
-            let width = (right - left).max(0.0);
-            let height = (bottom - top).max(0.0);
-            if width <= 0.0 || height <= 0.0 {
-                return None;
-            }
+        let width = (right - left).max(0.0);
+        let height = (bottom - top).max(0.0);
+        if width <= 0.0 || height <= 0.0 {
+            continue;
+        }
 
-            let bbox = BoundingBox::new_with_confidence(left, top, width, height, score);
-            let universal = bbox.as_xyaah();
+        let bbox = BoundingBox::new_with_confidence(left, top, width, height, score);
+        let universal = bbox.as_xyaah();
 
-            Some(Candidate {
-                detection: Detection {
-                    class_id: best_class,
-                    score,
-                    bbox: [left, top, right, bottom],
-                },
-                bbox: universal,
-            })
-        })
-        .collect()
+        candidates.push(Candidate {
+            detection: Detection {
+                class_id: best_class,
+                score,
+                bbox: [left, top, right, bottom],
+            },
+            bbox: universal,
+        });
+    }
+    
+    candidates
 }
 
 pub fn apply_nms(candidates: Vec<Candidate>, cfg: &YoloPostConfig) -> Vec<Candidate> {

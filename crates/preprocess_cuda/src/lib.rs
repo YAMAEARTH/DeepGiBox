@@ -1,5 +1,8 @@
 use anyhow::{anyhow, Result};
-use common_io::{ColorSpace, DType, MemLoc, MemRef, PixelFormat, RawFramePacket, Stage, TensorDesc, TensorInputPacket};
+use common_io::{
+    ColorSpace, DType, MemLoc, MemRef, PixelFormat, RawFramePacket, Stage, TensorDesc,
+    TensorInputPacket,
+};
 use cudarc::driver::{CudaDevice, CudaFunction, CudaStream, DevicePtr, LaunchConfig};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -28,27 +31,43 @@ pub struct PreprocessConfig {
     pub chroma: String,
 }
 
-fn default_size() -> [u32; 2] { [512, 512] }
-fn default_fp16() -> bool { true }
-fn default_device() -> u32 { 0 }
-fn default_mean() -> [f32; 3] { [0.0, 0.0, 0.0] }
-fn default_std() -> [f32; 3] { [1.0, 1.0, 1.0] }
-fn default_chroma() -> String { "UYVY".to_string() }
+fn default_size() -> [u32; 2] {
+    [512, 512]
+}
+fn default_fp16() -> bool {
+    true
+}
+fn default_device() -> u32 {
+    0
+}
+fn default_mean() -> [f32; 3] {
+    [0.0, 0.0, 0.0]
+}
+fn default_std() -> [f32; 3] {
+    [1.0, 1.0, 1.0]
+}
+fn default_chroma() -> String {
+    "UYVY".to_string()
+}
 
 /// Main preprocessing stage with GPU acceleration
 pub struct Preprocessor {
-    pub size: (u32, u32),     // (width, height)
+    pub size: (u32, u32), // (width, height) - output size
     pub fp16: bool,
     pub device: u32,
-    pub mean: [f32; 3],       // RGB mean
-    pub std: [f32; 3],        // RGB std
+    pub mean: [f32; 3], // RGB mean
+    pub std: [f32; 3],  // RGB std
     pub chroma: ChromaOrder,
-    
+
+    // Frame validation (for production video streams)
+    pub expected_input_size: Option<(u32, u32)>, // None = accept any size
+    pub skip_invalid_frames: bool,               // true = skip, false = panic
+
     // CUDA resources
     cuda_device: Arc<CudaDevice>,
     cuda_stream: CudaStream,
     kernel_func: CudaFunction,
-    
+
     // Buffer pool for output tensors (stores raw device pointers and sizes)
     buffer_pool: HashMap<(u32, u32, bool), (cudarc::driver::sys::CUdeviceptr, usize)>,
 }
@@ -56,9 +75,16 @@ pub struct Preprocessor {
 impl Preprocessor {
     /// Create a new preprocessor with specified configuration
     pub fn new(size: (u32, u32), fp16: bool, device: u32) -> Result<Self> {
-        Self::with_params(size, fp16, device, [0.0, 0.0, 0.0], [1.0, 1.0, 1.0], ChromaOrder::UYVY)
+        Self::with_params(
+            size,
+            fp16,
+            device,
+            [0.0, 0.0, 0.0],
+            [1.0, 1.0, 1.0],
+            ChromaOrder::UYVY,
+        )
     }
-    
+
     /// Create with full parameters
     pub fn with_params(
         size: (u32, u32),
@@ -71,21 +97,29 @@ impl Preprocessor {
         // Initialize CUDA device
         let cuda_device = CudaDevice::new(device as usize)
             .map_err(|e| anyhow!("Failed to initialize CUDA device {}: {:?}", device, e))?;
-        
+
         // Create CUDA stream
-        let cuda_stream = cuda_device.fork_default_stream()
+        let cuda_stream = cuda_device
+            .fork_default_stream()
             .map_err(|e| anyhow!("Failed to create CUDA stream: {:?}", e))?;
-        
+
         // Load PTX and get kernel function
         let ptx_path = std::path::Path::new(env!("OUT_DIR")).join("preprocess.ptx");
-        let ptx = std::fs::read_to_string(&ptx_path)
-            .map_err(|e| anyhow!("Failed to read PTX file {:?}: {}. Make sure CUDA kernel compiled successfully.", ptx_path, e))?;
-        cuda_device.load_ptx(ptx.into(), "preprocess", &["fused_preprocess_kernel"])
+        let ptx = std::fs::read_to_string(&ptx_path).map_err(|e| {
+            anyhow!(
+                "Failed to read PTX file {:?}: {}. Make sure CUDA kernel compiled successfully.",
+                ptx_path,
+                e
+            )
+        })?;
+        cuda_device
+            .load_ptx(ptx.into(), "preprocess", &["fused_preprocess_kernel"])
             .map_err(|e| anyhow!("Failed to load PTX: {:?}", e))?;
-        
-        let kernel_func = cuda_device.get_func("preprocess", "fused_preprocess_kernel")
+
+        let kernel_func = cuda_device
+            .get_func("preprocess", "fused_preprocess_kernel")
             .ok_or_else(|| anyhow!("Failed to get kernel function"))?;
-        
+
         Ok(Self {
             size,
             fp16,
@@ -93,39 +127,59 @@ impl Preprocessor {
             mean,
             std,
             chroma,
+            expected_input_size: Some((1920, 1080)), // Default for production video
+            skip_invalid_frames: true,               // Skip frames with unexpected size by default
             cuda_device,
             cuda_stream,
             kernel_func,
             buffer_pool: HashMap::new(),
         })
     }
-    
+
+    /// Set expected input size validation (None = accept any size)
+    pub fn with_input_validation(
+        mut self,
+        expected_size: Option<(u32, u32)>,
+        skip_invalid: bool,
+    ) -> Self {
+        self.expected_input_size = expected_size;
+        self.skip_invalid_frames = skip_invalid;
+        self
+    }
+
     /// Get or create output buffer
-    fn get_output_buffer(&mut self, w: u32, h: u32, fp16: bool) -> Result<(cudarc::driver::sys::CUdeviceptr, usize)> {
+    fn get_output_buffer(
+        &mut self,
+        w: u32,
+        h: u32,
+        fp16: bool,
+    ) -> Result<(cudarc::driver::sys::CUdeviceptr, usize)> {
         let key = (w, h, fp16);
-        
+
         if let Some(&buf) = self.buffer_pool.get(&key) {
             return Ok(buf);
         }
-        
+
         // Calculate required size: 3 channels * w * h * dtype_size
         let dtype_size = if fp16 { 2 } else { 4 };
         let total_size = (3 * w * h * dtype_size) as usize;
-        
+
         // Allocate new buffer
-        let buf = self.cuda_device.alloc_zeros::<u8>(total_size)
+        let buf = self
+            .cuda_device
+            .alloc_zeros::<u8>(total_size)
             .map_err(|e| anyhow!("Failed to allocate GPU buffer: {:?}", e))?;
-        
+
         let device_ptr = *buf.device_ptr() as cudarc::driver::sys::CUdeviceptr;
-        
+
         // Keep buffer alive by leaking it (we'll manage lifecycle manually)
         std::mem::forget(buf);
-        
+
         let buf_info = (device_ptr, total_size);
         self.buffer_pool.insert(key, buf_info);
         Ok(buf_info)
     }
-    
+
     /// Launch preprocessing kernel
     fn launch_kernel(
         &self,
@@ -137,7 +191,7 @@ impl Preprocessor {
         let in_stride = input.meta.stride_bytes as i32;
         let out_w = self.size.0 as i32;
         let out_h = self.size.1 as i32;
-        
+
         // Determine pixel format enum value
         let pixfmt = match input.meta.pixfmt {
             PixelFormat::BGRA8 => 0,
@@ -145,9 +199,9 @@ impl Preprocessor {
             PixelFormat::YUV422_8 => 2,
             _ => return Err(anyhow!("Unsupported pixel format: {:?}", input.meta.pixfmt)),
         };
-        
+
         let chroma_order = self.chroma as i32;
-        
+
         // For NV12, we need to calculate UV plane offset
         let (uv_plane_ptr, uv_stride) = if pixfmt == 1 {
             let y_plane_size = (in_h * in_stride) as usize;
@@ -156,27 +210,23 @@ impl Preprocessor {
         } else {
             (std::ptr::null(), 0)
         };
-        
+
         // Launch configuration: 16x16 blocks
         let block_dim = (16, 16, 1);
-        let grid_dim = (
-            ((out_w + 15) / 16) as u32,
-            ((out_h + 15) / 16) as u32,
-            1,
-        );
-        
+        let grid_dim = (((out_w + 15) / 16) as u32, ((out_h + 15) / 16) as u32, 1);
+
         let config = LaunchConfig {
             grid_dim,
             block_dim,
             shared_mem_bytes: 0,
         };
-        
+
         // Prepare kernel arguments
         // cudarc supports Vec<*mut c_void> for arbitrary number of parameters
         let in_ptr = input.data.ptr as cudarc::driver::sys::CUdeviceptr;
         let uv_ptr = uv_plane_ptr as cudarc::driver::sys::CUdeviceptr;
         let fp16_val = if self.fp16 { 1i32 } else { 0i32 };
-        
+
         let mut params = vec![
             &in_ptr as *const _ as *mut std::ffi::c_void,
             &output_buf as *const _ as *mut std::ffi::c_void,
@@ -197,41 +247,68 @@ impl Preprocessor {
             &uv_ptr as *const _ as *mut std::ffi::c_void,
             &uv_stride as *const _ as *mut std::ffi::c_void,
         ];
-        
+
         // Launch kernel using Vec of params
         use cudarc::driver::LaunchAsync;
         unsafe {
-            self.kernel_func.clone().launch(config, &mut params)
+            self.kernel_func
+                .clone()
+                .launch(config, &mut params)
                 .map_err(|e| anyhow!("Failed to launch kernel: {:?}", e))?;
         }
-        
+
         // Synchronize device
-        self.cuda_device.synchronize()
+        self.cuda_device
+            .synchronize()
             .map_err(|e| anyhow!("Failed to synchronize device: {:?}", e))?;
-        
+
         Ok(())
     }
 }
 
 impl Stage<RawFramePacket, TensorInputPacket> for Preprocessor {
     fn process(&mut self, input: RawFramePacket) -> TensorInputPacket {
-        // Validate input location
+        self.ensure_gpu_input(&input);
+        if !self.dimensions_match(&input) {
+            panic!(
+                "Frame #{} size mismatch: got {}x{}, expected {}x{}",
+                input.meta.frame_idx,
+                input.meta.width,
+                input.meta.height,
+                self.expected_input_size.map(|(w, _)| w).unwrap_or(0),
+                self.expected_input_size.map(|(_, h)| h).unwrap_or(0)
+            );
+        }
+        self.process_inner(input)
+    }
+}
+
+impl Preprocessor {
+    fn ensure_gpu_input(&self, input: &RawFramePacket) {
         if !matches!(input.data.loc, MemLoc::Gpu { device } if device == self.device) {
             panic!(
                 "Expected GPU input on device {}, got {:?}",
                 self.device, input.data.loc
             );
         }
-        
-        // Validate color space
+    }
+
+    fn dimensions_match(&self, input: &RawFramePacket) -> bool {
+        if let Some((expected_w, expected_h)) = self.expected_input_size {
+            input.meta.width == expected_w && input.meta.height == expected_h
+        } else {
+            true
+        }
+    }
+
+    fn process_inner(&mut self, input: RawFramePacket) -> TensorInputPacket {
         if !matches!(input.meta.colorspace, ColorSpace::BT709) {
             eprintln!(
                 "Warning: Expected BT709 color space, got {:?}",
                 input.meta.colorspace
             );
         }
-        
-        // Validate stride
+
         let expected_min_stride = match input.meta.pixfmt {
             PixelFormat::BGRA8 => input.meta.width * 4,
             PixelFormat::YUV422_8 => input.meta.width * 2,
@@ -244,16 +321,14 @@ impl Stage<RawFramePacket, TensorInputPacket> for Preprocessor {
                 input.meta.stride_bytes, expected_min_stride, input.meta.pixfmt
             );
         }
-        
-        // Get or allocate output buffer
-        let (output_buf, total_bytes) = self.get_output_buffer(self.size.0, self.size.1, self.fp16)
+
+        let (output_buf, total_bytes) = self
+            .get_output_buffer(self.size.0, self.size.1, self.fp16)
             .expect("Failed to get output buffer");
-        
-        // Launch kernel
+
         self.launch_kernel(&input, output_buf)
             .expect("Failed to launch preprocessing kernel");
-        
-        // Create output descriptor
+
         let desc = TensorDesc {
             n: 1,
             c: 3,
@@ -262,21 +337,51 @@ impl Stage<RawFramePacket, TensorInputPacket> for Preprocessor {
             dtype: if self.fp16 { DType::Fp16 } else { DType::Fp32 },
             device: self.device,
         };
-        
+
         let dtype_size = if self.fp16 { 2 } else { 4 };
-        
+
         let data = MemRef {
             ptr: output_buf as *mut u8,
             len: total_bytes,
             stride: (self.size.0 * dtype_size) as usize,
-            loc: MemLoc::Gpu { device: self.device },
+            loc: MemLoc::Gpu {
+                device: self.device,
+            },
         };
-        
+
         TensorInputPacket {
             from: input.meta,
             desc,
             data,
         }
+    }
+
+    pub fn process_checked(&mut self, input: RawFramePacket) -> Option<TensorInputPacket> {
+        self.ensure_gpu_input(&input);
+        if !self.dimensions_match(&input) {
+            let (expected_w, expected_h) = self.expected_input_size.unwrap_or((0, 0));
+            if self.skip_invalid_frames {
+                eprintln!(
+                    "⚠️  Skipping frame {} with size {}x{} (expected {}x{})",
+                    input.meta.frame_idx,
+                    input.meta.width,
+                    input.meta.height,
+                    expected_w,
+                    expected_h
+                );
+                return None;
+            } else {
+                panic!(
+                    "Frame #{} size mismatch: got {}x{}, expected {}x{}",
+                    input.meta.frame_idx,
+                    input.meta.width,
+                    input.meta.height,
+                    expected_w,
+                    expected_h
+                );
+            }
+        }
+        Some(self.process_inner(input))
     }
 }
 
@@ -284,23 +389,28 @@ impl Stage<RawFramePacket, TensorInputPacket> for Preprocessor {
 pub fn from_path(cfg_path: &str) -> Result<Preprocessor> {
     let config_str = std::fs::read_to_string(cfg_path)
         .map_err(|e| anyhow!("Failed to read config file: {}", e))?;
-    
-    let config: toml::Value = toml::from_str(&config_str)
-        .map_err(|e| anyhow!("Failed to parse TOML: {}", e))?;
-    
+
+    let config: toml::Value =
+        toml::from_str(&config_str).map_err(|e| anyhow!("Failed to parse TOML: {}", e))?;
+
     let preprocess_config: PreprocessConfig = config
         .get("preprocess")
         .ok_or_else(|| anyhow!("Missing [preprocess] section"))?
         .clone()
         .try_into()
         .map_err(|e| anyhow!("Failed to parse preprocess config: {}", e))?;
-    
+
     let chroma = match preprocess_config.chroma.to_uppercase().as_str() {
         "UYVY" => ChromaOrder::UYVY,
         "YUY2" => ChromaOrder::YUY2,
-        _ => return Err(anyhow!("Invalid chroma order: {}", preprocess_config.chroma)),
+        _ => {
+            return Err(anyhow!(
+                "Invalid chroma order: {}",
+                preprocess_config.chroma
+            ))
+        }
     };
-    
+
     Preprocessor::with_params(
         (preprocess_config.size[0], preprocess_config.size[1]),
         preprocess_config.fp16,

@@ -6,9 +6,11 @@ edition = "2021"
 [dependencies]
 anyhow = "1"
 image = "0.24"
+serde_json = "1.0"
 ort = { version = "2.0.0-rc.10", features = ["tensorrt", "cuda"] }
 cudarc = { version = "0.11.9", features = ["cuda-12040", "driver"] }
 half = "2.4"
+rand = "0.8"
 common_io = { path = "../../crates/common_io" }
 config = { path = "../../crates/config" }
 decklink_input = { path = "../../crates/decklink_input", optional = true }
@@ -16,7 +18,7 @@ decklink_output = { path = "../../crates/decklink_output", optional = true }
 preprocess_cuda = { path = "../../crates/preprocess_cuda", optional = true }
 inference = { path = "../../crates/inference", optional = true }
 inference_v2 = { path = "../../crates/inference_v2" }
-postprocess = { path = "../../crates/postprocess", optional = true }
+postprocess = { path = "../../crates/postprocess" }
 overlay_plan = { path = "../../crates/overlay_plan", optional = true }
 overlay_render = { path = "../../crates/overlay_render", optional = true }
 telemetry = { path = "../../crates/telemetry", optional = true }
@@ -29,7 +31,6 @@ full = [
     "decklink_output",
     "preprocess_cuda",
     "inference",
-    "postprocess",
     "overlay_plan",
     "overlay_render",
     "telemetry",

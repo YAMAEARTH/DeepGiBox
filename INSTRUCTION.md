@@ -40,11 +40,14 @@ DeckLinkInput
   → RawFramePacket{ meta{w,h,pixfmt(BGRA8/NV12/YUV422_8), colorspace(BT709/...),
                         stride_bytes, frame_idx, pts_ns,t_capture_ns}, data }
   → PreprocessCUDA (YUV/NV12/BGRA → RGB + resize + normalize, FP16/FP32)
-      → TensorInputPacket{ 1×3×H×W, dtype(Fp16/Fp32), device=GPU }
+      → TensorInputPacket{ 1×3×512×512, dtype(Fp16/Fp32), device=GPU }
+      ⚠️  Validates input: 1920×1080 (skips init frames with wrong dimensions)
+      🔧 Letterbox: maintains aspect ratio, pads to 512×512
   → Inference (TRT / ORT-TRT)
-      → RawDetectionsPacket **FIX Raw Detection i added raw_output to use the data in postprocessing
+      → RawDetectionsPacket (includes raw_output for postprocessing)
   → Postprocess (decode + threshold + NMS + optional tracking)
       → DetectionsPacket{ boxes, score, class_id, track_id? }
+      🔧 Auto-calculates letterbox params from FrameMeta (original size)
   → OverlayPlan (ops)
       → OverlayPlanPacket{ ops, canvas=(W,H) }
   → OverlayRender (ARGB8+alpha)

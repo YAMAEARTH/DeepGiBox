@@ -105,6 +105,7 @@ pub struct Detection {
     pub track_id: Option<i32>,
 }
 
+#[derive(Clone)]
 pub struct DetectionsPacket {
     pub from: FrameMeta,
     pub items: Vec<Detection>,
@@ -114,15 +115,22 @@ pub enum DrawOp {
     Rect {
         xywh: (f32, f32, f32, f32),
         thickness: u8,
+        color: (u8, u8, u8, u8),
+    },
+    FillRect {
+        xywh: (f32, f32, f32, f32),
+        color: (u8, u8, u8, u8),
     },
     Label {
         anchor: (f32, f32),
         text: String,
         font_px: u16,
+        color: (u8, u8, u8, u8),
     },
     Poly {
         pts: Vec<(f32, f32)>,
         thickness: u8,
+        color: (u8, u8, u8, u8),
     },
 }
 
