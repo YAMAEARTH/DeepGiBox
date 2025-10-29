@@ -10,6 +10,21 @@ extern "C" {
     fn decklink_output_open(device_index: c_int, width: c_int, height: c_int, fps: c_double) -> bool;
     fn decklink_output_send_frame_gpu(gpu_bgra_data: *const u8, gpu_pitch: c_int, width: c_int, height: c_int) -> bool;
     fn decklink_output_close();
+    
+    // Hardware keying functions
+    fn decklink_keyer_enable_internal() -> bool;
+    fn decklink_keyer_set_level(level: u8) -> bool;
+    fn decklink_keyer_disable() -> bool;
+    fn decklink_set_video_output_connection(connection: i64) -> bool;
+    fn decklink_get_connection_sdi() -> i64;
+    
+    // Get detected input format (for internal keying sync)
+    fn decklink_get_detected_input_format(
+        out_width: *mut c_int,
+        out_height: *mut c_int,
+        out_fps: *mut c_double,
+        out_mode: *mut u32,
+    ) -> bool;
 }
 
 /// Output device error type
@@ -103,6 +118,74 @@ impl OutputDevice {
     /// Get frame rate
     pub fn fps(&self) -> f64 {
         self.fps
+    }
+    
+    /// Enable hardware internal keying
+    pub fn enable_internal_keying(&mut self) -> Result<(), OutputDeviceError> {
+        if !self.is_open {
+            return Err(OutputDeviceError::DeviceNotAvailable("Device not open".to_string()));
+        }
+        
+        let success = unsafe { decklink_keyer_enable_internal() };
+        if !success {
+            return Err(OutputDeviceError::ConfigError(
+                "Failed to enable internal keyer (device may not support hardware keying)".to_string()
+            ));
+        }
+        
+        println!("✓ Hardware internal keying enabled");
+        Ok(())
+    }
+    
+    /// Set keyer level (0-255, 255 = fully visible overlay)
+    pub fn set_keyer_level(&mut self, level: u8) -> Result<(), OutputDeviceError> {
+        if !self.is_open {
+            return Err(OutputDeviceError::DeviceNotAvailable("Device not open".to_string()));
+        }
+        
+        let success = unsafe { decklink_keyer_set_level(level) };
+        if !success {
+            return Err(OutputDeviceError::ConfigError(
+                "Failed to set keyer level".to_string()
+            ));
+        }
+        
+        Ok(())
+    }
+    
+    /// Disable hardware internal keying
+    pub fn disable_internal_keying(&mut self) -> Result<(), OutputDeviceError> {
+        if !self.is_open {
+            return Err(OutputDeviceError::DeviceNotAvailable("Device not open".to_string()));
+        }
+        
+        let success = unsafe { decklink_keyer_disable() };
+        if !success {
+            return Err(OutputDeviceError::ConfigError(
+                "Failed to disable internal keyer".to_string()
+            ));
+        }
+        
+        println!("✓ Hardware internal keying disabled");
+        Ok(())
+    }
+    
+    /// Set video output connection to SDI
+    pub fn set_sdi_output(&mut self) -> Result<(), OutputDeviceError> {
+        if !self.is_open {
+            return Err(OutputDeviceError::DeviceNotAvailable("Device not open".to_string()));
+        }
+        
+        let sdi_conn = unsafe { decklink_get_connection_sdi() };
+        let success = unsafe { decklink_set_video_output_connection(sdi_conn) };
+        
+        if !success {
+            return Err(OutputDeviceError::ConfigError(
+                "Failed to set SDI output connection".to_string()
+            ));
+        }
+        
+        Ok(())
     }
 
     /// Submit an output request to the device
@@ -216,6 +299,24 @@ pub fn from_path<P: AsRef<Path>>(config_path: P) -> Result<OutputDevice, OutputD
         device_index,
         is_open: true,
     })
+}
+
+/// Get detected input format for internal keying sync
+pub fn get_detected_input_format() -> Option<(u32, u32, f64)> {
+    let mut width: c_int = 0;
+    let mut height: c_int = 0;
+    let mut fps: c_double = 0.0;
+    let mut mode: u32 = 0;
+    
+    let success = unsafe {
+        decklink_get_detected_input_format(&mut width, &mut height, &mut fps, &mut mode)
+    };
+    
+    if success && width > 0 && height > 0 && fps > 0.0 {
+        Some((width as u32, height as u32, fps))
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]

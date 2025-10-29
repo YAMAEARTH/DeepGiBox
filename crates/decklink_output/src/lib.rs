@@ -4,6 +4,9 @@ pub mod image_loader;
 pub mod output;
 
 pub use compositor::{CompositorBuilder, OverlaySource, PipelineCompositor};
-pub use device::{from_path, OutputDevice, OutputDeviceError, OutputFrame, OutputRequest, VideoFrame};
+pub use device::{
+    from_path, get_detected_input_format, OutputDevice, OutputDeviceError, OutputFrame,
+    OutputRequest, VideoFrame,
+};
 pub use image_loader::BgraImage;
 pub use output::{GpuBuffer, OutputError, OutputSession};
