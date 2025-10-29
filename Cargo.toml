@@ -6,7 +6,7 @@ members = [
     "telemetry",
     "config",
     "capture_yuv_dump",
-    "internal_keying_demo",
+    "internal_keying_demo", "internal_keying_simple",
 ]
 resolver = "2"
 

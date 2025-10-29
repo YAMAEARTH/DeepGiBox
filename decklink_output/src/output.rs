@@ -23,7 +23,7 @@ const CUDA_MEMCPY_DEVICE_TO_HOST: c_int = 2;
 const CUDA_SUCCESS: c_int = 0;
 
 extern "C" {
-    fn launch_composite_with_alpha(
+    fn launch_composite_png_over_decklink(
         decklink_uyvy: *const u8,
         png_bgra: *const u8,
         output_bgra: *mut u8,
@@ -32,6 +32,10 @@ extern "C" {
         decklink_pitch: c_int,
         png_pitch: c_int,
         output_pitch: c_int,
+        key_r: u8,
+        key_g: u8,
+        key_b: u8,
+        threshold: f32,
         stream: *mut c_void,
     );
 }
@@ -149,7 +153,48 @@ impl Drop for GpuBuffer {
 unsafe impl Send for GpuBuffer {}
 unsafe impl Sync for GpuBuffer {}
 
-/// Output session for compositing
+/// Chroma key configuration
+#[derive(Debug, Clone, Copy)]
+pub struct ChromaKey {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+    pub threshold: f32,
+}
+
+impl ChromaKey {
+    /// Green screen key (typical green screen color)
+    pub fn green_screen() -> Self {
+        ChromaKey {
+            r: 0,
+            g: 177,
+            b: 64,
+            threshold: 0.15,
+        }
+    }
+
+    /// Blue screen key
+    pub fn blue_screen() -> Self {
+        ChromaKey {
+            r: 0,
+            g: 0,
+            b: 255,
+            threshold: 0.15,
+        }
+    }
+
+    /// Custom key color
+    pub fn custom(r: u8, g: u8, b: u8, threshold: f32) -> Self {
+        ChromaKey {
+            r,
+            g,
+            b,
+            threshold,
+        }
+    }
+}
+
+/// Output session for compositing and keying
 pub struct OutputSession {
     png_buffer: GpuBuffer,
     output_buffer: GpuBuffer,
@@ -188,22 +233,20 @@ impl OutputSession {
         })
     }
 
-    /// Composite PNG over DeckLink using PNG's alpha channel
-    /// 
-    /// Performance: ~0.5ms per frame @ 1080p60
-    /// 
+    /// Composite PNG over DeckLink with chroma keying
     /// decklink_uyvy_gpu: pointer to DeckLink capture buffer on GPU (UYVY format)
     pub fn composite(
         &mut self,
         decklink_uyvy_gpu: *const u8,
         decklink_pitch: usize,
+        chroma_key: ChromaKey,
     ) -> Result<(), OutputError> {
         if decklink_uyvy_gpu.is_null() {
             return Err(OutputError::NullPointer);
         }
 
         unsafe {
-            launch_composite_with_alpha(
+            launch_composite_png_over_decklink(
                 decklink_uyvy_gpu,
                 self.png_buffer.ptr,
                 self.output_buffer.ptr,
@@ -212,6 +255,10 @@ impl OutputSession {
                 decklink_pitch as c_int,
                 self.png_buffer.pitch as c_int,
                 self.output_buffer.pitch as c_int,
+                chroma_key.r,
+                chroma_key.g,
+                chroma_key.b,
+                chroma_key.threshold,
                 self.stream,
             );
         }

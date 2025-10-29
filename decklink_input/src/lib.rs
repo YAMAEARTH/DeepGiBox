@@ -8,6 +8,51 @@ use libc::{c_char, int32_t};
 use std::ffi::CStr;
 use std::slice;
 
+/// Video format detection
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VideoFormat {
+    pub width: u32,
+    pub height: u32,
+    pub fps: f64,
+}
+
+impl VideoFormat {
+    pub fn new(width: u32, height: u32, fps: f64) -> Self {
+        Self { width, height, fps }
+    }
+    
+    /// Detect format from resolution and framerate
+    pub fn detect(width: u32, height: u32, fps: f64) -> Self {
+        Self::new(width, height, Self::normalize_fps(fps))
+    }
+    
+    /// Normalize framerate to common values
+    fn normalize_fps(fps: f64) -> f64 {
+        if (fps - 23.976).abs() < 0.1 { 24.0 }
+        else if (fps - 24.0).abs() < 0.1 { 24.0 }
+        else if (fps - 25.0).abs() < 0.1 { 25.0 }
+        else if (fps - 29.97).abs() < 0.1 { 30.0 }
+        else if (fps - 30.0).abs() < 0.1 { 30.0 }
+        else if (fps - 50.0).abs() < 0.1 { 50.0 }
+        else if (fps - 59.94).abs() < 0.1 { 60.0 }
+        else if (fps - 60.0).abs() < 0.1 { 60.0 }
+        else { fps }
+    }
+    
+    pub fn name(&self) -> String {
+        let res = match (self.width, self.height) {
+            (720, 486) | (720, 576) => "SD",
+            (1280, 720) => "720p",
+            (1920, 1080) => "1080p",
+            (2048, 1556) => "2K",
+            (3840, 2160) => "4K",
+            (7680, 4320) => "8K",
+            _ => "Custom",
+        };
+        format!("{}@{:.0}fps", res, self.fps)
+    }
+}
+
 #[repr(C)]
 struct DLDeviceList {
     names: *mut *mut c_char,
@@ -67,11 +112,20 @@ pub struct OutputDevice {
 impl OutputDevice {
     /// Open DeckLink output device
     pub fn open(device_index: i32, width: i32, height: i32, fps: f64) -> Result<Self, String> {
-        let success = unsafe { decklink_output_open(device_index as int32_t, width as int32_t, height as int32_t, fps) };
+        let success = unsafe { decklink_output_open(device_index, width, height, fps) };
         if !success {
             return Err(format!("Failed to open DeckLink output device {}", device_index));
         }
         Ok(Self { device_index, width, height, fps })
+    }
+
+    /// Open DeckLink output with auto-detected format from capture
+    pub fn open_from_format(device_index: i32, format: VideoFormat) -> Result<Self, String> {
+        println!("   🎬 Auto-detected format: {}", format.name());
+        println!("      Resolution: {}x{}", format.width, format.height);
+        println!("      Framerate: {:.0}fps", format.fps);
+        
+        Self::open(device_index, format.width as i32, format.height as i32, format.fps)
     }
 
     /// Send BGRA frame to output (from CPU memory)
@@ -82,7 +136,7 @@ impl OutputDevice {
         }
 
         let success = unsafe {
-            decklink_output_send_frame(bgra_data.as_ptr(), self.width as int32_t, self.height as int32_t)
+            decklink_output_send_frame(bgra_data.as_ptr(), self.width, self.height)
         };
 
         if !success {
@@ -97,9 +151,9 @@ impl OutputDevice {
         let success = unsafe {
             decklink_output_send_frame_gpu(
                 gpu_bgra_ptr,
-                gpu_pitch as int32_t,
-                self.width as int32_t,
-                self.height as int32_t
+                gpu_pitch as i32,
+                self.width,
+                self.height
             )
         };
 

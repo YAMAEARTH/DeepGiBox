@@ -1,12 +1,79 @@
 use anyhow::Result;
-use decklink_input::{capture::CaptureSession, OutputDevice};
-use decklink_output::{BgraImage, OutputSession};
+use decklink_input::{capture::CaptureSession, OutputDevice, VideoFormat};
+use decklink_output::{BgraImage, ChromaKey, OutputSession};
 use std::thread;
 use std::time::Duration;
 
+/// Detect stable video format from capture
+fn detect_stable_format(capture: &mut CaptureSession) -> Result<VideoFormat> {
+    const STABLE_FRAMES_REQUIRED: usize = 5;
+    const MAX_DETECTION_ATTEMPTS: usize = 150;
+    const SKIP_INITIAL_FRAMES: usize = 10; // Skip first frames while DeckLink auto-detects
+    
+    let mut last_format: Option<VideoFormat> = None;
+    let mut stable_count = 0;
+    let mut attempts = 0;
+    
+    // Skip initial frames to allow DeckLink to detect proper resolution
+    println!("   ⏳ Waiting for signal stabilization...");
+    for _ in 0..SKIP_INITIAL_FRAMES {
+        if let Some(_) = capture.get_frame()? {
+            thread::sleep(Duration::from_millis(16));
+        }
+    }
+    
+    loop {
+        attempts += 1;
+        if attempts > MAX_DETECTION_ATTEMPTS {
+            return Err(anyhow::anyhow!("Failed to detect stable video format after {} attempts", MAX_DETECTION_ATTEMPTS));
+        }
+        
+        if let Some(frame) = capture.get_frame()? {
+            let w = frame.meta.width;
+            let h = frame.meta.height;
+            
+            // Skip invalid or SD dimensions (720x486 is initial/invalid state)
+            if w == 0 || h == 0 || (w <= 720 && h <= 576) {
+                thread::sleep(Duration::from_millis(16));
+                continue;
+            }
+            
+            // Estimate FPS based on resolution
+            let fps = if h >= 2160 { 30.0 } else { 60.0 };
+            
+            let current_format = VideoFormat::detect(w, h, fps);
+            
+            match last_format {
+                None => {
+                    // First valid frame
+                    println!("   📺 Detected: {}", current_format.name());
+                    last_format = Some(current_format);
+                    stable_count = 1;
+                }
+                Some(ref last) if last.width == current_format.width && last.height == current_format.height => {
+                    // Same format, increment stability counter
+                    stable_count += 1;
+                    
+                    if stable_count >= STABLE_FRAMES_REQUIRED {
+                        return Ok(current_format);
+                    }
+                }
+                Some(_) => {
+                    // Format changed, reset
+                    println!("   📺 Format changed: {}", current_format.name());
+                    last_format = Some(current_format);
+                    stable_count = 1;
+                }
+            }
+        }
+        
+        thread::sleep(Duration::from_millis(16));
+    }
+}
+
 fn main() -> Result<()> {
-    println!("🎬 Internal Keying Demo with SDI Output");
-    println!("========================================");
+    println!("🎬 Internal Keying Demo with Auto-Format Detection");
+    println!("===================================================");
     
     // 1. Load PNG foreground image
     println!("\n📸 Loading PNG image...");
@@ -24,39 +91,32 @@ fn main() -> Result<()> {
     let mut capture = CaptureSession::open(0)?;
     println!("   ✓ DeckLink capture opened on device 0");
     
-    // Wait for stable frame dimensions (DeckLink may change resolution)
-    println!("\n⏳ Waiting for stable frame dimensions...");
-    let (width, height) = loop {
-        if let Some(frame) = capture.get_frame()? {
-            let w = frame.meta.width;
-            let h = frame.meta.height;
-            
-            // Check if frame matches PNG size or is stable HD resolution
-            if (w == png_image.width && h == png_image.height) || (w >= 1920 && h >= 1080) {
-                println!("   ✓ Got frame: {}x{}", w, h);
-                break (w, h);
-            } else {
-                println!("   ⏳ Frame {}x{} (waiting for {}x{})...", w, h, png_image.width, png_image.height);
-            }
-        }
-        thread::sleep(Duration::from_millis(50));
-    };
+    // 3. Detect stable video format
+    println!("\n⏳ Detecting video format (waiting for stable signal)...");
+    let video_format = detect_stable_format(&mut capture)?;
+    println!("   ✓ Stable format detected: {}", video_format.name());
     
-    // 3. Open DeckLink output (SDI)
+    // 4. Open DeckLink output (SDI) with auto-detected format
     println!("\n📡 Opening DeckLink output...");
-    let decklink_output = OutputDevice::open(0, width as i32, height as i32, 60.0)
+    let decklink_output = OutputDevice::open_from_format(0, video_format)
         .map_err(|e| anyhow::anyhow!("Failed to open DeckLink output: {}", e))?;
-    println!("   ✓ DeckLink output opened: {}x{}@{}fps", 
-        decklink_output.width(), decklink_output.height(), decklink_output.fps());
+    println!("   ✓ DeckLink output configured");
     
-    // 4. Create output session
+    // 5. Create output session
     println!("\n🔧 Setting up output session...");
-    let mut output = OutputSession::new(width, height, &png_image)?;
-    println!("   ✓ Output session ready: {}x{}", width, height);
+    let mut output = OutputSession::new(video_format.width, video_format.height, &png_image)?;
+    println!("   ✓ Output session ready: {}x{}", video_format.width, video_format.height);
     
-    // 5. Process frames and output to SDI (GPU→SDI direct!)
+    // 6. Configure chroma key
+    let chroma_key = ChromaKey::green_screen();
+    println!("\n🎨 Chroma Key: RGB({}, {}, {}) threshold={}",
+        chroma_key.r, chroma_key.g, chroma_key.b, chroma_key.threshold);
+    
+    // 7. Process frames and output to SDI (GPU→SDI direct!)
     println!("\n▶️  Processing frames → GPU→SDI Direct (Ctrl+C to stop)...");
-    println!("   Mode: ALPHA COMPOSITE (Fast - using PNG alpha channel)");
+    println!("──────────────────────────────────────────────────────────");
+    println!("   Format: {} | Resolution: {}x{} @ {:.0}fps",
+        video_format.name(), video_format.width, video_format.height, video_format.fps);
     println!("──────────────────────────────────────────────────────────");
     
     let mut frame_count = 0;
@@ -68,10 +128,11 @@ fn main() -> Result<()> {
             // Check if frame is on GPU
             match frame.data.loc {
                 common_io::MemLoc::Gpu { device } => {
-                    // Composite using PNG's alpha channel
+                    // Composite PNG over DeckLink on GPU
                     output.composite(
                         frame.data.ptr,
                         frame.data.stride,
+                        chroma_key,
                     )?;
                     
                     // Send directly from GPU to SDI (zero-copy!)
@@ -86,8 +147,8 @@ fn main() -> Result<()> {
                     let elapsed = start_time.elapsed().as_secs_f64();
                     if frame_count % 60 == 0 {
                         let fps = frame_count as f64 / elapsed;
-                        println!("Frame #{:6} | FPS: {:.2} | GPU→SDI direct (device: {})", 
-                            frame_count, fps, device);
+                        println!("Frame #{:6} | FPS: {:.2} | Format: {} | GPU device: {}", 
+                            frame_count, fps, video_format.name(), device);
                     }
                 }
                 common_io::MemLoc::Cpu => {

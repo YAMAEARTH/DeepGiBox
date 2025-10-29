@@ -142,6 +142,10 @@ static SharedFrame g_shared;
 class DvpAllocator;
 static DvpAllocator* g_allocator = nullptr;
 
+// Store detected input format for internal keying sync
+static BMDDisplayMode g_detected_input_mode = bmdModeUnknown;
+static double g_detected_input_fps = 0.0;
+
 struct DvpContext {
     bool initialized = false;
     uint32_t buffer_alignment = 1;
@@ -673,7 +677,14 @@ public:
         newDisplayMode->GetFrameRate(&fd, &ts);
         long w = newDisplayMode->GetWidth();
         long h = newDisplayMode->GetHeight();
-        fprintf(stderr, "[shim] FormatChanged: %ldx%ld, fps=%.3f\n", w, h, (ts && fd) ? (double)ts/(double)fd : 0.0);
+        double fps = (ts && fd) ? (double)ts/(double)fd : 0.0;
+        fprintf(stderr, "[shim] FormatChanged: %ldx%ld, fps=%.3f\n", w, h, fps);
+
+        // Store detected mode and fps for internal keying sync
+        g_detected_input_mode = newDisplayMode->GetDisplayMode();
+        g_detected_input_fps = fps;
+        fprintf(stderr, "[shim] Stored input mode=0x%x, fps=%.3f for output sync\n", 
+                (unsigned)g_detected_input_mode, g_detected_input_fps);
 
         // Avoid reconfiguring to the same mode/pixel format repeatedly
         static BMDDisplayMode s_lastMode = (BMDDisplayMode)0;
@@ -1374,6 +1385,45 @@ extern "C" uint64_t decklink_preview_gl_last_latency_ns() {
     return g_gl_last_latency_ns.load(std::memory_order_relaxed);
 }
 
+// ---- Get detected input format (for internal keying sync) ----
+
+extern "C" bool decklink_get_detected_input_format(int32_t* out_width, int32_t* out_height, double* out_fps, uint32_t* out_mode) {
+    if (g_detected_input_mode == bmdModeUnknown || g_detected_input_fps == 0.0) {
+        return false;
+    }
+
+    // Get mode details
+    IDeckLinkDisplayMode* mode = nullptr;
+    if (g_device) {
+        IDeckLinkInput_v14_2_1* input_tmp = nullptr;
+        if (g_device->QueryInterface(IID_IDeckLinkInput_v14_2_1, (void**)&input_tmp) == S_OK && input_tmp) {
+            IDeckLinkDisplayModeIterator* iter = nullptr;
+            if (input_tmp->GetDisplayModeIterator(&iter) == S_OK && iter) {
+                while (iter->Next(&mode) == S_OK && mode) {
+                    if (mode->GetDisplayMode() == g_detected_input_mode) {
+                        break;
+                    }
+                    mode->Release();
+                    mode = nullptr;
+                }
+                iter->Release();
+            }
+            input_tmp->Release();
+        }
+    }
+
+    if (mode) {
+        if (out_width) *out_width = mode->GetWidth();
+        if (out_height) *out_height = mode->GetHeight();
+        if (out_fps) *out_fps = g_detected_input_fps;
+        if (out_mode) *out_mode = (uint32_t)g_detected_input_mode;
+        mode->Release();
+        return true;
+    }
+
+    return false;
+}
+
 // ---- Output implementation ----
 
 namespace {
@@ -1427,40 +1477,70 @@ extern "C" bool decklink_output_open(int32_t device_index, int32_t width, int32_
         return false;
     }
 
-    // Find matching display mode
-    IDeckLinkDisplayModeIterator* mode_it = nullptr;
-    if (g_output->GetDisplayModeIterator(&mode_it) != S_OK || !mode_it) {
-        fprintf(stderr, "[shim][output] Failed to get display mode iterator\n");
-        g_output->Release();
-        g_output = nullptr;
-        g_output_device->Release();
-        g_output_device = nullptr;
-        g_output_iterator->Release();
-        g_output_iterator = nullptr;
-        return false;
-    }
-
     BMDDisplayMode chosen_mode = bmdModeUnknown;
-    IDeckLinkDisplayMode* mode = nullptr;
-    while (mode_it->Next(&mode) == S_OK && mode) {
-        long mode_width = mode->GetWidth();
-        long mode_height = mode->GetHeight();
-        BMDTimeValue frame_duration;
-        BMDTimeScale time_scale;
-        mode->GetFrameRate(&frame_duration, &time_scale);
-        double mode_fps = (double)time_scale / (double)frame_duration;
-
-        // Match resolution and framerate (with tolerance)
-        if (mode_width == width && mode_height == height && std::abs(mode_fps - fps) < 1.0) {
-            chosen_mode = mode->GetDisplayMode();
-            g_output_fps_num = (int32_t)time_scale;
-            g_output_fps_den = (int32_t)frame_duration;
-            mode->Release();
-            break;
+    
+    // CRITICAL FOR INTERNAL KEYING: Use exact input mode if available
+    if (g_detected_input_mode != bmdModeUnknown && g_detected_input_fps > 0.0) {
+        fprintf(stderr, "[shim][output] Using detected input mode=0x%x (fps=%.3f) for internal keying sync\n",
+                (unsigned)g_detected_input_mode, g_detected_input_fps);
+        chosen_mode = g_detected_input_mode;
+        
+        // Get framerate from the mode
+        IDeckLinkDisplayModeIterator* mode_it = nullptr;
+        if (g_output->GetDisplayModeIterator(&mode_it) == S_OK && mode_it) {
+            IDeckLinkDisplayMode* mode = nullptr;
+            while (mode_it->Next(&mode) == S_OK && mode) {
+                if (mode->GetDisplayMode() == g_detected_input_mode) {
+                    BMDTimeValue frame_duration;
+                    BMDTimeScale time_scale;
+                    mode->GetFrameRate(&frame_duration, &time_scale);
+                    g_output_fps_num = (int32_t)time_scale;
+                    g_output_fps_den = (int32_t)frame_duration;
+                    mode->Release();
+                    break;
+                }
+                mode->Release();
+            }
+            mode_it->Release();
         }
-        mode->Release();
+    } else {
+        // Fallback: Find matching display mode by resolution and fps
+        fprintf(stderr, "[shim][output] No detected input mode, searching for %dx%d@%.2ffps\n", 
+                width, height, fps);
+        
+        IDeckLinkDisplayModeIterator* mode_it = nullptr;
+        if (g_output->GetDisplayModeIterator(&mode_it) != S_OK || !mode_it) {
+            fprintf(stderr, "[shim][output] Failed to get display mode iterator\n");
+            g_output->Release();
+            g_output = nullptr;
+            g_output_device->Release();
+            g_output_device = nullptr;
+            g_output_iterator->Release();
+            g_output_iterator = nullptr;
+            return false;
+        }
+
+        IDeckLinkDisplayMode* mode = nullptr;
+        while (mode_it->Next(&mode) == S_OK && mode) {
+            long mode_width = mode->GetWidth();
+            long mode_height = mode->GetHeight();
+            BMDTimeValue frame_duration;
+            BMDTimeScale time_scale;
+            mode->GetFrameRate(&frame_duration, &time_scale);
+            double mode_fps = (double)time_scale / (double)frame_duration;
+
+            // Match resolution and framerate (with tolerance)
+            if (mode_width == width && mode_height == height && std::abs(mode_fps - fps) < 1.0) {
+                chosen_mode = mode->GetDisplayMode();
+                g_output_fps_num = (int32_t)time_scale;
+                g_output_fps_den = (int32_t)frame_duration;
+                mode->Release();
+                break;
+            }
+            mode->Release();
+        }
+        mode_it->Release();
     }
-    mode_it->Release();
 
     if (chosen_mode == bmdModeUnknown) {
         // Fallback: try 1080p60 for 1920x1080@60fps
@@ -1619,4 +1699,115 @@ extern "C" void decklink_output_close() {
     g_output_width = 0;
     g_output_height = 0;
     g_output_display_mode = bmdModeUnknown;
+}
+
+// ============================================================================
+// Keyer Control Functions
+// ============================================================================
+
+extern "C" bool decklink_keyer_enable_internal() {
+    if (!g_output_device) {
+        fprintf(stderr, "[shim] keyer_enable_internal: Output device not initialized\n");
+        return false;
+    }
+
+    IDeckLinkKeyer* keyer = nullptr;
+    HRESULT result = g_output_device->QueryInterface(IID_IDeckLinkKeyer, (void**)&keyer);
+    
+    if (result != S_OK || !keyer) {
+        fprintf(stderr, "[shim] keyer_enable_internal: Device does not support keying\n");
+        return false;
+    }
+
+    // Enable internal keying (false = internal, true = external)
+    result = keyer->Enable(false);
+    keyer->Release();
+    
+    if (result != S_OK) {
+        fprintf(stderr, "[shim] keyer_enable_internal: Failed to enable internal keyer (0x%08x)\n", result);
+        return false;
+    }
+
+    fprintf(stderr, "[shim] Internal keyer enabled\n");
+    return true;
+}
+
+extern "C" bool decklink_keyer_set_level(uint8_t level) {
+    if (!g_output_device) {
+        fprintf(stderr, "[shim] keyer_set_level: Output device not initialized\n");
+        return false;
+    }
+
+    IDeckLinkKeyer* keyer = nullptr;
+    HRESULT result = g_output_device->QueryInterface(IID_IDeckLinkKeyer, (void**)&keyer);
+    
+    if (result != S_OK || !keyer) {
+        fprintf(stderr, "[shim] keyer_set_level: Device does not support keying\n");
+        return false;
+    }
+
+    result = keyer->SetLevel(level);
+    keyer->Release();
+    
+    if (result != S_OK) {
+        fprintf(stderr, "[shim] keyer_set_level: Failed to set level (0x%08x)\n", result);
+        return false;
+    }
+
+    return true;
+}
+
+extern "C" bool decklink_keyer_disable() {
+    if (!g_output_device) {
+        fprintf(stderr, "[shim] keyer_disable: Output device not initialized\n");
+        return false;
+    }
+
+    IDeckLinkKeyer* keyer = nullptr;
+    HRESULT result = g_output_device->QueryInterface(IID_IDeckLinkKeyer, (void**)&keyer);
+    
+    if (result != S_OK || !keyer) {
+        fprintf(stderr, "[shim] keyer_disable: Device does not support keying\n");
+        return false;
+    }
+
+    result = keyer->Disable();
+    keyer->Release();
+    
+    if (result != S_OK) {
+        fprintf(stderr, "[shim] keyer_disable: Failed to disable keyer (0x%08x)\n", result);
+        return false;
+    }
+
+    fprintf(stderr, "[shim] Keyer disabled\n");
+    return true;
+}
+
+extern "C" int64_t decklink_get_connection_sdi() {
+    return bmdVideoConnectionSDI;
+}
+
+extern "C" bool decklink_set_video_output_connection(int64_t connection) {
+    if (!g_output_device) {
+        fprintf(stderr, "[shim] set_video_output_connection: Output device not initialized\n");
+        return false;
+    }
+
+    IDeckLinkConfiguration* config = nullptr;
+    HRESULT result = g_output_device->QueryInterface(IID_IDeckLinkConfiguration, (void**)&config);
+    
+    if (result != S_OK || !config) {
+        fprintf(stderr, "[shim] set_video_output_connection: Failed to get configuration interface\n");
+        return false;
+    }
+
+    result = config->SetInt(bmdDeckLinkConfigVideoOutputConnection, connection);
+    config->Release();
+    
+    if (result != S_OK) {
+        fprintf(stderr, "[shim] set_video_output_connection: Failed to set connection (0x%08x)\n", result);
+        return false;
+    }
+
+    return true;
 }
