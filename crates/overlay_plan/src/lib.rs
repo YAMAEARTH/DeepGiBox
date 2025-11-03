@@ -20,6 +20,9 @@ impl Stage<DetectionsPacket, OverlayPlanPacket> for PlanStage {
         let canvas = (input.from.width, input.from.height);
         let (cw, ch) = (canvas.0 as f32, canvas.1 as f32);
 
+        // Calculate scale factor for bounding box thickness (1080p = 1.0, 4K = 2.0)
+        let bbox_scale = ch / 1080.0;
+
         // Determine primary detection (highest confidence) — only needed for full UI mode
         let primary = if self.enable_full_ui {
             input
@@ -38,10 +41,14 @@ impl Stage<DetectionsPacket, OverlayPlanPacket> for PlanStage {
                 _ => ("Unknown", (255, 128, 128, 128)),// Gray
             };
             let (x, y, w, h) = (det.bbox.x, det.bbox.y, det.bbox.w, det.bbox.h);
-            // Add bounding box rectangle (baseline)
+            
+            // Scale thickness for both 1080p and 4K: 2px @ 1080p → 4px @ 4K
+            let bbox_thickness = ((2.0 * bbox_scale).round() as u8).max(1);
+            
+            // Add bounding box rectangle with scaled thickness
             ops.push(DrawOp::Rect {
                 xywh: (x, y, w, h),
-                thickness: 2,
+                thickness: bbox_thickness,
                 color: class_color,
             });
             // Corner brackets using Poly segments (approximate from temp.rs) — only in full UI
@@ -81,6 +88,9 @@ impl Stage<DetectionsPacket, OverlayPlanPacket> for PlanStage {
         // HUD elements based on primary detection (top-left info, confidence bar, bottom class)
         if self.enable_full_ui {
             if let Some(p) = primary {
+                // Calculate scale factor based on height (1080p = 1.0, 4K = 2.0)
+                let scale = ch / 1080.0;
+                
                 // Mode text derived from class
                 let mode_text = if p.class_id == 1 { "EGD" } else { "COLON" };
                 let conf = p.score.clamp(0.0, 1.0);
@@ -89,39 +99,43 @@ impl Stage<DetectionsPacket, OverlayPlanPacket> for PlanStage {
                     1 => ("Neoplastic", (255, 255, 0, 0)),        // Red
                     _ => ("Awaiting", (255, 128, 128, 128)),      // Gray
                 };
-                // Top-left info labels (date/time as in temp.rs) and mode + T value
-                let left_x = 36.0;
-                let mut y = 48.0;
+                // Top-left info labels (date/time) and mode + T value - scaled
+                let left_x = 36.0 * scale;
+                let mut y = 48.0 * scale;
                 let label_color = (255, 255, 255, 255); // White
-                ops.push(DrawOp::Label { anchor: (left_x, y), text: "27/11/2020".to_string(), font_px: 16, color: label_color });
-                y += 32.0;
-                ops.push(DrawOp::Label { anchor: (left_x, y), text: "10:21:16".to_string(), font_px: 16, color: label_color });
-                y += 20.0;
-                // Simple square icon (outline only)
-                let icon_size = 30.0;
+                let base_font_size = (16.0 * scale) as u16;
+                ops.push(DrawOp::Label { anchor: (left_x, y), text: "27/11/2020".to_string(), font_px: base_font_size, color: label_color });
+                y += 32.0 * scale;
+                ops.push(DrawOp::Label { anchor: (left_x, y), text: "10:21:16".to_string(), font_px: base_font_size, color: label_color });
+                y += 20.0 * scale;
+                // Simple square icon (outline only) - scaled
+                let icon_size = 30.0 * scale;
                 let icon_top = y;
                 let icon_color = (255, 255, 255, 255); // White
-                ops.push(DrawOp::Rect { xywh: (left_x, icon_top, icon_size, icon_size), thickness: 2, color: icon_color });
-                // Speaker-like shape using rectangles and lines (approximate)
-                let speaker_x = left_x + icon_size + 16.0;
-                ops.push(DrawOp::Rect { xywh: (speaker_x, icon_top + 4.0, 14.0, 20.0), thickness: 2, color: icon_color });
-                ops.push(DrawOp::Poly { pts: vec![(speaker_x + 14.0, icon_top + 4.0), (speaker_x + 28.0, icon_top - 4.0)], thickness: 2, color: icon_color });
-                ops.push(DrawOp::Poly { pts: vec![(speaker_x + 28.0, icon_top - 4.0), (speaker_x + 28.0, icon_top + icon_size - 4.0)], thickness: 2, color: icon_color });
-                ops.push(DrawOp::Poly { pts: vec![(speaker_x + 14.0, icon_top + icon_size + 2.0), (speaker_x + 28.0, icon_top + icon_size - 4.0)], thickness: 2, color: icon_color });
-                y = icon_top + icon_size + 20.0;
-                ops.push(DrawOp::Label { anchor: (left_x, y), text: mode_text.to_string(), font_px: 18, color: label_color });
-                y += 32.0;
-                ops.push(DrawOp::Label { anchor: (left_x, y), text: format!("T = {:.2}", conf), font_px: 16, color: label_color });
-                // Confidence bar on right side (3 segments stacked)
+                let thickness = (2.0 * scale).max(1.0) as u8;
+                ops.push(DrawOp::Rect { xywh: (left_x, icon_top, icon_size, icon_size), thickness, color: icon_color });
+                // Speaker-like shape using rectangles and lines (approximate) - scaled
+                let speaker_x = left_x + icon_size + 16.0 * scale;
+                ops.push(DrawOp::Rect { xywh: (speaker_x, icon_top + 4.0 * scale, 14.0 * scale, 20.0 * scale), thickness, color: icon_color });
+                ops.push(DrawOp::Poly { pts: vec![(speaker_x + 14.0 * scale, icon_top + 4.0 * scale), (speaker_x + 28.0 * scale, icon_top - 4.0 * scale)], thickness, color: icon_color });
+                ops.push(DrawOp::Poly { pts: vec![(speaker_x + 28.0 * scale, icon_top - 4.0 * scale), (speaker_x + 28.0 * scale, icon_top + icon_size - 4.0 * scale)], thickness, color: icon_color });
+                ops.push(DrawOp::Poly { pts: vec![(speaker_x + 14.0 * scale, icon_top + icon_size + 2.0 * scale), (speaker_x + 28.0 * scale, icon_top + icon_size - 4.0 * scale)], thickness, color: icon_color });
+                y = icon_top + icon_size + 20.0 * scale;
+                let mode_font_size = (18.0 * scale) as u16;
+                ops.push(DrawOp::Label { anchor: (left_x, y), text: mode_text.to_string(), font_px: mode_font_size, color: label_color });
+                y += 32.0 * scale;
+                ops.push(DrawOp::Label { anchor: (left_x, y), text: format!("T = {:.2}", conf), font_px: base_font_size, color: label_color });
+                // Confidence bar on right side (3 segments stacked) - scaled
                 if cw > 0.0 && ch > 0.0 {
-                    let bar_x = (cw - 80.0).max(8.0);
-                    let bar_height = 200.0;
+                    let bar_x = (cw - 80.0 * scale).max(8.0 * scale);
+                    let bar_height = 200.0 * scale;
                     let num_segments = 3;
-                    let gap = 12.0;
-                    let segment_height = ((bar_height - (num_segments as f32 - 1.0) * gap) / num_segments as f32).max(20.0);
+                    let gap = 12.0 * scale;
+                    let segment_height = ((bar_height - (num_segments as f32 - 1.0) * gap) / num_segments as f32).max(20.0 * scale);
                     let effective_bar_height = segment_height * num_segments as f32 + gap * (num_segments as f32 - 1.0);
-                    let start_y = ((ch - effective_bar_height) / 2.0).max(32.0);
+                    let start_y = ((ch - effective_bar_height) / 2.0).max(32.0 * scale);
                     let active_segments = (conf * num_segments as f32).ceil().clamp(0.0, num_segments as f32) as i32;
+                    let bar_width = 28.0 * scale;
                     for i in 0..num_segments {
                         let top = start_y + i as f32 * (segment_height + gap);
                         let seg_color = if (i as i32) < active_segments {
@@ -130,29 +144,29 @@ impl Stage<DetectionsPacket, OverlayPlanPacket> for PlanStage {
                             (128, 128, 128, 128) // Gray for inactive
                         };
                         // Filled bar
-                        ops.push(DrawOp::FillRect { xywh: (bar_x, top, 28.0, segment_height), color: seg_color });
+                        ops.push(DrawOp::FillRect { xywh: (bar_x, top, bar_width, segment_height), color: seg_color });
                         // Outline
-                        ops.push(DrawOp::Rect { xywh: (bar_x, top, 28.0, segment_height), thickness: 2, color: (255, 255, 255, 255) });
+                        ops.push(DrawOp::Rect { xywh: (bar_x, top, bar_width, segment_height), thickness, color: (255, 255, 255, 255) });
                         // Optional: draw a short tick inside for active segments (visual hint)
                         if (i as i32) < active_segments {
-                            ops.push(DrawOp::Poly { pts: vec![(bar_x + 4.0, top + 4.0), (bar_x + 24.0, top + segment_height - 4.0)], thickness: 2, color: (255, 255, 255, 255) });
+                            ops.push(DrawOp::Poly { pts: vec![(bar_x + 4.0 * scale, top + 4.0 * scale), (bar_x + 24.0 * scale, top + segment_height - 4.0 * scale)], thickness, color: (255, 255, 255, 255) });
                         }
                     }
                 }
-                // Bottom centered class box (outline + label)
+                // Bottom centered class box (outline + label) - scaled
                 if cw > 0.0 && ch > 0.0 {
                     let (text, box_color) = class_text;
-                    // Approximate a box sized to text: assume ~8 px per char width and 18 px height
-                    let approx_w = (text.len() as f32 * 8.0) + 48.0; // padding
-                    let approx_h = 18.0 + 36.0;
+                    // Approximate a box sized to text: assume ~8 px per char width and 18 px height - scaled
+                    let approx_w = (text.len() as f32 * 8.0 * scale) + 48.0 * scale; // padding
+                    let approx_h = 18.0 * scale + 36.0 * scale;
                     let origin_x = (cw - approx_w) / 2.0;
-                    let origin_y = ch - approx_h - 24.0;
+                    let origin_y = ch - approx_h - 24.0 * scale;
                     // Filled background
                     ops.push(DrawOp::FillRect { xywh: (origin_x, origin_y, approx_w, approx_h), color: box_color });
                     // Outline
-                    ops.push(DrawOp::Rect { xywh: (origin_x, origin_y, approx_w, approx_h), thickness: 2, color: (255, 255, 255, 255) });
+                    ops.push(DrawOp::Rect { xywh: (origin_x, origin_y, approx_w, approx_h), thickness, color: (255, 255, 255, 255) });
                     // Label
-                    ops.push(DrawOp::Label { anchor: (origin_x + 24.0, origin_y + approx_h - 18.0), text: text.to_string(), font_px: 18, color: (255, 255, 255, 255) });
+                    ops.push(DrawOp::Label { anchor: (origin_x + 24.0 * scale, origin_y + approx_h - 18.0 * scale), text: text.to_string(), font_px: mode_font_size, color: (255, 255, 255, 255) });
                 }
             }
         }
