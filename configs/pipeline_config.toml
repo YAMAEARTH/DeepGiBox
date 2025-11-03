@@ -1,0 +1,184 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# DeepGiBox Pipeline Configuration
+# Complete Pipeline: Capture → Overlay → Hardware Internal Keying
+# ═══════════════════════════════════════════════════════════════════════════
+
+[general]
+# Test duration in seconds (0 = unlimited)
+test_duration_seconds = 30
+# Enable debug dumps (saves frames, detections, etc. to output/test/)
+enable_debug_dumps = false
+# Dump first N frames only
+debug_dump_frame_count = 5
+# Print statistics every N frames
+stats_print_interval = 60
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CAPTURE SETTINGS
+# ═══════════════════════════════════════════════════════════════════════════
+[capture]
+# DeckLink device index (0 = first device)
+device_index = 0
+# Expected input resolution (used for config selection)
+# Options: "1080p60", "4k30"
+expected_resolution = "1080p60"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PREPROCESSING SETTINGS
+# ═══════════════════════════════════════════════════════════════════════════
+[preprocessing]
+# Output tensor size (model input size)
+output_width = 512
+output_height = 512
+# Use FP16 precision (false = FP32)
+use_fp16 = false
+# CUDA device ID
+cuda_device = 0
+# Normalization mean [R, G, B]
+mean = [0.0, 0.0, 0.0]
+# Normalization std [R, G, B]
+std = [1.0, 1.0, 1.0]
+# Chroma order for YUV422 input
+# Options: "UYVY", "YUYV"
+chroma_order = "UYVY"
+# Crop region preset
+# Options: "Olympus", "Pentax", "Fuji", "None"
+crop_region = "Olympus"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# INFERENCE SETTINGS
+# ═══════════════════════════════════════════════════════════════════════════
+[inference]
+# TensorRT engine path
+engine_path = "configs/model/v7_optimized_YOLOv5.engine"
+# TRT shim library path
+lib_path = "trt-shim/build/libtrt_shim.so"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# POSTPROCESSING SETTINGS
+# ═══════════════════════════════════════════════════════════════════════════
+[postprocessing]
+# Number of classes (must match model output)
+num_classes = 2
+# Confidence threshold (0.0 - 1.0)
+confidence_threshold = 0.25
+# NMS IoU threshold (0.0 - 1.0)
+nms_threshold = 0.45
+# Maximum detections to keep (0 = unlimited)
+max_detections = 100
+
+# Temporal smoothing
+[postprocessing.temporal_smoothing]
+# Enable temporal smoothing
+enable = true
+# Window size (number of frames)
+window_size = 4
+
+# SORT tracking
+[postprocessing.tracking]
+# Enable SORT tracking
+enable = true
+# Maximum age (frames) before track is deleted
+max_age = 30
+# Minimum confidence for tracking
+min_confidence = 0.3
+# IoU threshold for track matching
+iou_threshold = 0.3
+
+# ═══════════════════════════════════════════════════════════════════════════
+# OVERLAY PLANNING SETTINGS
+# ═══════════════════════════════════════════════════════════════════════════
+[overlay]
+# Enable full UI mode (HUD elements, confidence bars, etc.)
+enable_full_ui = true
+
+# Bounding box settings
+[overlay.bbox]
+# Base thickness for 1080p (will auto-scale for 4K)
+base_thickness = 2
+# Corner bracket length factor (0.0 - 1.0)
+corner_length_factor = 0.22
+# Corner bracket min/max length in pixels
+corner_min_length = 18.0
+corner_max_length = 40.0
+# Corner bracket thickness
+corner_thickness = 3
+
+# Label settings
+[overlay.label]
+# Font size in pixels (for 1080p, auto-scales for 4K)
+font_size = 16
+# Show confidence score
+show_confidence = true
+# Show track ID
+show_track_id = true
+# Label offset from bbox (pixels)
+label_offset_y = 10.0
+
+# Class colors (ARGB format: Alpha, Red, Green, Blue)
+[overlay.colors]
+# Class 0: Hyperplastic (Green)
+class_0 = [255, 0, 255, 0]
+# Class 1: Neoplastic (Red)  
+class_1 = [255, 255, 0, 0]
+# Unknown class (Gray)
+class_unknown = [255, 128, 128, 128]
+
+# HUD colors
+[overlay.colors.hud]
+# General text/UI elements (White)
+text = [255, 255, 255, 255]
+# Active segments (Green)
+active = [255, 0, 255, 0]
+# Inactive segments (Gray)
+inactive = [128, 128, 128, 128]
+
+# ═══════════════════════════════════════════════════════════════════════════
+# RENDERING SETTINGS
+# ═══════════════════════════════════════════════════════════════════════════
+[rendering]
+# Font file path (embedded in binary if not specified)
+# font_path = "testsupport/DejaVuSans.ttf"
+# Enable anti-aliasing for text
+text_antialiasing = true
+
+# ═══════════════════════════════════════════════════════════════════════════
+# HARDWARE KEYING SETTINGS
+# ═══════════════════════════════════════════════════════════════════════════
+[keying]
+# DeckLink output config path (will auto-select based on resolution if not set)
+# config_path_1080p = "configs/dev_1080p60_yuv422_fp16_trt.toml"
+# config_path_4k = "configs/dev_4k30_yuv422_fp16_trt.toml"
+# Keyer level (0-255, 255 = fully visible overlay)
+keyer_level = 255
+# Enable internal keying
+enable_internal_keying = true
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PERFORMANCE SETTINGS
+# ═══════════════════════════════════════════════════════════════════════════
+[performance]
+# GPU buffer pool size (for overlay rendering)
+gpu_buffer_pool_size = 10
+# Enable GPU buffer reuse
+gpu_buffer_reuse = true
+# Print detailed timing breakdown
+print_detailed_timings = true
+# Print per-frame latency
+print_per_frame_latency = true
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CLASS LABELS
+# ═══════════════════════════════════════════════════════════════════════════
+[classes]
+# Class ID to label mapping
+labels = [
+    "Hyper",      # Class 0: Hyperplastic
+    "Neo",        # Class 1: Neoplastic
+]
+
+# Class ID to mode mapping (for full UI)
+modes = [
+    "COLON",      # Class 0
+    "EGD",        # Class 1
+]
