@@ -15,6 +15,7 @@ struct RawCaptureFrame {
     height: i32,
     row_bytes: i32,
     seq: u64,
+    hw_capture_time_ns: u64, // Hardware timestamp from DeckLink (nanoseconds)
     gpu_data: *const u8,
     gpu_row_bytes: i32,
     gpu_device: u32,
@@ -75,6 +76,10 @@ pub struct CaptureSession {
     open: bool,
     source_id: u32,
     frame_count: u64,
+    // Reference points for measuring capture latency
+    first_hw_time_ns: Option<u64>,    // First STABLE hardware timestamp
+    first_system_time_ns: Option<u64>, // System time at first stable frame callback
+    last_hw_time_ns: u64,              // Last hardware timestamp (for detecting changes)
 }
 
 impl CaptureSession {
@@ -85,6 +90,9 @@ impl CaptureSession {
                 open: true,
                 source_id: device_index as u32,
                 frame_count: 0,
+                first_hw_time_ns: None,
+                first_system_time_ns: None,
+                last_hw_time_ns: 0,
             })
         } else {
             Err(CaptureError::OpenFailed)
@@ -133,11 +141,84 @@ impl CaptureSession {
             (raw.data as *mut u8, row_bytes, cpu_len, MemLoc::Cpu)
         };
 
-        // Capture timestamp (nanoseconds)
-        let t_capture_ns = std::time::SystemTime::now()
+        // Get current system time when frame becomes available in software
+        let system_time_now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64;
+
+        // Calculate TRUE capture timestamp using hardware timestamp
+        // 
+        // The hardware timestamp represents the presentation time (PTS) of the frame
+        // in the DeckLink hardware clock domain. By comparing hardware time differences
+        // with system time differences, we can measure the processing latency.
+        //
+        // IMPORTANT: Hardware timestamp may not increment on every frame initially
+        // (DeckLink buffering, format changes, etc.). Wait for stable timestamps!
+        //
+        // Algorithm:
+        //   - Wait for hardware timestamp to change (indicates stable operation)
+        //   - Record hw_time₀ and system_time₀ when timestamp first changes
+        //   - Current frame: 
+        //       Δhw = hw_time - hw_time₀ (time since reference frame in hardware clock)
+        //       Δsys = system_time - system_time₀ (time since reference callback in system clock)
+        //       Processing latency L = Δsys - Δhw
+        //       True capture time = system_time_now - L
+        let t_capture_ns = if raw.hw_capture_time_ns > 0 {
+            // Check if hardware timestamp has changed from last frame
+            let hw_changed = raw.hw_capture_time_ns != self.last_hw_time_ns;
+            self.last_hw_time_ns = raw.hw_capture_time_ns;
+            
+            // Initialize reference points when timestamp first becomes stable (changes consistently)
+            if self.first_hw_time_ns.is_none() {
+                if hw_changed && self.frame_count > 0 {
+                    // Hardware timestamp is now changing - use this as reference
+                    println!("[capture] Hardware timestamp now stable and incrementing");
+                    println!("[capture]   Reference HW timestamp: {} ns", raw.hw_capture_time_ns);
+                    println!("[capture]   System time at reference: {} ns", system_time_now);
+                    self.first_hw_time_ns = Some(raw.hw_capture_time_ns);
+                    self.first_system_time_ns = Some(system_time_now);
+                } else if self.frame_count < 5 {
+                    println!("[capture] Frame #{}: Waiting for stable HW timestamp (current: {} ns, changed: {})",
+                        self.frame_count, raw.hw_capture_time_ns, hw_changed);
+                }
+                // Use system time until we have stable reference
+                system_time_now
+            } else {
+                // Calculate elapsed time in both clock domains
+                let hw_first = self.first_hw_time_ns.unwrap();
+                let sys_first = self.first_system_time_ns.unwrap();
+                
+                let delta_hw_ns = raw.hw_capture_time_ns.saturating_sub(hw_first);
+                let delta_sys_ns = system_time_now.saturating_sub(sys_first);
+                
+                // Processing latency = system elapsed - hardware elapsed
+                // (positive means frames are delayed, negative means clock drift)
+                let processing_latency_ns = delta_sys_ns as i64 - delta_hw_ns as i64;
+                
+                // True capture time = current system time - processing latency
+                let true_capture_time = if processing_latency_ns >= 0 {
+                    system_time_now.saturating_sub(processing_latency_ns as u64)
+                } else {
+                    // Negative latency indicates clock drift - use system time
+                    system_time_now
+                };
+                
+                if self.frame_count < 15 {
+                    println!("[capture] Frame #{}: Δhw={:.2}ms, Δsys={:.2}ms, latency={:.2}ms", 
+                        self.frame_count,
+                        delta_hw_ns as f64 / 1_000_000.0,
+                        delta_sys_ns as f64 / 1_000_000.0,
+                        processing_latency_ns as f64 / 1_000_000.0);
+                }
+                
+                true_capture_time
+            }
+        } else {
+            // Fallback: no hardware timestamp - use system time directly
+            // This will show near-zero capture latency (software overhead only)
+            system_time_now
+        };
 
         // Build FrameMeta according to INSTRUCTION.md
         let meta = FrameMeta {
@@ -148,7 +229,7 @@ impl CaptureSession {
             colorspace: ColorSpace::BT709, // BT.709 colorspace
             frame_idx: self.frame_count,
             pts_ns: raw.seq, // Use sequence as PTS
-            t_capture_ns,
+            t_capture_ns, // Capture timestamp (converted from hardware clock if available)
             stride_bytes: raw.row_bytes as u32,
             crop_region: None,
         };

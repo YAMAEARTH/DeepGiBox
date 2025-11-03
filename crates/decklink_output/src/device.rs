@@ -9,6 +9,9 @@ use std::path::Path;
 extern "C" {
     fn decklink_output_open(device_index: c_int, width: c_int, height: c_int, fps: c_double) -> bool;
     fn decklink_output_send_frame_gpu(gpu_bgra_data: *const u8, gpu_pitch: c_int, width: c_int, height: c_int) -> bool;
+    fn decklink_output_schedule_frame_gpu(gpu_bgra_data: *const u8, gpu_pitch: c_int, width: c_int, height: c_int, display_time: u64, display_duration: u64) -> bool;
+    fn decklink_output_start_scheduled_playback(start_time: u64, time_scale: c_double) -> bool;
+    fn decklink_output_stop_scheduled_playback() -> bool;
     fn decklink_output_close();
     
     // Hardware keying functions
@@ -25,6 +28,15 @@ extern "C" {
         out_fps: *mut c_double,
         out_mode: *mut u32,
     ) -> bool;
+    
+    // Get frame timing from display mode (requirement #1)
+    fn decklink_output_get_frame_timing(out_frame_duration: *mut i64, out_time_scale: *mut i64) -> bool;
+    
+    // Get hardware reference clock (requirement #3)
+    fn decklink_output_get_hardware_time(out_time: *mut u64, out_timebase: *mut u64) -> bool;
+    
+    // Get buffered frame count (requirement #4)
+    fn decklink_output_get_buffered_frame_count(out_count: *mut u32) -> bool;
 }
 
 /// Output device error type
@@ -102,6 +114,7 @@ pub struct OutputDevice {
     fps: f64,
     device_index: i32,
     is_open: bool,
+    scheduled_playback_active: bool,
 }
 
 impl OutputDevice {
@@ -188,7 +201,7 @@ impl OutputDevice {
         Ok(())
     }
 
-    /// Submit an output request to the device
+    /// Submit an output request to the device (synchronous mode)
     pub fn submit(&mut self, request: OutputRequest) -> Result<(), OutputDeviceError> {
         if !self.is_open {
             return Err(OutputDeviceError::DeviceNotAvailable("Device not open".to_string()));
@@ -237,7 +250,175 @@ impl OutputDevice {
         
         Ok(())
     }
-
+    
+    /// Schedule a frame for async playback
+    pub fn schedule_frame(&mut self, request: OutputRequest, display_time: u64, display_duration: u64) -> Result<(), OutputDeviceError> {
+        if !self.is_open {
+            return Err(OutputDeviceError::DeviceNotAvailable("Device not open".to_string()));
+        }
+        
+        // Get video frame from request
+        let video = request.video.ok_or_else(|| {
+            OutputDeviceError::ConfigError("No video frame provided".to_string())
+        })?;
+        
+        // Validate frame size
+        if video.meta.width != self.width || video.meta.height != self.height {
+            return Err(OutputDeviceError::FrameSizeMismatch {
+                expected_width: self.width,
+                expected_height: self.height,
+                actual_width: video.meta.width,
+                actual_height: video.meta.height,
+            });
+        }
+        
+        // Check if frame is on GPU
+        match video.data.loc {
+            MemLoc::Gpu { .. } => {
+                // Schedule GPU frame for async playback
+                let success = unsafe {
+                    decklink_output_schedule_frame_gpu(
+                        video.data.ptr,
+                        video.data.stride as c_int,
+                        self.width as c_int,
+                        self.height as c_int,
+                        display_time,
+                        display_duration,
+                    )
+                };
+                
+                if !success {
+                    return Err(OutputDeviceError::DeviceNotAvailable(
+                        "Failed to schedule GPU frame for DeckLink output".to_string()
+                    ));
+                }
+            }
+            MemLoc::Cpu => {
+                return Err(OutputDeviceError::ConfigError(
+                    "CPU frames not supported yet - frame must be on GPU".to_string()
+                ));
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Start scheduled playback (async mode)
+    pub fn start_scheduled_playback(&mut self, start_time: u64, time_scale: f64) -> Result<(), OutputDeviceError> {
+        if !self.is_open {
+            return Err(OutputDeviceError::DeviceNotAvailable("Device not open".to_string()));
+        }
+        
+        let success = unsafe {
+            decklink_output_start_scheduled_playback(start_time, time_scale)
+        };
+        
+        if !success {
+            return Err(OutputDeviceError::ConfigError(
+                "Failed to start scheduled playback".to_string()
+            ));
+        }
+        
+        self.scheduled_playback_active = true;
+        Ok(())
+    }
+    
+    /// Stop scheduled playback
+    pub fn stop_scheduled_playback(&mut self) -> Result<(), OutputDeviceError> {
+        if !self.is_open {
+            return Err(OutputDeviceError::DeviceNotAvailable("Device not open".to_string()));
+        }
+        
+        if !self.scheduled_playback_active {
+            return Ok(()); // Already stopped
+        }
+        
+        let success = unsafe {
+            decklink_output_stop_scheduled_playback()
+        };
+        
+        if !success {
+            return Err(OutputDeviceError::ConfigError(
+                "Failed to stop scheduled playback".to_string()
+            ));
+        }
+        
+        self.scheduled_playback_active = false;
+        Ok(())
+    }
+    
+    /// Check if scheduled playback is active
+    pub fn is_scheduled_playback_active(&self) -> bool {
+        self.scheduled_playback_active
+    }
+    
+    /// Get frame timing from display mode (requirement #1)
+    pub fn get_frame_timing(&self) -> Result<(i64, i64), OutputDeviceError> {
+        if !self.is_open {
+            return Err(OutputDeviceError::DeviceNotAvailable("Device not open".to_string()));
+        }
+        
+        let mut frame_duration = 0i64;
+        let mut time_scale = 0i64;
+        
+        let success = unsafe {
+            decklink_output_get_frame_timing(&mut frame_duration as *mut i64, &mut time_scale as *mut i64)
+        };
+        
+        if !success {
+            return Err(OutputDeviceError::ConfigError(
+                "Failed to get frame timing from display mode".to_string()
+            ));
+        }
+        
+        Ok((frame_duration, time_scale))
+    }
+    
+    /// Get hardware reference clock time (requirement #3)
+    /// Returns (time_in_ticks, timebase_hz)
+    /// Use DIFFERENCE between calls to calculate elapsed time
+    pub fn get_hardware_time(&self) -> Result<(u64, u64), OutputDeviceError> {
+        if !self.is_open {
+            return Err(OutputDeviceError::DeviceNotAvailable("Device not open".to_string()));
+        }
+        
+        let mut time = 0u64;
+        let mut timebase = 0u64;
+        
+        let success = unsafe {
+            decklink_output_get_hardware_time(&mut time as *mut u64, &mut timebase as *mut u64)
+        };
+        
+        if !success {
+            return Err(OutputDeviceError::ConfigError(
+                "Failed to get hardware reference clock".to_string()
+            ));
+        }
+        
+        Ok((time, timebase))
+    }
+    
+    /// Get buffered video frame count (requirement #4)
+    pub fn get_buffered_frame_count(&self) -> Result<u32, OutputDeviceError> {
+        if !self.is_open {
+            return Err(OutputDeviceError::DeviceNotAvailable("Device not open".to_string()));
+        }
+        
+        let mut count = 0u32;
+        
+        let success = unsafe {
+            decklink_output_get_buffered_frame_count(&mut count as *mut u32)
+        };
+        
+        if !success {
+            return Err(OutputDeviceError::ConfigError(
+                "Failed to get buffered frame count".to_string()
+            ));
+        }
+        
+        Ok(count)
+    }
+    
     /// Get the last submitted frame
     pub fn last_frame(&self) -> Option<&OutputFrame> {
         // TODO: Implement frame tracking
@@ -249,6 +430,12 @@ impl Drop for OutputDevice {
     fn drop(&mut self) {
         if self.is_open {
             println!("🔌 Closing DeckLink output device {}...", self.device_index);
+            
+            // Stop scheduled playback if active
+            if self.scheduled_playback_active {
+                let _ = self.stop_scheduled_playback();
+            }
+            
             unsafe {
                 decklink_output_close();
             }
@@ -298,6 +485,7 @@ pub fn from_path<P: AsRef<Path>>(config_path: P) -> Result<OutputDevice, OutputD
         fps,
         device_index,
         is_open: true,
+        scheduled_playback_active: false,
     })
 }
 

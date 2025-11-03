@@ -95,6 +95,7 @@ struct CaptureFrame {
     int32_t height;
     int32_t row_bytes; // bytes per row in data
     uint64_t seq;      // monotonically increasing frame sequence
+    uint64_t hw_capture_time_ns; // Hardware timestamp from DeckLink (nanoseconds)
     const uint8_t* gpu_data;
     int32_t gpu_row_bytes;
     uint32_t gpu_device;
@@ -108,6 +109,9 @@ void decklink_capture_close();
 bool decklink_output_open(int32_t device_index, int32_t width, int32_t height, double fps);
 bool decklink_output_send_frame(const uint8_t* bgra_data, int32_t width, int32_t height);
 bool decklink_output_send_frame_gpu(const uint8_t* gpu_bgra_data, int32_t gpu_pitch, int32_t width, int32_t height);
+bool decklink_output_schedule_frame_gpu(const uint8_t* gpu_bgra_data, int32_t gpu_pitch, int32_t width, int32_t height, uint64_t display_time, uint64_t display_duration);
+bool decklink_output_start_scheduled_playback(uint64_t start_time, double time_scale);
+bool decklink_output_stop_scheduled_playback();
 void decklink_output_close();
 
 } // extern "C"
@@ -123,6 +127,7 @@ struct SharedFrame {
     int32_t row_bytes = 0; // bytes per input row as reported by DeckLink
     std::mutex mtx;
     uint64_t seq = 0;
+    uint64_t hw_capture_time_ns = 0; // Hardware timestamp from DeckLink (nanoseconds)
     uint8_t* gpu_ptr = nullptr;
     size_t gpu_pitch = 0;
     int32_t gpu_width = 0;
@@ -829,10 +834,48 @@ public:
             g_shared.row_bytes = srcStride;
             g_shared.gpu_ready = false;
 
+            // Get hardware capture timestamp from DeckLink frame
+            // Use nanosecond timebase (1,000,000,000 Hz) for direct conversion
+            BMDTimeValue hw_frame_time = 0;
+            BMDTimeValue hw_frame_duration = 0;
+            BMDTimeScale hw_timebase = 1000000000; // nanoseconds
+            
+            // Try GetHardwareReferenceTimestamp first (more accurate)
+            HRESULT hr_hw = videoFrame->GetHardwareReferenceTimestamp(hw_timebase, &hw_frame_time, &hw_frame_duration);
+            if (hr_hw != S_OK) {
+                // Fallback to GetStreamTime if hardware timestamp not available
+                hr_hw = videoFrame->GetStreamTime(&hw_frame_time, &hw_frame_duration, hw_timebase);
+            }
+            
+            if (hr_hw == S_OK) {
+                g_shared.hw_capture_time_ns = static_cast<uint64_t>(hw_frame_time);
+            } else {
+                // If no hardware timestamp available, use current system time as fallback
+                auto now = std::chrono::system_clock::now();
+                auto duration = now.time_since_epoch();
+                g_shared.hw_capture_time_ns = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count()
+                );
+            }
+
             static bool s_logged = false;
+            static int log_count = 0;
             if (!s_logged) {
                 fprintf(stderr, "[shim] First frame: %dx%d, rb=%ld, pix=0x%x\n", w, h, (long)rowBytes, (unsigned)pixfmt);
                 s_logged = true;
+            }
+            
+            // Log first 10 frames to debug hardware timestamp behavior
+            if (log_count < 10) {
+                if (hr_hw == S_OK) {
+                    fprintf(stderr, "[shim] Frame #%d: HW timestamp = %llu ns (delta from first: %lld ns)\n", 
+                        log_count, 
+                        (unsigned long long)g_shared.hw_capture_time_ns,
+                        (long long)(g_shared.hw_capture_time_ns - (log_count == 0 ? g_shared.hw_capture_time_ns : 0)));
+                } else {
+                    fprintf(stderr, "[shim] Frame #%d: HW timestamp not available (hr=0x%08x)\n", log_count, (unsigned)hr_hw);
+                }
+                log_count++;
             }
             g_shared.seq++;
 
@@ -1140,6 +1183,7 @@ extern "C" bool decklink_capture_get_frame(CaptureFrame* out) {
         out->height = 0;
         out->row_bytes = 0;
         out->seq = 0;
+        out->hw_capture_time_ns = 0;
         out->gpu_data = nullptr;
         out->gpu_row_bytes = 0;
         out->gpu_device = 0;
@@ -1150,6 +1194,7 @@ extern "C" bool decklink_capture_get_frame(CaptureFrame* out) {
     out->height = g_shared.height;
     out->row_bytes = g_shared.row_bytes;
     out->seq = g_shared.seq;
+    out->hw_capture_time_ns = g_shared.hw_capture_time_ns; // Pass hardware timestamp to Rust
     if (g_shared.gpu_ready && g_shared.gpu_ptr) {
         out->gpu_data = g_shared.gpu_ptr;
         out->gpu_row_bytes = static_cast<int32_t>(g_shared.gpu_pitch);
@@ -1185,6 +1230,7 @@ extern "C" void decklink_capture_close() {
         g_shared.height = 0;
         g_shared.row_bytes = 0;
         g_shared.seq = 0;
+        g_shared.hw_capture_time_ns = 0;
         if (g_shared.cuda_stream || g_shared.gpu_ptr || g_shared.cuda_available) {
             cudaError_t err = cudaSetDevice(static_cast<int>(g_shared.cuda_device));
             if (err != cudaSuccess) {
@@ -1435,7 +1481,69 @@ namespace {
     static int32_t g_output_height = 0;
     static int32_t g_output_fps_num = 60;
     static int32_t g_output_fps_den = 1;
+    static bool g_scheduled_playback_running = false;
+    static std::atomic<uint64_t> g_scheduled_frames_count{0};
+    static std::atomic<uint64_t> g_completed_frames_count{0};
 }
+
+// Scheduled frame completion callback
+class ScheduledFrameCallback : public IDeckLinkVideoOutputCallback_v14_2_1 {
+public:
+    ScheduledFrameCallback() : m_ref(1) {}
+    virtual ~ScheduledFrameCallback() = default;
+
+    HRESULT QueryInterface(REFIID iid, void** ppv) override {
+        if (!ppv) return E_POINTER;
+        if (memcmp(&iid, &kIID_IUnknown, sizeof(REFIID)) == 0 ||
+            memcmp(&iid, &IID_IDeckLinkVideoOutputCallback_v14_2_1, sizeof(REFIID)) == 0) {
+            *ppv = static_cast<IDeckLinkVideoOutputCallback_v14_2_1*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+
+    ULONG AddRef() override { return ++m_ref; }
+    ULONG Release() override {
+        ULONG r = --m_ref;
+        if (r == 0) delete this;
+        return r;
+    }
+
+    HRESULT ScheduledFrameCompleted(IDeckLinkVideoFrame_v14_2_1* completedFrame, BMDOutputFrameCompletionResult result) override {
+        g_completed_frames_count.fetch_add(1, std::memory_order_relaxed);
+        
+        // Log completion result for debugging
+        static std::atomic<uint64_t> s_last_log_frame{0};
+        uint64_t current_frame = g_completed_frames_count.load(std::memory_order_relaxed);
+        
+        if (current_frame % 300 == 0 || current_frame < 10) { // Log every 5 seconds @ 60fps
+            const char* result_str = "Unknown";
+            switch (result) {
+                case bmdOutputFrameCompleted: result_str = "Completed"; break;
+                case bmdOutputFrameDisplayedLate: result_str = "DisplayedLate"; break;
+                case bmdOutputFrameDropped: result_str = "Dropped"; break;
+                case bmdOutputFrameFlushed: result_str = "Flushed"; break;
+            }
+            fprintf(stderr, "[shim][async] Frame %llu completed: %s\n", 
+                    (unsigned long long)current_frame, result_str);
+        }
+        
+        return S_OK;
+    }
+
+    HRESULT ScheduledPlaybackHasStopped() override {
+        fprintf(stderr, "[shim][async] Scheduled playback has stopped\n");
+        g_scheduled_playback_running = false;
+        return S_OK;
+    }
+
+private:
+    std::atomic<ULONG> m_ref;
+};
+
+static ScheduledFrameCallback* g_scheduled_callback = nullptr;
 
 extern "C" bool decklink_output_open(int32_t device_index, int32_t width, int32_t height, double fps) {
     if (g_output) {
@@ -1564,9 +1672,27 @@ extern "C" bool decklink_output_open(int32_t device_index, int32_t width, int32_
     g_output_width = width;
     g_output_height = height;
 
+    // IMPORTANT: Set up scheduled frame callback BEFORE EnableVideoOutput (per SDK docs)
+    if (!g_scheduled_callback) {
+        g_scheduled_callback = new ScheduledFrameCallback();
+        HRESULT callback_hr = g_output->SetScheduledFrameCompletionCallback(g_scheduled_callback);
+        if (callback_hr != S_OK) {
+            fprintf(stderr, "[shim][output] SetScheduledFrameCompletionCallback failed hr=0x%08x\n", (unsigned)callback_hr);
+            g_scheduled_callback->Release();
+            g_scheduled_callback = nullptr;
+            // Continue anyway - callback is optional for sync mode
+        } else {
+            fprintf(stderr, "[shim][output] Scheduled frame callback set up successfully\n");
+        }
+    }
+
     HRESULT enable_hr = g_output->EnableVideoOutput(chosen_mode, bmdVideoOutputFlagDefault);
     if (enable_hr != S_OK) {
         fprintf(stderr, "[shim][output] EnableVideoOutput failed hr=0x%08x\n", (unsigned)enable_hr);
+        if (g_scheduled_callback) {
+            g_scheduled_callback->Release();
+            g_scheduled_callback = nullptr;
+        }
         g_output->Release();
         g_output = nullptr;
         g_output_device->Release();
@@ -1682,7 +1808,223 @@ extern "C" bool decklink_output_send_frame_gpu(const uint8_t* gpu_bgra_data, int
     return true;
 }
 
+// ============================================================================
+// Async Scheduled Playback Functions
+// ============================================================================
+
+extern "C" bool decklink_output_schedule_frame_gpu(const uint8_t* gpu_bgra_data, int32_t gpu_pitch, int32_t width, int32_t height, uint64_t display_time, uint64_t display_duration) {
+    if (!g_output || !gpu_bgra_data) {
+        return false;
+    }
+
+    if (width != g_output_width || height != g_output_height) {
+        fprintf(stderr, "[shim][output] Frame dimension mismatch: expected %dx%d, got %dx%d\n",
+                g_output_width, g_output_height, width, height);
+        return false;
+    }
+
+    // Create video frame (BGRA format: bmdFormat8BitBGRA)
+    IDeckLinkMutableVideoFrame_v14_2_1* frame = nullptr;
+    int32_t row_bytes = width * 4; // BGRA = 4 bytes per pixel
+    HRESULT create_hr = g_output->CreateVideoFrame(width, height, row_bytes, bmdFormat8BitBGRA, bmdFrameFlagDefault, &frame);
+    if (create_hr != S_OK || !frame) {
+        fprintf(stderr, "[shim][output] CreateVideoFrame failed hr=0x%08x\n", (unsigned)create_hr);
+        return false;
+    }
+
+    // Get frame buffer pointer (CPU-side)
+    void* frame_bytes = nullptr;
+    HRESULT getbytes_hr = frame->GetBytes(&frame_bytes);
+    if (getbytes_hr != S_OK || !frame_bytes) {
+        fprintf(stderr, "[shim][output] GetBytes failed hr=0x%08x\n", (unsigned)getbytes_hr);
+        frame->Release();
+        return false;
+    }
+
+    // Copy directly from GPU to DeckLink frame buffer (GPU → CPU)
+    cudaError_t copy_err = cudaMemcpy2D(
+        frame_bytes,           // dst (CPU/DeckLink buffer)
+        row_bytes,             // dst pitch
+        gpu_bgra_data,         // src (GPU)
+        gpu_pitch,             // src pitch
+        row_bytes,             // width in bytes
+        height,                // height
+        cudaMemcpyDeviceToHost
+    );
+
+    if (copy_err != cudaSuccess) {
+        fprintf(stderr, "[shim][output] cudaMemcpy2D failed: %s\n", cudaGetErrorString(copy_err));
+        frame->Release();
+        return false;
+    }
+
+    // Schedule frame for async playback
+    // Per SDK: display_time and display_duration are in timebase units
+    // timeScale parameter should match the timebase used (e.g., 90000 for 90kHz)
+    // For standard video, use frame rate timebase
+    BMDTimeScale timebase = (BMDTimeScale)g_output_fps_num; // Use fps numerator as timebase
+    
+    HRESULT schedule_hr = g_output->ScheduleVideoFrame(frame, display_time, display_duration, timebase);
+    frame->Release();
+
+    if (schedule_hr != S_OK) {
+        fprintf(stderr, "[shim][output] ScheduleVideoFrame failed hr=0x%08x (display_time=%llu, duration=%llu, timebase=%d)\n",
+                (unsigned)schedule_hr, (unsigned long long)display_time, (unsigned long long)display_duration, (int)timebase);
+        return false;
+    }
+
+    uint64_t frame_num = g_scheduled_frames_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (frame_num <= 5 || frame_num % 60 == 0) {
+        fprintf(stderr, "[shim][output] Scheduled frame #%llu (time=%llu, duration=%llu)\n",
+                (unsigned long long)frame_num, (unsigned long long)display_time, (unsigned long long)display_duration);
+    }
+    return true;
+}
+
+extern "C" bool decklink_output_start_scheduled_playback(uint64_t start_time, double time_scale) {
+    if (!g_output) {
+        fprintf(stderr, "[shim][output] start_scheduled_playback: Output not initialized\n");
+        return false;
+    }
+
+    // Callback should already be set up in decklink_output_open
+    if (!g_scheduled_callback) {
+        fprintf(stderr, "[shim][output] Warning: Scheduled callback not set up, trying to set now\n");
+        g_scheduled_callback = new ScheduledFrameCallback();
+        HRESULT callback_hr = g_output->SetScheduledFrameCompletionCallback(g_scheduled_callback);
+        if (callback_hr != S_OK) {
+            fprintf(stderr, "[shim][output] SetScheduledFrameCompletionCallback failed hr=0x%08x\n", (unsigned)callback_hr);
+            g_scheduled_callback->Release();
+            g_scheduled_callback = nullptr;
+            return false;
+        }
+    }
+
+    // Start scheduled playback
+    // Per SDK: start_time is in timebase units, time_scale is the timebase (e.g., 90000 for 90kHz)
+    HRESULT start_hr = g_output->StartScheduledPlayback(start_time, time_scale, 1.0);
+    if (start_hr != S_OK) {
+        fprintf(stderr, "[shim][output] StartScheduledPlayback failed hr=0x%08x (start_time=%llu, time_scale=%.0f)\n",
+                (unsigned)start_hr, (unsigned long long)start_time, time_scale);
+        return false;
+    }
+
+    g_scheduled_playback_running = true;
+    fprintf(stderr, "[shim][output] Scheduled playback started successfully (start_time=%llu, time_scale=%.0f)\n",
+            (unsigned long long)start_time, time_scale);
+    return true;
+}
+
+extern "C" bool decklink_output_stop_scheduled_playback() {
+    if (!g_output) {
+        return false;
+    }
+
+    if (!g_scheduled_playback_running) {
+        return true; // Already stopped
+    }
+
+    HRESULT stop_hr = g_output->StopScheduledPlayback(0, nullptr, 0);
+    if (stop_hr != S_OK) {
+        fprintf(stderr, "[shim][output] StopScheduledPlayback failed hr=0x%08x\n", (unsigned)stop_hr);
+        return false;
+    }
+
+    g_scheduled_playback_running = false;
+    fprintf(stderr, "[shim][output] Scheduled playback stopped\n");
+    return true;
+}
+
+// Get frameDuration and timeScale from display mode (requirement #1)
+extern "C" bool decklink_output_get_frame_timing(int64_t* out_frame_duration, int64_t* out_time_scale) {
+    if (!g_output || !out_frame_duration || !out_time_scale) {
+        return false;
+    }
+
+    IDeckLinkDisplayModeIterator* mode_it = nullptr;
+    if (g_output->GetDisplayModeIterator(&mode_it) != S_OK || !mode_it) {
+        fprintf(stderr, "[shim][output] Failed to get display mode iterator\n");
+        return false;
+    }
+
+    IDeckLinkDisplayMode* mode = nullptr;
+    bool found = false;
+    while (mode_it->Next(&mode) == S_OK && mode) {
+        if (mode->GetDisplayMode() == g_output_display_mode) {
+            BMDTimeValue frame_duration;
+            BMDTimeScale time_scale;
+            mode->GetFrameRate(&frame_duration, &time_scale);
+            *out_frame_duration = frame_duration;
+            *out_time_scale = time_scale;
+            found = true;
+            mode->Release();
+            break;
+        }
+        mode->Release();
+    }
+    mode_it->Release();
+
+    if (!found) {
+        fprintf(stderr, "[shim][output] Display mode 0x%x not found\n", (unsigned)g_output_display_mode);
+        return false;
+    }
+
+    fprintf(stderr, "[shim][output] Frame timing: duration=%lld, timeScale=%lld (fps=%.2f)\n",
+            (long long)*out_frame_duration, (long long)*out_time_scale,
+            (double)*out_time_scale / (double)*out_frame_duration);
+    return true;
+}
+
+// Get hardware reference clock (requirement #3)
+// Returns absolute hardware time in ticks - use DIFFERENCE between calls for elapsed time
+extern "C" bool decklink_output_get_hardware_time(uint64_t* out_time, uint64_t* out_timebase) {
+    if (!g_output || !out_time || !out_timebase) {
+        return false;
+    }
+    
+    BMDTimeValue time_in_ticks = 0;
+    BMDTimeScale timebase_hz = (BMDTimeScale)g_output_fps_num; // Use output timebase
+    
+    HRESULT hr = g_output->GetHardwareReferenceClock(timebase_hz, &time_in_ticks, nullptr, nullptr);
+    if (hr != S_OK) {
+        fprintf(stderr, "[shim][output] GetHardwareReferenceClock failed hr=0x%08x\n", (unsigned)hr);
+        return false;
+    }
+    
+    *out_time = (uint64_t)time_in_ticks;
+    *out_timebase = (uint64_t)timebase_hz;
+    return true;
+}
+
+// Get buffered video frame count for queue management (requirement #4)
+extern "C" bool decklink_output_get_buffered_frame_count(uint32_t* out_count) {
+    if (!g_output || !out_count) {
+        return false;
+    }
+
+    uint32_t buffered = 0;
+    HRESULT hr = g_output->GetBufferedVideoFrameCount(&buffered);
+    if (hr != S_OK) {
+        fprintf(stderr, "[shim][output] GetBufferedVideoFrameCount failed hr=0x%08x\n", (unsigned)hr);
+        return false;
+    }
+
+    *out_count = buffered;
+    return true;
+}
+
 extern "C" void decklink_output_close() {
+    // Stop scheduled playback if running
+    if (g_scheduled_playback_running) {
+        decklink_output_stop_scheduled_playback();
+    }
+
+    // Release callback
+    if (g_scheduled_callback) {
+        g_scheduled_callback->Release();
+        g_scheduled_callback = nullptr;
+    }
+
     if (g_output) {
         g_output->DisableVideoOutput();
         g_output->Release();
@@ -1699,6 +2041,9 @@ extern "C" void decklink_output_close() {
     g_output_width = 0;
     g_output_height = 0;
     g_output_display_mode = bmdModeUnknown;
+    g_scheduled_playback_running = false;
+    g_scheduled_frames_count.store(0, std::memory_order_relaxed);
+    g_completed_frames_count.store(0, std::memory_order_relaxed);
 }
 
 // ============================================================================
