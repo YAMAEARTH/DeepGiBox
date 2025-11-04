@@ -1,177 +1,531 @@
 use anyhow::Result;
 use common_io::{DetectionsPacket, OverlayPlanPacket, DrawOp, Stage};
+use std::cmp::Ordering;
 
 pub fn from_path(cfg: &str) -> Result<PlanStage> {
-    // Simple, permissive parser: enable full UI if cfg contains any of these keywords
-    let cfg_lc = cfg.to_ascii_lowercase();
-    let enable_full_ui = ["full", "full_ui", "ui=full", "hud"].iter().any(|k| cfg_lc.contains(k));
-    Ok(PlanStage { enable_full_ui })
+    PlanStage::from_path(cfg)
 }
 
 pub struct PlanStage {
     pub enable_full_ui: bool,
 }
 
+fn class_palette(class_id: u32) -> (&'static str, &'static str, (u8, u8, u8, u8)) {
+    match class_id {
+        0 => ("Hyper", "Hyperplastic", (0, 255, 0, 255)),
+        1 => ("Neo", "Neoplastic", (255, 64, 64, 255)),
+        _ => ("Unknown", "Awaiting", (128, 128, 128, 255)),
+    }
+}
+
+fn scaled_font_px(base_px: f32, scale: f32, min_px: i32) -> u16 {
+    let px = (base_px * scale).round() as i32;
+    let result = if px < min_px { min_px } else { px };
+    result.max(1).min(u16::MAX as i32) as u16
+}
+
+fn scaled_thickness(base_px: f32, scale: f32) -> u8 {
+    let px = (base_px * scale).round() as i32;
+    let result = if px < 1 { 1 } else { px };
+    result.min(u8::MAX as i32) as u8
+}
+
 impl Stage<DetectionsPacket, OverlayPlanPacket> for PlanStage {
     fn process(&mut self, input: DetectionsPacket) -> OverlayPlanPacket {
         let mut ops = Vec::new();
 
-        // Capture canvas dimensions before moving input.from
         let canvas = (input.from.width, input.from.height);
         let (cw, ch) = (canvas.0 as f32, canvas.1 as f32);
 
-        // Calculate scale factor for bounding box thickness (1080p = 1.0, 4K = 2.0)
-        let bbox_scale = ch / 1080.0;
+        if cw <= 0.0 || ch <= 0.0 {
+            eprintln!("Invalid canvas dimensions: ({}, {})", cw, ch);
+            return OverlayPlanPacket { from: input.from, ops, canvas };
+        }
 
-        // Determine primary detection (highest confidence) — only needed for full UI mode
-        let primary = if self.enable_full_ui {
-            input
-                .items
-                .iter()
-                .max_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal))
-        } else {
-            None
-        };
+        let ui_scale = (ch / 1080.0).max(0.1);
 
-        // Convert each detection into drawing operations
+        let best_detection = input
+            .items
+            .iter()
+            .max_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(Ordering::Equal));
+        let best_score = best_detection.map(|d| d.score.clamp(0.0, 1.0)).unwrap_or(0.0);
+        let (_, best_long_label, best_color) = best_detection
+            .map(|d| class_palette(d.class_id as u32))
+            .unwrap_or(("None", "Awaiting", (80, 80, 80, 255)));
+
+        if self.enable_full_ui {
+            let label_color = (238, 240, 230, 255);
+            let accent_color = (200, 200, 200, 255);
+            let icon_outline = scaled_thickness(2.0, ui_scale);
+            let icon_x = 24.0 * ui_scale;
+            let icon_size = (28.0 * ui_scale).max(14.0);
+            let text_x = icon_x + icon_size + 16.0 * ui_scale;
+            let mut row_y = 44.0 * ui_scale;
+            let row_gap = 42.0 * ui_scale;
+            let font_regular = scaled_font_px(20.0, ui_scale, 14);
+
+            ops.push(DrawOp::Rect {
+                xywh: (icon_x, row_y, icon_size, icon_size),
+                thickness: icon_outline,
+                color: accent_color,
+            });
+            ops.push(DrawOp::Poly {
+                pts: vec![
+                    (icon_x + 4.0 * ui_scale, row_y + 6.0 * ui_scale),
+                    (icon_x + icon_size - 4.0 * ui_scale, row_y + 6.0 * ui_scale),
+                ],
+                thickness: icon_outline,
+                color: accent_color,
+            });
+            ops.push(DrawOp::Label {
+                anchor: (text_x, row_y),
+                text: "Patient ID".to_string(),
+                font_px: font_regular,
+                color: label_color,
+            });
+            row_y += row_gap;
+
+            let mid_y = row_y + icon_size * 0.5;
+            ops.push(DrawOp::Poly {
+                pts: vec![
+                    (icon_x + icon_size * 0.2, row_y + icon_size * 0.2),
+                    (icon_x + icon_size * 0.5, row_y),
+                    (icon_x + icon_size * 0.8, row_y + icon_size * 0.2),
+                ],
+                thickness: icon_outline,
+                color: accent_color,
+            });
+            ops.push(DrawOp::Poly {
+                pts: vec![
+                    (icon_x + icon_size * 0.2, mid_y),
+                    (icon_x + icon_size * 0.8, mid_y),
+                ],
+                thickness: icon_outline,
+                color: accent_color,
+            });
+            ops.push(DrawOp::Label {
+                anchor: (text_x, row_y),
+                text: "Patient Name".to_string(),
+                font_px: font_regular,
+                color: label_color,
+            });
+            row_y += row_gap;
+
+            ops.push(DrawOp::Label {
+                anchor: (text_x, row_y),
+                text: "Patient name (add. info)".to_string(),
+                font_px: font_regular,
+                color: label_color,
+            });
+            row_y += row_gap;
+
+            ops.push(DrawOp::Rect {
+                xywh: (icon_x, row_y, icon_size, icon_size),
+                thickness: icon_outline,
+                color: accent_color,
+            });
+            ops.push(DrawOp::Poly {
+                pts: vec![
+                    (icon_x, row_y + icon_size * 0.3),
+                    (icon_x + icon_size, row_y + icon_size * 0.3),
+                ],
+                thickness: icon_outline,
+                color: accent_color,
+            });
+            ops.push(DrawOp::Label {
+                anchor: (text_x, row_y),
+                text: "DOB".to_string(),
+                font_px: font_regular,
+                color: label_color,
+            });
+            ops.push(DrawOp::Label {
+                anchor: (text_x + 148.0 * ui_scale, row_y),
+                text: "Age".to_string(),
+                font_px: font_regular,
+                color: label_color,
+            });
+            row_y += row_gap;
+
+            ops.push(DrawOp::Poly {
+                pts: vec![
+                    (icon_x + icon_size * 0.2, row_y),
+                    (icon_x + icon_size * 0.8, row_y + icon_size),
+                ],
+                thickness: icon_outline,
+                color: accent_color,
+            });
+            ops.push(DrawOp::Poly {
+                pts: vec![
+                    (icon_x + icon_size * 0.8, row_y),
+                    (icon_x + icon_size * 0.2, row_y + icon_size),
+                ],
+                thickness: icon_outline,
+                color: accent_color,
+            });
+            ops.push(DrawOp::Label {
+                anchor: (text_x, row_y),
+                text: "Sex".to_string(),
+                font_px: font_regular,
+                color: label_color,
+            });
+            row_y += row_gap;
+
+            ops.push(DrawOp::Rect {
+                xywh: (icon_x, row_y, icon_size, icon_size),
+                thickness: icon_outline,
+                color: accent_color,
+            });
+            ops.push(DrawOp::Label {
+                anchor: (text_x, row_y),
+                text: "0".to_string(),
+                font_px: font_regular,
+                color: label_color,
+            });
+            row_y += row_gap;
+
+            let cam_w = icon_size * 1.6;
+            let cam_h = icon_size * 0.9;
+            let cam_y = row_y + (icon_size - cam_h) * 0.5;
+            let cam_outline = std::cmp::max(icon_outline, 2);
+            ops.push(DrawOp::FillRect {
+                xywh: (icon_x, cam_y, cam_w, cam_h),
+                color: (255, 200, 0, 255),
+            });
+            ops.push(DrawOp::Rect {
+                xywh: (icon_x, cam_y, cam_w, cam_h),
+                thickness: cam_outline,
+                color: (0, 0, 0, 255),
+            });
+            ops.push(DrawOp::Poly {
+                pts: vec![
+                    (icon_x + cam_w * 0.2, cam_y + cam_h * 0.5),
+                    (icon_x + cam_w * 0.8, cam_y + cam_h * 0.5),
+                ],
+                thickness: cam_outline,
+                color: (0, 0, 0, 255),
+            });
+            ops.push(DrawOp::Label {
+                anchor: (text_x, row_y),
+                text: " ".to_string(),
+                font_px: font_regular,
+                color: label_color,
+            });
+            row_y += row_gap;
+
+            ops.push(DrawOp::Label {
+                anchor: (text_x, row_y),
+                text: "OFF".to_string(),
+                font_px: font_regular,
+                color: label_color,
+            });
+            row_y += row_gap;
+
+            let bar_width = 4.0 * ui_scale;
+            for i in 0..3 {
+                let height_factor = (i + 1) as f32 / 3.0;
+                let bar_height = (icon_size * height_factor).max(4.0 * ui_scale);
+                let bar_x = icon_x + i as f32 * (6.0 * ui_scale);
+                let bar_y = row_y + icon_size - bar_height;
+                ops.push(DrawOp::FillRect {
+                    xywh: (bar_x, bar_y, bar_width, bar_height),
+                    color: accent_color,
+                });
+            }
+            ops.push(DrawOp::Label {
+                anchor: (text_x, row_y),
+                text: "".to_string(),
+                font_px: font_regular,
+                color: label_color,
+            });
+            row_y += row_gap;
+
+            let bubble_h = icon_size * 0.7;
+            ops.push(DrawOp::Rect {
+                xywh: (icon_x, row_y, icon_size, bubble_h),
+                thickness: icon_outline,
+                color: accent_color,
+            });
+            ops.push(DrawOp::Poly {
+                pts: vec![
+                    (icon_x + icon_size * 0.3, row_y + bubble_h),
+                    (icon_x + icon_size * 0.45, row_y + bubble_h + 6.0 * ui_scale),
+                    (icon_x + icon_size * 0.55, row_y + bubble_h),
+                ],
+                thickness: icon_outline,
+                color: accent_color,
+            });
+            ops.push(DrawOp::Label {
+                anchor: (text_x, row_y),
+                text: "Comment".to_string(),
+                font_px: font_regular,
+                color: label_color,
+            });
+
+            let bar_scale = ui_scale;
+            let bar_x = (cw - 80.0 * bar_scale).max(8.0 * bar_scale);
+            let bar_height = 200.0 * bar_scale;
+            let num_segments = 3;
+            let gap = 12.0 * bar_scale;
+            let segment_height =
+                ((bar_height - (num_segments as f32 - 1.0) * gap) / num_segments as f32)
+                    .max(20.0 * bar_scale);
+            let effective_bar_height =
+                segment_height * num_segments as f32 + gap * (num_segments as f32 - 1.0);
+            let start_y = ((ch - effective_bar_height) / 2.0).max(32.0 * bar_scale);
+            let active_segments =
+                (best_score * num_segments as f32).ceil().clamp(0.0, num_segments as f32) as i32;
+            let bar_width = 28.0 * bar_scale;
+            let diag_thickness = scaled_thickness(2.0, ui_scale);
+
+            for i in 0..num_segments {
+                let top = start_y + i as f32 * (segment_height + gap);
+                let seg_color = if (i as i32) < active_segments {
+                    (0, 255, 0, 255)
+                } else {
+                    (80, 80, 80, 255)
+                };
+                ops.push(DrawOp::FillRect {
+                    xywh: (bar_x, top, bar_width, segment_height),
+                    color: seg_color,
+                });
+                ops.push(DrawOp::Rect {
+                    xywh: (bar_x, top, bar_width, segment_height),
+                    thickness: icon_outline,
+                    color: (220, 220, 220, 255),
+                });
+                if (i as i32) < active_segments {
+                    ops.push(DrawOp::Poly {
+                        pts: vec![
+                            (bar_x + 6.0 * bar_scale, top + segment_height - 6.0 * bar_scale),
+                            (bar_x + bar_width - 6.0 * bar_scale, top + 6.0 * bar_scale),
+                        ],
+                        thickness: diag_thickness,
+                        color: (230, 255, 230, 255),
+                    });
+                }
+            }
+
+            let bottom_width = (240.0 * ui_scale).min(cw * 0.5).max(160.0 * ui_scale);
+            let bottom_height = 36.0 * ui_scale;
+            let bottom_x = (cw - bottom_width) / 2.0;
+            let bottom_y = ch - bottom_height - 32.0 * ui_scale;
+            ops.push(DrawOp::FillRect {
+                xywh: (bottom_x, bottom_y, bottom_width, bottom_height),
+                color: best_color,
+            });
+            ops.push(DrawOp::Rect {
+                xywh: (bottom_x, bottom_y, bottom_width, bottom_height),
+                thickness: icon_outline,
+                color: (255, 255, 255, 255),
+            });
+            ops.push(DrawOp::Label {
+                anchor: (bottom_x + 24.0 * ui_scale, bottom_y + bottom_height / 4.0),
+                text: best_long_label.to_string(),
+                font_px: scaled_font_px(18.0, ui_scale, 14),
+                color: (255, 255, 255, 255),
+            });
+        }
+
+        let bbox_scale = ui_scale;
+        let bbox_outline = scaled_thickness(2.0, bbox_scale);
+        let corner_outline = scaled_thickness(3.0, bbox_scale);
+        let label_font = scaled_font_px(20.0, ui_scale, 14);
+
         for det in &input.items {
-            let (class_label, class_color) = match det.class_id {
-                0 => ("Hyper", (255, 0, 255, 0)),      // Green
-                1 => ("Neo", (255, 255, 0, 0)),        // Red
-                _ => ("Unknown", (255, 128, 128, 128)),// Gray
-            };
+            let (short_label, _, class_color) = class_palette(det.class_id as u32);
             let (x, y, w, h) = (det.bbox.x, det.bbox.y, det.bbox.w, det.bbox.h);
-            
-            // Scale thickness for both 1080p and 4K: 2px @ 1080p → 4px @ 4K
-            let bbox_thickness = ((2.0 * bbox_scale).round() as u8).max(1);
-            
-            // Add bounding box rectangle with scaled thickness
+
             ops.push(DrawOp::Rect {
                 xywh: (x, y, w, h),
-                thickness: bbox_thickness,
+                thickness: bbox_outline,
                 color: class_color,
             });
-            // Corner brackets using Poly segments (approximate from temp.rs) — only in full UI
+
             if self.enable_full_ui {
-                let corner_len = ((w.min(h) * 0.22).max(18.0)).min(40.0);
+                let corner_len = (w.min(h) * 0.22)
+                    .max(18.0 * ui_scale)
+                    .min(40.0 * ui_scale);
                 let x2 = x + w;
                 let y2 = y + h;
-                // Top-left
-                ops.push(DrawOp::Poly { pts: vec![(x, y), (x + corner_len, y)], thickness: 3, color: class_color });
-                ops.push(DrawOp::Poly { pts: vec![(x, y), (x, y + corner_len)], thickness: 3, color: class_color });
-                // Top-right
-                ops.push(DrawOp::Poly { pts: vec![(x2, y), (x2 - corner_len, y)], thickness: 3, color: class_color });
-                ops.push(DrawOp::Poly { pts: vec![(x2, y), (x2, y + corner_len)], thickness: 3, color: class_color });
-                // Bottom-left
-                ops.push(DrawOp::Poly { pts: vec![(x, y2), (x + corner_len, y2)], thickness: 3, color: class_color });
-                ops.push(DrawOp::Poly { pts: vec![(x, y2), (x, y2 - corner_len)], thickness: 3, color: class_color });
-                // Bottom-right
-                ops.push(DrawOp::Poly { pts: vec![(x2, y2), (x2 - corner_len, y2)], thickness: 3, color: class_color });
-                ops.push(DrawOp::Poly { pts: vec![(x2, y2), (x2, y2 - corner_len)], thickness: 3, color: class_color });
+
+                ops.push(DrawOp::Poly {
+                    pts: vec![(x, y), (x + corner_len, y)],
+                    thickness: corner_outline,
+                    color: class_color,
+                });
+                ops.push(DrawOp::Poly {
+                    pts: vec![(x, y), (x, y + corner_len)],
+                    thickness: corner_outline,
+                    color: class_color,
+                });
+                ops.push(DrawOp::Poly {
+                    pts: vec![(x2, y), (x2 - corner_len, y)],
+                    thickness: corner_outline,
+                    color: class_color,
+                });
+                ops.push(DrawOp::Poly {
+                    pts: vec![(x2, y), (x2, y + corner_len)],
+                    thickness: corner_outline,
+                    color: class_color,
+                });
+                ops.push(DrawOp::Poly {
+                    pts: vec![(x, y2), (x + corner_len, y2)],
+                    thickness: corner_outline,
+                    color: class_color,
+                });
+                ops.push(DrawOp::Poly {
+                    pts: vec![(x, y2), (x, y2 - corner_len)],
+                    thickness: corner_outline,
+                    color: class_color,
+                });
+                ops.push(DrawOp::Poly {
+                    pts: vec![(x2, y2), (x2 - corner_len, y2)],
+                    thickness: corner_outline,
+                    color: class_color,
+                });
+                ops.push(DrawOp::Poly {
+                    pts: vec![(x2, y2), (x2, y2 - corner_len)],
+                    thickness: corner_outline,
+                    color: class_color,
+                });
             }
-            // Add label with confidence score
+
             let track_info = if let Some(track_id) = det.track_id {
                 format!(" ID:{}", track_id)
             } else {
                 String::new()
             };
-            let label_text = format!("{} {:.2}{}", class_label, det.score, track_info);
-            let label_y = if y > 20.0 { y - 10.0 } else { y + 20.0 };
+            let label_text = format!("{} {:.2}{}", short_label, det.score, track_info);
+            let preferred_top = y - 28.0 * ui_scale;
+            let label_y = if preferred_top > 12.0 * ui_scale {
+                preferred_top
+            } else {
+                y + h + 16.0 * ui_scale
+            };
             ops.push(DrawOp::Label {
                 anchor: (x, label_y),
                 text: label_text,
-                font_px: 16,
+                font_px: label_font,
                 color: class_color,
             });
         }
 
-        // HUD elements based on primary detection (top-left info, confidence bar, bottom class)
         if self.enable_full_ui {
-            if let Some(p) = primary {
-                // Calculate scale factor based on height (1080p = 1.0, 4K = 2.0)
-                let scale = ch / 1080.0;
-                
-                // Mode text derived from class
-                let mode_text = if p.class_id == 1 { "EGD" } else { "COLON" };
-                let conf = p.score.clamp(0.0, 1.0);
-                let class_text = match p.class_id {
-                    0 => ("Hyperplastic", (255, 0, 255, 0)),      // Green
-                    1 => ("Neoplastic", (255, 255, 0, 0)),        // Red
-                    _ => ("Awaiting", (255, 128, 128, 128)),      // Gray
-                };
-                // Top-left info labels (date/time) and mode + T value - scaled
-                let left_x = 36.0 * scale;
-                let mut y = 48.0 * scale;
-                let label_color = (255, 255, 255, 255); // White
-                let base_font_size = (16.0 * scale) as u16;
-                ops.push(DrawOp::Label { anchor: (left_x, y), text: "27/11/2020".to_string(), font_px: base_font_size, color: label_color });
-                y += 32.0 * scale;
-                ops.push(DrawOp::Label { anchor: (left_x, y), text: "10:21:16".to_string(), font_px: base_font_size, color: label_color });
-                y += 20.0 * scale;
-                // Simple square icon (outline only) - scaled
-                let icon_size = 30.0 * scale;
-                let icon_top = y;
-                let icon_color = (255, 255, 255, 255); // White
-                let thickness = (2.0 * scale).max(1.0) as u8;
-                ops.push(DrawOp::Rect { xywh: (left_x, icon_top, icon_size, icon_size), thickness, color: icon_color });
-                // Speaker-like shape using rectangles and lines (approximate) - scaled
-                let speaker_x = left_x + icon_size + 16.0 * scale;
-                ops.push(DrawOp::Rect { xywh: (speaker_x, icon_top + 4.0 * scale, 14.0 * scale, 20.0 * scale), thickness, color: icon_color });
-                ops.push(DrawOp::Poly { pts: vec![(speaker_x + 14.0 * scale, icon_top + 4.0 * scale), (speaker_x + 28.0 * scale, icon_top - 4.0 * scale)], thickness, color: icon_color });
-                ops.push(DrawOp::Poly { pts: vec![(speaker_x + 28.0 * scale, icon_top - 4.0 * scale), (speaker_x + 28.0 * scale, icon_top + icon_size - 4.0 * scale)], thickness, color: icon_color });
-                ops.push(DrawOp::Poly { pts: vec![(speaker_x + 14.0 * scale, icon_top + icon_size + 2.0 * scale), (speaker_x + 28.0 * scale, icon_top + icon_size - 4.0 * scale)], thickness, color: icon_color });
-                y = icon_top + icon_size + 20.0 * scale;
-                let mode_font_size = (18.0 * scale) as u16;
-                ops.push(DrawOp::Label { anchor: (left_x, y), text: mode_text.to_string(), font_px: mode_font_size, color: label_color });
-                y += 32.0 * scale;
-                ops.push(DrawOp::Label { anchor: (left_x, y), text: format!("T = {:.2}", conf), font_px: base_font_size, color: label_color });
-                // Confidence bar on right side (3 segments stacked) - scaled
-                if cw > 0.0 && ch > 0.0 {
-                    let bar_x = (cw - 80.0 * scale).max(8.0 * scale);
-                    let bar_height = 200.0 * scale;
-                    let num_segments = 3;
-                    let gap = 12.0 * scale;
-                    let segment_height = ((bar_height - (num_segments as f32 - 1.0) * gap) / num_segments as f32).max(20.0 * scale);
-                    let effective_bar_height = segment_height * num_segments as f32 + gap * (num_segments as f32 - 1.0);
-                    let start_y = ((ch - effective_bar_height) / 2.0).max(32.0 * scale);
-                    let active_segments = (conf * num_segments as f32).ceil().clamp(0.0, num_segments as f32) as i32;
-                    let bar_width = 28.0 * scale;
-                    for i in 0..num_segments {
-                        let top = start_y + i as f32 * (segment_height + gap);
-                        let seg_color = if (i as i32) < active_segments {
-                            (255, 0, 255, 0) // Green for active
-                        } else {
-                            (128, 128, 128, 128) // Gray for inactive
-                        };
-                        // Filled bar
-                        ops.push(DrawOp::FillRect { xywh: (bar_x, top, bar_width, segment_height), color: seg_color });
-                        // Outline
-                        ops.push(DrawOp::Rect { xywh: (bar_x, top, bar_width, segment_height), thickness, color: (255, 255, 255, 255) });
-                        // Optional: draw a short tick inside for active segments (visual hint)
-                        if (i as i32) < active_segments {
-                            ops.push(DrawOp::Poly { pts: vec![(bar_x + 4.0 * scale, top + 4.0 * scale), (bar_x + 24.0 * scale, top + segment_height - 4.0 * scale)], thickness, color: (255, 255, 255, 255) });
-                        }
-                    }
-                }
-                // Bottom centered class box (outline + label) - scaled
-                if cw > 0.0 && ch > 0.0 {
-                    let (text, box_color) = class_text;
-                    // Approximate a box sized to text: assume ~8 px per char width and 18 px height - scaled
-                    let approx_w = (text.len() as f32 * 8.0 * scale) + 48.0 * scale; // padding
-                    let approx_h = 18.0 * scale + 36.0 * scale;
-                    let origin_x = (cw - approx_w) / 2.0;
-                    let origin_y = ch - approx_h - 24.0 * scale;
-                    // Filled background
-                    ops.push(DrawOp::FillRect { xywh: (origin_x, origin_y, approx_w, approx_h), color: box_color });
-                    // Outline
-                    ops.push(DrawOp::Rect { xywh: (origin_x, origin_y, approx_w, approx_h), thickness, color: (255, 255, 255, 255) });
-                    // Label
-                    ops.push(DrawOp::Label { anchor: (origin_x + 24.0 * scale, origin_y + approx_h - 18.0 * scale), text: text.to_string(), font_px: mode_font_size, color: (255, 255, 255, 255) });
-                }
-            }
+            let corner_padding = 32.0 * ui_scale;
+            let icon_outline = scaled_thickness(2.0, ui_scale);
+            let icon_size = (32.0 * ui_scale).max(14.0);
+            let corner_x = cw - icon_size - corner_padding;
+            let mut corner_y = corner_padding;
+
+            ops.push(DrawOp::Rect {
+                xywh: (corner_x, corner_y, icon_size, icon_size),
+                thickness: icon_outline,
+                color: (255, 255, 255, 255),
+            });
+
+            let speaker_x = corner_x + icon_size + 16.0 * ui_scale;
+            let speaker_h = icon_size * 0.7;
+            let speaker_body_w = icon_size * 0.3;
+            let speaker_y = corner_y + (icon_size - speaker_h) / 2.0;
+
+            ops.push(DrawOp::FillRect {
+                xywh: (speaker_x, speaker_y, speaker_body_w, speaker_h),
+                color: (255, 255, 255, 255),
+            });
+
+            let horn_pts = vec![
+                (speaker_x + speaker_body_w, speaker_y),
+                (
+                    speaker_x + speaker_body_w + speaker_h * 0.55,
+                    speaker_y + speaker_h * 0.5,
+                ),
+                (speaker_x + speaker_body_w, speaker_y + speaker_h),
+            ];
+            ops.push(DrawOp::Poly {
+                pts: horn_pts,
+                thickness: icon_outline,
+                color: (255, 255, 255, 255),
+            });
+
+            let wave_inner = vec![
+                (
+                    speaker_x + speaker_body_w + speaker_h * 0.35,
+                    speaker_y + speaker_h * 0.2,
+                ),
+                (
+                    speaker_x + speaker_body_w + speaker_h * 0.58,
+                    speaker_y + speaker_h * 0.5,
+                ),
+                (
+                    speaker_x + speaker_body_w + speaker_h * 0.35,
+                    speaker_y + speaker_h * 0.8,
+                ),
+            ];
+            let wave_outer = vec![
+                (
+                    speaker_x + speaker_body_w + speaker_h * 0.55,
+                    speaker_y + speaker_h * 0.05,
+                ),
+                (
+                    speaker_x + speaker_body_w + speaker_h * 0.86,
+                    speaker_y + speaker_h * 0.5,
+                ),
+                (
+                    speaker_x + speaker_body_w + speaker_h * 0.55,
+                    speaker_y + speaker_h * 0.95,
+                ),
+            ];
+            ops.push(DrawOp::Poly {
+                pts: wave_inner,
+                thickness: icon_outline,
+                color: (255, 255, 255, 255),
+            });
+            ops.push(DrawOp::Poly {
+                pts: wave_outer,
+                thickness: icon_outline,
+                color: (255, 255, 255, 255),
+            });
+
+            corner_y += icon_size + 12.0 * ui_scale;
+
+            let mode_text = best_detection
+                .map(|d| if d.class_id == 1 { "EGD" } else { "COLON" })
+                .unwrap_or("COLON");
+            let font_regular = scaled_font_px(20.0, ui_scale, 14);
+            ops.push(DrawOp::Label {
+                anchor: (corner_x, corner_y),
+                text: mode_text.to_string(),
+                font_px: font_regular,
+                color: (255, 255, 255, 255),
+            });
+            corner_y += 24.0 * ui_scale;
+            ops.push(DrawOp::Label {
+                anchor: (corner_x, corner_y),
+                text: format!("T = {:.2}", best_score),
+                font_px: scaled_font_px(18.0, ui_scale, 14),
+                color: (255, 255, 255, 255),
+            });
         }
 
-        OverlayPlanPacket { from: input.from, ops, canvas }
+        OverlayPlanPacket {
+            from: input.from,
+            ops,
+            canvas,
+        }
     }
 }
 
+impl PlanStage {
+    fn parse_enable_full_ui(cfg: &str) -> bool {
+        let cfg_lc = cfg.to_ascii_lowercase();
+        ["full", "full_ui", "ui=full", "hud"]
+            .iter()
+            .any(|key| cfg_lc.contains(key))
+    }
+
+    pub fn from_path(cfg: &str) -> Result<Self> {
+        Ok(Self {
+            enable_full_ui: Self::parse_enable_full_ui(cfg),
+        })
+    }
+}
