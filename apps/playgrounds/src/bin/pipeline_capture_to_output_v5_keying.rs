@@ -32,6 +32,8 @@ use preprocess_cuda::{Preprocessor, CropRegion};
 use std::time::{Duration, Instant};
 use std::fs;
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use rusttype::{Font, Scale, point};
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -583,24 +585,48 @@ fn main() -> Result<()> {
     // Hardware reference clock tracking for scheduling (requirement #3)
     let mut hw_start_time: Option<u64> = None;
     let frames_ahead = 0u64; // Schedule at current time for MINIMAL LATENCY (0-33ms instead of 66ms)
-    let max_queue_depth = 3u32; // Triple buffer (requirement #4)
+    
+    // ADAPTIVE QUEUE MANAGEMENT
+    // Dynamically adjust queue size based on pipeline performance
+    let mut max_queue_depth = 3u32; // Start with triple buffer
+    let mut pipeline_time_sma = 35.0; // Smooth Moving Average (start at 35ms)
+    const SMA_ALPHA: f64 = 0.1; // Smoothing factor for moving average
+    let frame_period_ms = 1000.0 / fps_calc; // Target frame period (e.g., 33.33ms @ 30fps)
+    let mut queue_adjustments = 0u32; // Track how many times queue was adjusted
     
     println!("  ⏱️  Frame timing from DisplayMode:");
     println!("      → Frame duration: {} ticks", frame_duration);
     println!("      → Time scale: {} Hz", timebase);
     println!("      → Calculated FPS: {:.2}", fps_calc);
+    println!("      → Frame period: {:.2}ms", frame_period_ms);
     println!("  ⏱️  Scheduling configuration:");
     println!("      → Pre-roll: {} frames ({:.1}ms startup)", preroll_count, (preroll_count as f64 / fps_calc) * 1000.0);
     println!("      → Schedule ahead: {} frames ({:.1}ms latency)", frames_ahead, (frames_ahead as f64 / fps_calc) * 1000.0);
-    println!("      → Max queue depth: {} frames", max_queue_depth);
-    println!("      → Expected overlay latency: {:.1}-{:.1}ms", 
-             (frames_ahead as f64 / fps_calc) * 1000.0,
-             ((frames_ahead + 1) as f64 / fps_calc) * 1000.0);
+    println!("      → ADAPTIVE Queue: starts at {} frames (adjusts 2-5 based on performance)", max_queue_depth);
+    println!("      → Queue thresholds:");
+    println!("         • < {}ms → 2 frames ({:.1}ms latency) [FAST]", frame_period_ms * 0.9, frame_period_ms * 2.0);
+    println!("         • < {}ms → 3 frames ({:.1}ms latency) [NORMAL]", frame_period_ms * 1.2, frame_period_ms * 3.0);
+    println!("         • < {}ms → 4 frames ({:.1}ms latency) [SLOW]", frame_period_ms * 1.5, frame_period_ms * 4.0);
+    println!("         • >= {}ms → 5 frames ({:.1}ms latency) [VERY SLOW]", frame_period_ms * 1.5, frame_period_ms * 5.0);
+    
+    // Signal handler for graceful shutdown (Ctrl+C)
+    let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
+    ctrlc::set_handler(move || {
+        println!("\n🛑 Ctrl+C received - stopping pipeline gracefully...");
+        r.store(false, Ordering::SeqCst);
+    }).expect("Error setting Ctrl-C handler");
     
     let pipeline_start_time = Instant::now();
     let test_duration = Duration::from_secs(30);
 
     loop {
+        // Check for Ctrl+C signal
+        if !running.load(Ordering::SeqCst) {
+            println!("⏱️  Interrupted by user - preparing summary");
+            break;
+        }
+        
         // Check if 30 seconds have elapsed
         if pipeline_start_time.elapsed() >= test_duration {
             println!();
@@ -934,6 +960,28 @@ fn main() -> Result<()> {
         let pipeline_ms = pipeline_time.as_secs_f64() * 1000.0;
         total_latency_ms += pipeline_ms;
 
+        // 🎯 ADAPTIVE QUEUE SIZE ADJUSTMENT
+        // Update smooth moving average of pipeline time
+        pipeline_time_sma = SMA_ALPHA * pipeline_ms + (1.0 - SMA_ALPHA) * pipeline_time_sma;
+        
+        // Determine optimal queue depth based on performance
+        let old_queue_depth = max_queue_depth;
+        max_queue_depth = if pipeline_time_sma < frame_period_ms * 0.9 {
+            2 // Fast pipeline: minimal queue for lowest latency
+        } else if pipeline_time_sma < frame_period_ms * 1.2 {
+            3 // Normal: balanced latency/smoothness
+        } else if pipeline_time_sma < frame_period_ms * 1.5 {
+            4 // Slow: more buffering for smoothness
+        } else {
+            5 // Very slow: maximum buffering to avoid drops
+        };
+        
+        if max_queue_depth != old_queue_depth {
+            queue_adjustments += 1;
+            println!("  🎯 [ADAPTIVE] Queue adjusted: {} → {} frames (SMA={:.2}ms)", 
+                     old_queue_depth, max_queue_depth, pipeline_time_sma);
+        }
+
         // Print latency breakdown
         println!();
         println!("════════════════════════════════════════════════════════════");
@@ -1008,6 +1056,15 @@ fn main() -> Result<()> {
             println!("  Total elapsed time:      {:.2}s", elapsed);
             println!("  Real-time FPS:           {:.2} FPS", avg_fps);
             println!("  Mode:                    ASYNC SCHEDULED BGRA");
+            println!();
+            println!("  🎯 Adaptive Queue Management:");
+            println!("  ─────────────────────────────────────────────────────────");
+            println!("  Current queue depth:     {} frames ({:.1}ms latency)", 
+                     max_queue_depth, max_queue_depth as f64 * frame_period_ms);
+            println!("  Pipeline time (SMA):     {:.2}ms", pipeline_time_sma);
+            println!("  Target frame period:     {:.2}ms", frame_period_ms);
+            println!("  Queue adjustments:       {} times", queue_adjustments);
+            println!("  Performance ratio:       {:.2}x (SMA/target)", pipeline_time_sma / frame_period_ms);
             println!("  ─────────────────────────────────────────────────────────");
             println!();
         }
@@ -1048,13 +1105,27 @@ fn main() -> Result<()> {
     println!("  Real-time FPS:           {:.2} FPS", avg_fps);
     println!("  Mode:                    ASYNC SCHEDULED BGRA");
     println!();
+    println!("  🎯 Adaptive Queue Management:");
+    println!("  ─────────────────────────────────────────────────────────");
+    println!("  Final queue depth:       {} frames ({:.1}ms latency)", 
+             max_queue_depth, max_queue_depth as f64 * frame_period_ms);
+    println!("  Final pipeline SMA:      {:.2}ms", pipeline_time_sma);
+    println!("  Target frame period:     {:.2}ms", frame_period_ms);
+    println!("  Total adjustments:       {} times", queue_adjustments);
+    println!("  Performance ratio:       {:.2}x (SMA/target)", pipeline_time_sma / frame_period_ms);
+    println!("  Adaptation status:       {}", 
+             if pipeline_time_sma < frame_period_ms * 0.9 { "🟢 FAST (Low latency mode)" }
+             else if pipeline_time_sma < frame_period_ms * 1.2 { "🟡 NORMAL (Balanced)" }
+             else if pipeline_time_sma < frame_period_ms * 1.5 { "🟠 SLOW (Smoothness priority)" }
+             else { "🔴 VERY SLOW (Max buffering)" });
+    println!();
     println!("  🚀 OPTIMIZATION SUMMARY:");
     println!("  ─────────────────────────────────────────────────────────");
     println!("  ✅ Eliminated ARGB→BGRA conversion (~17ms saved)");
     println!("  ✅ Direct BGRA rendering on CPU");
     println!("  ✅ Single GPU upload (no intermediate buffers)");
     println!("  ✅ Hardware keying with async scheduled playback");
-    println!("  ✅ Triple-buffer frame queue for smooth output");
+    println!("  ✅ ADAPTIVE queue management (2-5 frames dynamic)");
     println!("  ✅ Callback-driven scheduling (non-blocking)");
     println!("  ─────────────────────────────────────────────────────────");
     println!();
