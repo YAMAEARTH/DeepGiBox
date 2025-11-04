@@ -1,0 +1,8 @@
+[package]
+name = "inference_v3"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+common_io = { path = "../common_io" }
+libloading = "0.8"

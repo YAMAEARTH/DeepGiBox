@@ -18,6 +18,7 @@ decklink_output = { path = "../../crates/decklink_output", optional = true }
 preprocess_cuda = { path = "../../crates/preprocess_cuda", optional = true }
 inference = { path = "../../crates/inference", optional = true }
 inference_v2 = { path = "../../crates/inference_v2" }
+inference_v3 = { path = "../../crates/inference_v3"}
 postprocess = { path = "../../crates/postprocess" }
 overlay_plan = { path = "../../crates/overlay_plan", optional = true }
 overlay_render = { path = "../../crates/overlay_render", optional = true }

@@ -7,20 +7,12 @@ edition = "2021"
 # Empty workspace to prevent inheriting from parent
 
 [[bin]]
-name = "zero_copy"
-path = "src/zero_copy_example.rs"
+name = "bisenet_engine"
+path = "src/bisenet_engine.rs"
 
 [[bin]]
 name = "test_rust"
 path = "src/main.rs"
-
-[[bin]]
-name = "tensor_packet"
-path = "src/tensor_packet_inference.rs"
-
-[[bin]]
-name = "tensor_packet_bench"
-path = "src/copy_tensor_packet_inference.rs"
 
 [dependencies]
 libloading = "0.8"

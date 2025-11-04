@@ -64,6 +64,19 @@ void copy_input_to_gpu(
     int input_size             // Number of floats to copy
 );
 
+// Run inference with multiple inputs (image + thresholds)
+// Use this for models like GIM that need threshold parameters
+void run_inference_device_multiple_input(
+    InferenceSession session, 
+    const float* d_input,      // GPU pointer to main input (image)
+    float* d_output,           // GPU pointer to output (unused, uses internal buffers)
+    int input_size, 
+    int output_size,
+    float threshold_nbi,       // NBI threshold value
+    float threshold_wle,       // WLE threshold value
+    float c_threshold          // Classification threshold value
+);
+
 #ifdef __cplusplus
 }
 #endif
