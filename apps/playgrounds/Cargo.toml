@@ -11,6 +11,7 @@ ort = { version = "2.0.0-rc.10", features = ["tensorrt", "cuda"] }
 cudarc = { version = "0.11.9", features = ["cuda-12040", "driver"] }
 half = "2.4"
 rand = "0.8"
+rusttype = "0.9"
 common_io = { path = "../../crates/common_io" }
 config = { path = "../../crates/config" }
 decklink_input = { path = "../../crates/decklink_input", optional = true }

@@ -33,13 +33,36 @@ pub enum CropRegion {
 }
 
 impl CropRegion {
-    /// Get crop coordinates (x, y, width, height) for 1920×1080 input
-    pub fn get_coords(&self) -> (u32, u32, u32, u32) {
+    /// Get crop coordinates (x, y, width, height) based on input frame size
+    /// Supports both 1080p (1920×1080) and 4K (3840×2160) with same proportions
+    pub fn get_coords(&self, input_width: u32, input_height: u32) -> (u32, u32, u32, u32) {
+        // Detect if input is 4K (2x scale of 1080p)
+        let scale = if input_width == 3840 && input_height == 2160 {
+            2 // 4K
+        } else {
+            1 // 1080p or default
+        };
+        
         match self {
-            CropRegion::Fuji => (0, 0, 1376, 1080),
-            CropRegion::Olympus => (548, 0, 1372, 1080),
-            CropRegion::Pentax => (0, 0, 1376, 1080),
-            CropRegion::None => (0, 0, 1920, 1080), // Full frame
+            CropRegion::Fuji => {
+                // 1080p: [0:1080, 0:1376] -> (0, 0, 1376, 1080)
+                // 4K:    [0:2160, 0:2752] -> (0, 0, 2752, 2160)
+                (0, 0, 1376 * scale, 1080 * scale)
+            }
+            CropRegion::Olympus => {
+                // 1080p: [0:1080, 548:1920] -> (548, 0, 1372, 1080)
+                // 4K:    [0:2160, 1096:3840] -> (1096, 0, 2744, 2160)
+                (548 * scale, 0, 1372 * scale, 1080 * scale)
+            }
+            CropRegion::Pentax => {
+                // 1080p: [0:1080, 0:1376] -> (0, 0, 1376, 1080)
+                // 4K:    [0:2160, 0:2752] -> (0, 0, 2752, 2160)
+                (0, 0, 1376 * scale, 1080 * scale)
+            }
+            CropRegion::None => {
+                // Full frame - use actual input size
+                (0, 0, input_width, input_height)
+            }
         }
     }
 }
@@ -96,8 +119,8 @@ pub struct Preprocessor {
     pub crop_region: CropRegion, // Camera-specific crop region
 
     // Frame validation (for production video streams)
-    pub expected_input_size: Option<(u32, u32)>, // None = accept any size
-    pub skip_invalid_frames: bool,               // true = skip, false = panic
+    pub expected_input_sizes: Vec<(u32, u32)>, // Empty = accept any size
+    pub skip_invalid_frames: bool,              // true = skip, false = panic
 
     // CUDA resources
     cuda_device: Arc<CudaDevice>,
@@ -177,8 +200,8 @@ impl Preprocessor {
             std,
             chroma,
             crop_region,
-            expected_input_size: Some((1920, 1080)), // Default for production video
-            skip_invalid_frames: true,               // Skip frames with unexpected size by default
+            expected_input_sizes: vec![(1920, 1080), (3840, 2160)], // Support both 1080p and 4K
+            skip_invalid_frames: true,                               // Skip frames with unexpected size by default
             cuda_device,
             cuda_stream,
             kernel_func,
@@ -186,13 +209,13 @@ impl Preprocessor {
         })
     }
 
-    /// Set expected input size validation (None = accept any size)
+    /// Set expected input size validation (empty vec = accept any size)
     pub fn with_input_validation(
         mut self,
-        expected_size: Option<(u32, u32)>,
+        expected_sizes: Vec<(u32, u32)>,
         skip_invalid: bool,
     ) -> Self {
-        self.expected_input_size = expected_size;
+        self.expected_input_sizes = expected_sizes;
         self.skip_invalid_frames = skip_invalid;
         self
     }
@@ -252,8 +275,8 @@ impl Preprocessor {
 
         let chroma_order = self.chroma as i32;
 
-        // Get crop region coordinates
-        let (crop_x, crop_y, crop_w, crop_h) = self.crop_region.get_coords();
+        // Get crop region coordinates based on input size
+        let (crop_x, crop_y, crop_w, crop_h) = self.crop_region.get_coords(input.meta.width, input.meta.height);
         let crop_x_i32 = crop_x as i32;
         let crop_y_i32 = crop_y as i32;
         let crop_w_i32 = crop_w as i32;
@@ -331,13 +354,21 @@ impl Stage<RawFramePacket, TensorInputPacket> for Preprocessor {
     fn process(&mut self, input: RawFramePacket) -> TensorInputPacket {
         self.ensure_gpu_input(&input);
         if !self.dimensions_match(&input) {
+            let expected_sizes_str = if self.expected_input_sizes.is_empty() {
+                "any size".to_string()
+            } else {
+                self.expected_input_sizes
+                    .iter()
+                    .map(|(w, h)| format!("{}x{}", w, h))
+                    .collect::<Vec<_>>()
+                    .join(" or ")
+            };
             panic!(
-                "Frame #{} size mismatch: got {}x{}, expected {}x{}",
+                "Frame #{} size mismatch: got {}x{}, expected {}",
                 input.meta.frame_idx,
                 input.meta.width,
                 input.meta.height,
-                self.expected_input_size.map(|(w, _)| w).unwrap_or(0),
-                self.expected_input_size.map(|(_, h)| h).unwrap_or(0)
+                expected_sizes_str
             );
         }
         self.process_inner(input)
@@ -355,11 +386,13 @@ impl Preprocessor {
     }
 
     fn dimensions_match(&self, input: &RawFramePacket) -> bool {
-        if let Some((expected_w, expected_h)) = self.expected_input_size {
-            input.meta.width == expected_w && input.meta.height == expected_h
-        } else {
-            true
+        if self.expected_input_sizes.is_empty() {
+            return true; // Accept any size
         }
+        // Check if input matches any of the expected sizes
+        self.expected_input_sizes
+            .iter()
+            .any(|&(w, h)| input.meta.width == w && input.meta.height == h)
     }
 
     fn process_inner(&mut self, input: RawFramePacket) -> TensorInputPacket {
@@ -414,7 +447,7 @@ impl Preprocessor {
         let crop_info = if matches!(self.crop_region, CropRegion::None) {
             None
         } else {
-            let (cx, cy, cw, ch) = self.crop_region.get_coords();
+            let (cx, cy, cw, ch) = self.crop_region.get_coords(input.meta.width, input.meta.height);
             Some((cx, cy, cw, ch))
         };
         
@@ -431,25 +464,32 @@ impl Preprocessor {
     pub fn process_checked(&mut self, input: RawFramePacket) -> Option<TensorInputPacket> {
         self.ensure_gpu_input(&input);
         if !self.dimensions_match(&input) {
-            let (expected_w, expected_h) = self.expected_input_size.unwrap_or((0, 0));
+            let expected_sizes_str = if self.expected_input_sizes.is_empty() {
+                "any size".to_string()
+            } else {
+                self.expected_input_sizes
+                    .iter()
+                    .map(|(w, h)| format!("{}x{}", w, h))
+                    .collect::<Vec<_>>()
+                    .join(" or ")
+            };
+            
             if self.skip_invalid_frames {
                 eprintln!(
-                    "⚠️  Skipping frame {} with size {}x{} (expected {}x{})",
+                    "⚠️  Skipping frame {} with size {}x{} (expected {})",
                     input.meta.frame_idx,
                     input.meta.width,
                     input.meta.height,
-                    expected_w,
-                    expected_h
+                    expected_sizes_str
                 );
                 return None;
             } else {
                 panic!(
-                    "Frame #{} size mismatch: got {}x{}, expected {}x{}",
+                    "Frame #{} size mismatch: got {}x{}, expected {}",
                     input.meta.frame_idx,
                     input.meta.width,
                     input.meta.height,
-                    expected_w,
-                    expected_h
+                    expected_sizes_str
                 );
             }
         }
