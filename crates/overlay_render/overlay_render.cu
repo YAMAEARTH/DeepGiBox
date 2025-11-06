@@ -14,10 +14,11 @@ __device__ inline void put_pixel(
 ) {
     if (x < 0 || y < 0 || x >= width || y >= height) return;
     int idx = y * stride + x * 4;
-    buf[idx + 0] = a;
-    buf[idx + 1] = r;
-    buf[idx + 2] = g;
-    buf[idx + 3] = b;
+    // Write ARGB format
+    buf[idx + 0] = a;  // Alpha
+    buf[idx + 1] = r;  // Red
+    buf[idx + 2] = g;  // Green
+    buf[idx + 3] = b;  // Blue
 }
 
 /**

@@ -24,9 +24,10 @@ use anyhow::{anyhow, Result};
 use common_io::{MemLoc, MemRef, Stage, DrawOp, DetectionsPacket, OverlayPlanPacket, TensorInputPacket, RawDetectionsPacket};
 use cudarc::driver::{CudaDevice, CudaSlice, DevicePtr};
 use decklink_input::capture::CaptureSession;
-use decklink_output::OutputRequest;
+use decklink_output::{OutputRequest, compositor::PipelineCompositor};
 use inference_v2::TrtInferenceStage;
 use overlay_plan::PlanStage;
+use overlay_render; // GPU overlay renderer
 use postprocess;
 use preprocess_cuda::{Preprocessor, CropRegion};
 use std::time::{Duration, Instant};
@@ -34,7 +35,6 @@ use std::fs;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use rusttype::{Font, Scale, point};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // FRAME QUEUE MANAGED BY HARDWARE (GetBufferedVideoFrameCount)
@@ -69,25 +69,7 @@ fn dump_raw_frame(frame: &common_io::RawFramePacket, frame_num: usize) -> Result
     Ok(())
 }
 
-/// Dump BGRA buffer to file with statistics
-fn dump_bgra_buffer(data: &[u8], width: u32, height: u32, frame_num: usize, label: &str) -> Result<()> {
-    let filename = format!("output/test/debug_frame_{:04}_{}_bgra.bin", frame_num, label);
-    println!("  🔍 Dumping BGRA buffer to: {}", filename);
-    
-    fs::create_dir_all("output/test")?;
-    let mut file = fs::File::create(&filename)?;
-    file.write_all(data)?;
-    
-    // Calculate statistics
-    let non_zero = data.iter().filter(|&&b| b != 0).count();
-    let total = data.len();
-    let percent = (non_zero as f64 / total as f64) * 100.0;
-    
-    println!("  ✓ Dumped {} bytes ({}x{} BGRA)", total, width, height);
-    println!("  ℹ️  Non-zero bytes: {} / {} ({:.2}%)", non_zero, total, percent);
-    
-    Ok(())
-}
+
 
 /// Dump detection results
 fn dump_detections(packet: &DetectionsPacket, frame_num: usize) -> Result<()> {
@@ -227,167 +209,7 @@ fn dump_overlay_plan(packet: &OverlayPlanPacket, frame_num: usize) -> Result<()>
 
 // ═══════════════════════════════════════════════════════════════════════════
 // INLINE BGRA RENDERER (CPU)
-// ═══════════════════════════════════════════════════════════════════════════
-// This replaces the RenderStage and renders directly to BGRA format
-// to avoid ARGB→BGRA conversion overhead (~17ms)
 
-/// Directly render overlay to BGRA format (avoiding ARGB intermediate)
-struct BgraOverlayRenderer;
-
-impl BgraOverlayRenderer {
-    /// Put pixel in BGRA format
-    fn put_pixel(buf: &mut [u8], stride: usize, w: usize, h: usize, x: i32, y: i32, b: u8, g: u8, r: u8, a: u8) {
-        if x < 0 || y < 0 { return; }
-        let (x, y) = (x as usize, y as usize);
-        if x >= w || y >= h { return; }
-        let idx = y * stride + x * 4;
-        buf[idx + 0] = b;
-        buf[idx + 1] = g;
-        buf[idx + 2] = r;
-        buf[idx + 3] = a;
-    }
-
-    /// Draw line with thickness in BGRA format
-    fn draw_line(buf: &mut [u8], stride: usize, w: usize, h: usize, x0: i32, y0: i32, x1: i32, y1: i32, thickness: i32, color_bgra: (u8, u8, u8, u8)) {
-        let (mut x0, mut y0, x1, y1) = (x0, y0, x1, y1);
-        let dx = (x1 - x0).abs();
-        let sx = if x0 < x1 { 1 } else { -1 };
-        let dy = -(y1 - y0).abs();
-        let sy = if y0 < y1 { 1 } else { -1 };
-        let mut err = dx + dy;
-        let rad = thickness.max(1) / 2;
-        loop {
-            for oy in -rad..=rad {
-                for ox in -rad..=rad {
-                    Self::put_pixel(buf, stride, w, h, x0 + ox, y0 + oy, color_bgra.0, color_bgra.1, color_bgra.2, color_bgra.3);
-                }
-            }
-            if x0 == x1 && y0 == y1 { break; }
-            let e2 = 2 * err;
-            if e2 >= dy { err += dy; x0 += sx; }
-            if e2 <= dx { err += dx; y0 += sy; }
-        }
-    }
-
-    /// Draw rectangle outline in BGRA format
-    fn draw_rect_outline(buf: &mut [u8], stride: usize, w: usize, h: usize, x: i32, y: i32, ww: i32, hh: i32, thickness: i32, color_bgra: (u8, u8, u8, u8)) {
-        if ww <= 0 || hh <= 0 { return; }
-        let x2 = x + ww;
-        let y2 = y + hh;
-        Self::draw_line(buf, stride, w, h, x, y, x2, y, thickness, color_bgra);
-        Self::draw_line(buf, stride, w, h, x2, y, x2, y2, thickness, color_bgra);
-        Self::draw_line(buf, stride, w, h, x2, y2, x, y2, thickness, color_bgra);
-        Self::draw_line(buf, stride, w, h, x, y2, x, y, thickness, color_bgra);
-    }
-
-    /// Draw text using embedded font
-    fn draw_text(
-        buf: &mut [u8], 
-        stride: usize, 
-        w: usize, 
-        h: usize, 
-        x: i32, 
-        y: i32, 
-        text: &str, 
-        font_size: f32,
-        color: (u8, u8, u8, u8) // BGRA
-    ) {
-        // Use embedded DejaVu Sans font
-        let font_data = include_bytes!("../../../../testsupport/DejaVuSans.ttf");
-        let font = Font::try_from_bytes(font_data as &[u8]).unwrap_or_else(|| {
-            panic!("Failed to load embedded font");
-        });
-        
-        let scale = Scale::uniform(font_size);
-        let v_metrics = font.v_metrics(scale);
-        let offset = point(0.0, v_metrics.ascent);
-        
-        let glyphs: Vec<_> = font.layout(text, scale, offset).collect();
-        
-        for glyph in glyphs {
-            if let Some(bounding_box) = glyph.pixel_bounding_box() {
-                glyph.draw(|gx, gy, gv| {
-                    let px = x + bounding_box.min.x + gx as i32;
-                    let py = y + bounding_box.min.y + gy as i32;
-                    
-                    if px >= 0 && py >= 0 && (px as usize) < w && (py as usize) < h {
-                        let idx = (py as usize) * stride + (px as usize) * 4;
-                        if idx + 3 < buf.len() {
-                            // Alpha blend with existing pixel
-                            let alpha = (gv * 255.0) as u32;
-                            let inv_alpha = 255 - alpha;
-                            
-                            buf[idx + 0] = ((color.0 as u32 * alpha + buf[idx + 0] as u32 * inv_alpha) / 255) as u8; // B
-                            buf[idx + 1] = ((color.1 as u32 * alpha + buf[idx + 1] as u32 * inv_alpha) / 255) as u8; // G
-                            buf[idx + 2] = ((color.2 as u32 * alpha + buf[idx + 2] as u32 * inv_alpha) / 255) as u8; // R
-                            buf[idx + 3] = buf[idx + 3].max(((color.3 as u32 * alpha) / 255) as u8); // A - max blend
-                        }
-                    }
-                });
-            }
-        }
-    }
-
-    /// Render OverlayPlanPacket directly to BGRA buffer
-    fn render_to_bgra(plan: &common_io::OverlayPlanPacket) -> Vec<u8> {
-        let w = plan.canvas.0 as usize;
-        let h = plan.canvas.1 as usize;
-        let stride = w * 4;
-        
-        let mut buf = vec![0u8; h * stride];
-        
-        let mut rect_count = 0;
-        let mut fillrect_count = 0;
-        let mut poly_count = 0;
-        let mut label_count = 0;
-        
-        // Execute drawing operations
-        for op in &plan.ops {
-            match op {
-                DrawOp::Rect { xywh, thickness, color } => {
-                    rect_count += 1;
-                    let (x, y, ww, hh) = (xywh.0 as i32, xywh.1 as i32, xywh.2 as i32, xywh.3 as i32);
-                    // Convert ARGB color to BGRA
-                    let color_bgra = (color.3, color.2, color.1, color.0); // (B, G, R, A)
-                    Self::draw_rect_outline(&mut buf, stride, w, h, x, y, ww, hh, *thickness as i32, color_bgra);
-                }
-                DrawOp::FillRect { xywh, color } => {
-                    fillrect_count += 1;
-                    let (x, y, ww, hh) = (xywh.0 as i32, xywh.1 as i32, xywh.2 as i32, xywh.3 as i32);
-                    // Convert ARGB color to BGRA
-                    let color_bgra = (color.3, color.2, color.1, color.0); // (B, G, R, A)
-                    for yy in y.max(0)..(y+hh).min(h as i32) {
-                        for xx in x.max(0)..(x+ww).min(w as i32) {
-                            Self::put_pixel(&mut buf, stride, w, h, xx, yy, color_bgra.0, color_bgra.1, color_bgra.2, color_bgra.3);
-                        }
-                    }
-                }
-                DrawOp::Poly { pts, thickness, color } => {
-                    poly_count += 1;
-                    if pts.len() >= 2 {
-                        let (x0, y0) = (pts[0].0 as i32, pts[0].1 as i32);
-                        let (x1, y1) = (pts[1].0 as i32, pts[1].1 as i32);
-                        // Convert ARGB color to BGRA
-                        let color_bgra = (color.3, color.2, color.1, color.0);
-                        Self::draw_line(&mut buf, stride, w, h, x0, y0, x1, y1, *thickness as i32, color_bgra);
-                    }
-                }
-                DrawOp::Label { anchor, text, font_px, color } => {
-                    label_count += 1;
-                    let (x, y) = (anchor.0 as i32, anchor.1 as i32);
-                    // Convert ARGB color to BGRA
-                    let color_bgra = (color.3, color.2, color.1, color.0); // (B, G, R, A)
-                    Self::draw_text(&mut buf, stride, w, h, x, y, text, *font_px as f32, color_bgra);
-                }
-            }
-        }
-        
-        println!("      📊 BGRA Render stats: {} Rect, {} FillRect, {} Poly, {} Label rendered", 
-                 rect_count, fillrect_count, poly_count, label_count);
-        
-        buf
-    }
-}
 
 fn main() -> Result<()> {
     println!("╔══════════════════════════════════════════════════════════╗");
@@ -483,17 +305,21 @@ fn main() -> Result<()> {
     println!("  ✓ SORT tracking: enabled (max_age=30)");
     println!();
 
-    // 5. Initialize Overlay Planning
-    println!("🎨 Step 5: Initialize Overlay Planning");
+    // 5. Initialize Overlay Planning and GPU Rendering
+    println!("🎨 Step 5: Initialize Overlay Planning and GPU Rendering");
     let mut plan_stage = PlanStage {
         enable_full_ui: true,
     };
     println!("  ✓ Overlay planning ready");
-    println!("  ✓ Rendering: INLINE BGRA (optimized, no conversion)");
+    
+    // Initialize GPU overlay renderer
+    let mut render_stage = overlay_render::from_path("gpu,device=0")?;
+    println!("  ✓ GPU overlay renderer initialized");
+    println!("  ✓ Rendering: GPU (ARGB format, zero CPU copy)");
     println!();
 
-    // 5.5 Initialize Hardware Internal Keying (DeckLink Output) with ASYNC scheduling
-    println!("🔧 Step 5.5: Initialize Hardware Internal Keying (ASYNC MODE)");
+    // 5.5 Initialize Hardware Internal Keying + GPU Compositor
+    println!("🔧 Step 5.5: Initialize Hardware Internal Keying + GPU Compositor");
     
     // Wait for first frame to get dimensions
     println!("  ⏳ Waiting for first frame to determine dimensions...");
@@ -532,6 +358,11 @@ fn main() -> Result<()> {
     // Set keyer level to maximum (255 = fully visible overlay)
     decklink_out.set_keyer_level(255)?;
     println!("  ✓ Keyer level set to 255 (fully visible)");
+    
+    // Initialize GPU compositor (zero CPU copy mode)
+    let mut compositor = PipelineCompositor::from_pipeline_with_mode(width, height, true)?;
+    println!("  ✓ GPU compositor initialized (zero CPU copy)");
+    println!("  ✓ Pipeline: DeckLink UYVY (GPU) + Overlay ARGB (GPU) → BGRA (GPU)");
     
     // Note: Frame queue now managed by DeckLink hardware (GetBufferedVideoFrameCount)
     // No need for software queue - hardware handles buffering
@@ -778,45 +609,48 @@ fn main() -> Result<()> {
             dump_overlay_plan(&overlay_plan, frame_count as usize)?;
         }
 
-        // Step 6: OPTIMIZED Inline BGRA Rendering
+        // Step 6: GPU Overlay Rendering (Zero CPU Copy!)
         println!();
-        println!("🖼️  Step 6: Inline BGRA Rendering (OPTIMIZED)");
+        println!("🖼️  Step 6: GPU Overlay Rendering");
         let render_start = Instant::now();
-        let bgra_buffer = BgraOverlayRenderer::render_to_bgra(&overlay_plan);
+        let overlay_frame = render_stage.process(overlay_plan);
         let render_time = render_start.elapsed();
         total_render_ms += render_time.as_secs_f64() * 1000.0;
         println!("  ✓ Time: {:.2}ms", render_time.as_secs_f64() * 1000.0);
-        println!("  ✓ BGRA Buffer:");
+        println!("  ✓ Overlay Frame:");
         println!("      → Dimensions: {}×{}", width, height);
-        println!("      → Buffer size: {} bytes", bgra_buffer.len());
-        println!("      → Format: BGRA8 (native DeckLink format)");
-        println!("      → Location: CPU (ready for GPU upload)");
-        println!("      → ⚡ NO CONVERSION NEEDED (direct BGRA rendering)");
+        println!("      → Buffer size: {} bytes", overlay_frame.argb.len);
+        println!("      → Format: ARGB (GPU native)");
+        println!("      → Location: {:?}", overlay_frame.argb.loc);
+        println!("      → ⚡ ZERO CPU BUFFER - All GPU!");
         
-        // Dump BGRA overlay (first 5 frames)
-        if frame_count < 5 {
-            dump_bgra_buffer(&bgra_buffer, width, height, frame_count as usize, "overlay")?;
+        // Verify overlay is on GPU
+        if !matches!(overlay_frame.argb.loc, MemLoc::Gpu { .. }) {
+            println!("  ❌ ERROR: Overlay should be on GPU but got: {:?}", overlay_frame.argb.loc);
         }
+        
+        // NOTE: GPU overlay buffer cannot be easily dumped (requires CUDA memcpy)
+        // Verify overlay by checking the output on DeckLink monitor
 
-        // Step 7: Hardware Internal Keying (ASYNC SCHEDULED)
+        // Step 7: GPU Compositing + Hardware Internal Keying (ASYNC SCHEDULED)
         println!();
-        println!("🎬 Step 7: Hardware Internal Keying (ASYNC SCHEDULED)");
+        println!("🎬 Step 7: GPU Composite + Hardware Internal Keying (ASYNC)");
         let keying_start = Instant::now();
         
-        // Sub-step 1: Upload BGRA overlay to GPU (reuse buffer from pool or allocate new)
-        let upload_start = Instant::now();
-        let mut overlay_gpu_buffer = if !gpu_buffers.is_empty() {
-            gpu_buffers.pop().unwrap()
-        } else {
-            cuda_device.alloc_zeros::<u8>(bgra_buffer.len())?
-        };
-        cuda_device.htod_sync_copy_into(&bgra_buffer, &mut overlay_gpu_buffer)?;
-        let upload_time = upload_start.elapsed();
-        total_keying_upload_ms += upload_time.as_secs_f64() * 1000.0;
+        // Sub-step 1: GPU Composite (ARGB overlay + UYVY video → BGRA output)
+        let composite_start = Instant::now();
+        let composited_memref = compositor.composite_gpu(&raw_frame_gpu, &overlay_frame)?;
+        let composite_time = composite_start.elapsed();
+        total_keying_upload_ms += composite_time.as_secs_f64() * 1000.0; // Reuse this counter for composite
         
-        // Sub-step 2: Create GPU packet for overlay
+        println!("      ✓ GPU Composite done: {:.2}ms", composite_time.as_secs_f64() * 1000.0);
+        println!("      → Input: UYVY (GPU) + ARGB (GPU)");
+        println!("      → Output: BGRA (GPU) at {:p}", composited_memref.ptr);
+        println!("      → ⚡ ZERO CPU COPY!");
+        
+        // Sub-step 2: Create GPU packet for output
         let packet_start = Instant::now();
-        let overlay_gpu_packet = common_io::RawFramePacket {
+        let composited_packet = common_io::RawFramePacket {
             meta: common_io::FrameMeta {
                 source_id: raw_frame_gpu.meta.source_id,
                 width,
@@ -829,12 +663,7 @@ fn main() -> Result<()> {
                 stride_bytes: (width * 4) as u32,
                 crop_region: None,
             },
-            data: MemRef {
-                ptr: *overlay_gpu_buffer.device_ptr() as *mut u8,
-                len: bgra_buffer.len(),
-                stride: (width * 4) as usize,
-                loc: common_io::MemLoc::Gpu { device: 0 },
-            },
+            data: composited_memref,
         };
         let packet_time = packet_start.elapsed();
         total_keying_packet_ms += packet_time.as_secs_f64() * 1000.0;
@@ -857,7 +686,7 @@ fn main() -> Result<()> {
         
         if buffered_count < max_queue_depth {
             let output_request = OutputRequest {
-                video: Some(&overlay_gpu_packet),
+                video: Some(&composited_packet),
                 overlay: None,
             };
             
@@ -925,8 +754,7 @@ fn main() -> Result<()> {
         let schedule_time = schedule_start.elapsed();
         total_keying_schedule_ms += schedule_time.as_secs_f64() * 1000.0;
         
-        // Return GPU buffer to pool (requirement #4 - recycle buffers)
-        gpu_buffers.push(overlay_gpu_buffer);
+        // Note: No GPU buffer to return - compositor manages its own buffers!
         
         let keying_time = keying_start.elapsed();
         total_keying_ms += keying_time.as_secs_f64() * 1000.0;
@@ -937,13 +765,13 @@ fn main() -> Result<()> {
         let queued_frames = buffered_count;
         
         println!("  [KEYR][ASYNC]");
-        println!("      ├─ gpu_upload_ms=    {:.2}ms", upload_time.as_secs_f64() * 1000.0);
+        println!("      ├─ gpu_composite_ms= {:.2}ms ⚡ ZERO CPU!", composite_time.as_secs_f64() * 1000.0);
         println!("      ├─ packet_build_ms=  {:.2}ms", packet_time.as_secs_f64() * 1000.0);
         println!("      ├─ schedule_call_ms= {:.2}ms", schedule_time.as_secs_f64() * 1000.0);
         println!("      └─ queued_frames=    {}/{}", queued_frames, max_queue_depth);
         println!("  ✓ Time: {:.2}ms", keying_time.as_secs_f64() * 1000.0);
         println!("  ✓ Mode: ASYNC SCHEDULED KEYING (Hardware-driven)");
-        println!("  ✓ Pipeline: BGRA CPU → GPU → DeckLink Scheduled Fill");
+        println!("  ✓ Pipeline: ARGB (GPU) + UYVY (GPU) → BGRA (GPU) → DeckLink");
         println!("  ✓ Hardware keyer: ACTIVE (Enable=FALSE, Level=255)");
         println!("  ✓ Playback: {}", if scheduled_playback_started { "RUNNING" } else { "PRE-ROLL" });
 
@@ -1008,14 +836,14 @@ fn main() -> Result<()> {
         println!("  7. 🎬 Hardware Keying:   {:6.2}ms ({:4.1}%) ⚡ ASYNC", 
             keying_time.as_secs_f64() * 1000.0,
             (keying_time.as_secs_f64() * 1000.0 / pipeline_ms) * 100.0);
-        println!("      ├─ CPU→GPU Upload:    {:6.2}ms", upload_time.as_secs_f64() * 1000.0);
+        println!("      ├─ GPU Composite:     {:6.2}ms ⚡ ZERO CPU", composite_time.as_secs_f64() * 1000.0);
         println!("      ├─ Packet Creation:   {:6.2}ms", packet_time.as_secs_f64() * 1000.0);
         println!("      └─ Schedule Call:     {:6.2}ms", schedule_time.as_secs_f64() * 1000.0);
         println!("────────────────────────────────────────────────────────────");
         println!("  🔴 END-TO-END (N2N):    {:6.2}ms ({:.1} FPS)", 
             pipeline_ms, 1000.0 / pipeline_ms);
         println!("  🔴 HARDWARE LATENCY:    {:6.2}ms", hardware_latency_ms);
-        println!("  🎯 Mode: ASYNC SCHEDULED (No ARGB→BGRA conversion)");
+        println!("  🎯 Mode: ASYNC SCHEDULED (GPU-only, ZERO CPU copy)");
         println!("════════════════════════════════════════════════════════════");
         println!();
 
@@ -1038,9 +866,9 @@ fn main() -> Result<()> {
             println!("  3. 🧠 Inference:         {:6.2}ms avg", total_inference_ms / frame_count as f64);
             println!("  4. 🎯 Postprocessing:    {:6.2}ms avg", total_postprocess_ms / frame_count as f64);
             println!("  5. 🎨 Overlay Planning:  {:6.2}ms avg", total_plan_ms / frame_count as f64);
-            println!("  6. 🖼️  Overlay Rendering:    {:6.2}ms avg ⚡ OPTIMIZED", total_render_ms / frame_count as f64);
+            println!("  6. 🖼️  Overlay Rendering:    {:6.2}ms avg ⚡ GPU", total_render_ms / frame_count as f64);
             println!("  7. 🎬 Hardware Keying:   {:6.2}ms avg ⚡ ASYNC", total_keying_ms / frame_count as f64);
-            println!("      ├─ CPU→GPU Upload:    {:6.2}ms avg", total_keying_upload_ms / frame_count as f64);
+            println!("      ├─ GPU Composite:     {:6.2}ms avg ⚡ ZERO CPU", total_keying_upload_ms / frame_count as f64);
             println!("      ├─ Packet Creation:   {:6.2}ms avg", total_keying_packet_ms / frame_count as f64);
             println!("      └─ Schedule Call:     {:6.2}ms avg", total_keying_schedule_ms / frame_count as f64);
             println!("  ─────────────────────────────────────────────────────────");
@@ -1055,7 +883,7 @@ fn main() -> Result<()> {
             println!("  Total frames processed:  {}", frame_count);
             println!("  Total elapsed time:      {:.2}s", elapsed);
             println!("  Real-time FPS:           {:.2} FPS", avg_fps);
-            println!("  Mode:                    ASYNC SCHEDULED BGRA");
+            println!("  Mode:                    ASYNC SCHEDULED (GPU-only)");
             println!();
             println!("  🎯 Adaptive Queue Management:");
             println!("  ─────────────────────────────────────────────────────────");
@@ -1086,9 +914,9 @@ fn main() -> Result<()> {
     println!("  3. 🧠 Inference:         {:6.2}ms avg", total_inference_ms / frame_count as f64);
     println!("  4. 🎯 Postprocessing:    {:6.2}ms avg", total_postprocess_ms / frame_count as f64);
     println!("  5. 🎨 Overlay Planning:  {:6.2}ms avg", total_plan_ms / frame_count as f64);
-    println!("  6. 🖼️  BGRA Rendering:    {:6.2}ms avg ⚡ OPTIMIZED", total_render_ms / frame_count as f64);
+    println!("  6. 🖼️  GPU Rendering:     {:6.2}ms avg ⚡ GPU-only", total_render_ms / frame_count as f64);
     println!("  7. 🎬 Hardware Keying:   {:6.2}ms avg ⚡ ASYNC", total_keying_ms / frame_count as f64);
-    println!("      ├─ CPU→GPU Upload:    {:6.2}ms avg", total_keying_upload_ms / frame_count as f64);
+    println!("      ├─ GPU Composite:     {:6.2}ms avg ⚡ ZERO CPU", total_keying_upload_ms / frame_count as f64);
     println!("      ├─ Packet Creation:   {:6.2}ms avg", total_keying_packet_ms / frame_count as f64);
     println!("      └─ Schedule Call:     {:6.2}ms avg", total_keying_schedule_ms / frame_count as f64);
     println!("  ─────────────────────────────────────────────────────────");
@@ -1103,7 +931,7 @@ fn main() -> Result<()> {
     println!("  Total frames processed:  {}", frame_count);
     println!("  Total elapsed time:      {:.2}s", total_elapsed);
     println!("  Real-time FPS:           {:.2} FPS", avg_fps);
-    println!("  Mode:                    ASYNC SCHEDULED BGRA");
+    println!("  Mode:                    ASYNC SCHEDULED (GPU-only)");
     println!();
     println!("  🎯 Adaptive Queue Management:");
     println!("  ─────────────────────────────────────────────────────────");
@@ -1121,9 +949,9 @@ fn main() -> Result<()> {
     println!();
     println!("  🚀 OPTIMIZATION SUMMARY:");
     println!("  ─────────────────────────────────────────────────────────");
-    println!("  ✅ Eliminated ARGB→BGRA conversion (~17ms saved)");
-    println!("  ✅ Direct BGRA rendering on CPU");
-    println!("  ✅ Single GPU upload (no intermediate buffers)");
+    println!("  ✅ GPU overlay rendering (CUDA kernels)");
+    println!("  ✅ GPU compositing (ARGB + UYVY → BGRA)");
+    println!("  ✅ ZERO CPU→GPU copy (all buffers stay on GPU)");
     println!("  ✅ Hardware keying with async scheduled playback");
     println!("  ✅ ADAPTIVE queue management (2-5 frames dynamic)");
     println!("  ✅ Callback-driven scheduling (non-blocking)");

@@ -188,7 +188,7 @@ impl Stage<OverlayPlanPacket, OverlayFramePacket> for RenderStage {
                             xywh.2 as c_int,
                             xywh.3 as c_int,
                             *thickness as c_int,
-                            color.0, color.1, color.2, color.3,
+                            color.3, color.0, color.1, color.2, // A, R, G, B (color is R,G,B,A)
                             self.stream,
                         );
                     }
@@ -204,7 +204,7 @@ impl Stage<OverlayPlanPacket, OverlayFramePacket> for RenderStage {
                             xywh.1 as c_int,
                             xywh.2 as c_int,
                             xywh.3 as c_int,
-                            color.0, color.1, color.2, color.3,
+                            color.3, color.0, color.1, color.2, // A, R, G, B (color is R,G,B,A)
                             self.stream,
                         );
                     }
@@ -222,7 +222,7 @@ impl Stage<OverlayPlanPacket, OverlayFramePacket> for RenderStage {
                                 pts[1].0 as c_int,
                                 pts[1].1 as c_int,
                                 *thickness as c_int,
-                                color.0, color.1, color.2, color.3,
+                                color.3, color.0, color.1, color.2, // A, R, G, B (color is R,G,B,A)
                                 self.stream,
                             );
                         }
