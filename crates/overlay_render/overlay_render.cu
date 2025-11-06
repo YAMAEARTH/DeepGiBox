@@ -14,11 +14,11 @@ __device__ inline void put_pixel(
 ) {
     if (x < 0 || y < 0 || x >= width || y >= height) return;
     int idx = y * stride + x * 4;
-    // Write ARGB format
-    buf[idx + 0] = a;  // Alpha
-    buf[idx + 1] = r;  // Red
-    buf[idx + 2] = g;  // Green
-    buf[idx + 3] = b;  // Blue
+    // Write BGRA format (for DeckLink internal keying)
+    buf[idx + 0] = b;  // Blue
+    buf[idx + 1] = g;  // Green
+    buf[idx + 2] = r;  // Red
+    buf[idx + 3] = a;  // Alpha
 }
 
 /**
@@ -120,10 +120,11 @@ __global__ void clear_buffer_kernel(
     if (x >= width || y >= height) return;
     
     int idx = y * stride + x * 4;
-    buf[idx + 0] = 0; // A
-    buf[idx + 1] = 0; // R
-    buf[idx + 2] = 0; // G
-    buf[idx + 3] = 0; // B
+    // BGRA format
+    buf[idx + 0] = 0; // B
+    buf[idx + 1] = 0; // G
+    buf[idx + 2] = 0; // R
+    buf[idx + 3] = 0; // A (transparent)
 }
 
 // ==================== C API สำหรับเรียกจาก Rust ====================

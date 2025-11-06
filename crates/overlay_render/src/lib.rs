@@ -261,10 +261,10 @@ impl Stage<OverlayPlanPacket, OverlayFramePacket> for RenderStage {
             eprintln!("[ERROR] CUDA kernel error detected: {}", last_err);
         }
         
-        // Return GPU buffer (ไม่มี CPU copy!)
+        // Return GPU buffer in BGRA format (ไม่มี CPU copy!)
         OverlayFramePacket {
             from: input.from,
-            argb: MemRef {
+            argb: MemRef {  // Note: field name is 'argb' but actual format is BGRA
                 ptr: gpu_ptr,
                 len: self.stride * h as usize,
                 stride: self.stride,

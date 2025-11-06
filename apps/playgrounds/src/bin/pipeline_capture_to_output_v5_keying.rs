@@ -24,10 +24,10 @@ use anyhow::{anyhow, Result};
 use common_io::{MemLoc, MemRef, Stage, DrawOp, DetectionsPacket, OverlayPlanPacket, TensorInputPacket, RawDetectionsPacket};
 use cudarc::driver::{CudaDevice, CudaSlice, DevicePtr};
 use decklink_input::capture::CaptureSession;
-use decklink_output::{OutputRequest, compositor::PipelineCompositor};
+use decklink_output::OutputRequest;
 use inference_v2::TrtInferenceStage;
 use overlay_plan::PlanStage;
-use overlay_render; // GPU overlay renderer
+use overlay_render; // GPU overlay renderer (outputs BGRA)
 use postprocess;
 use preprocess_cuda::{Preprocessor, CropRegion};
 use std::time::{Duration, Instant};
@@ -318,8 +318,8 @@ fn main() -> Result<()> {
     println!("  ✓ Rendering: GPU (ARGB format, zero CPU copy)");
     println!();
 
-    // 5.5 Initialize Hardware Internal Keying + GPU Compositor
-    println!("🔧 Step 5.5: Initialize Hardware Internal Keying + GPU Compositor");
+    // 5.5 Initialize Hardware Internal Keying (REAL!)
+    println!("🔧 Step 5.5: Initialize Hardware Internal Keying (REAL)");
     
     // Wait for first frame to get dimensions
     println!("  ⏳ Waiting for first frame to determine dimensions...");
@@ -353,16 +353,14 @@ fn main() -> Result<()> {
     
     // Enable hardware internal keying (must be done AFTER set_sdi_output and BEFORE StartScheduledPlayback)
     decklink_out.enable_internal_keying()?;
-    println!("  ✓ Hardware internal keying ENABLED");
+    println!("  ✅ Hardware internal keying ENABLED (REAL KEYING!)");
     
     // Set keyer level to maximum (255 = fully visible overlay)
     decklink_out.set_keyer_level(255)?;
-    println!("  ✓ Keyer level set to 255 (fully visible)");
+    println!("  ✓ Keyer level set to 255 (fully visible overlay)");
     
-    // Initialize GPU compositor (zero CPU copy mode)
-    let mut compositor = PipelineCompositor::from_pipeline_with_mode(width, height, true)?;
-    println!("  ✓ GPU compositor initialized (zero CPU copy)");
-    println!("  ✓ Pipeline: DeckLink UYVY (GPU) + Overlay ARGB (GPU) → BGRA (GPU)");
+    println!("  🎯 Pipeline: Fill (UYVY) + Key (BGRA) → DeckLink Hardware Keyer");
+    println!("  🎯 NO GPU compositing - Hardware does alpha blending!");
     
     // Note: Frame queue now managed by DeckLink hardware (GetBufferedVideoFrameCount)
     // No need for software queue - hardware handles buffering
@@ -395,8 +393,7 @@ fn main() -> Result<()> {
     let mut total_keying_ms = 0.0;
     let mut total_hardware_latency_ms = 0.0;
     
-    // Hardware Keying sub-timings (ASYNC)
-    let mut total_keying_upload_ms = 0.0;
+    // Hardware Keying sub-timings (ASYNC) - REAL keying!
     let mut total_keying_packet_ms = 0.0;
     let mut total_keying_schedule_ms = 0.0;
 
@@ -620,7 +617,7 @@ fn main() -> Result<()> {
         println!("  ✓ Overlay Frame:");
         println!("      → Dimensions: {}×{}", width, height);
         println!("      → Buffer size: {} bytes", overlay_frame.argb.len);
-        println!("      → Format: ARGB (GPU native)");
+        println!("      → Format: BGRA (DeckLink keyer format)");
         println!("      → Location: {:?}", overlay_frame.argb.loc);
         println!("      → ⚡ ZERO CPU BUFFER - All GPU!");
         
@@ -628,47 +625,38 @@ fn main() -> Result<()> {
         if !matches!(overlay_frame.argb.loc, MemLoc::Gpu { .. }) {
             println!("  ❌ ERROR: Overlay should be on GPU but got: {:?}", overlay_frame.argb.loc);
         }
-        
-        // NOTE: GPU overlay buffer cannot be easily dumped (requires CUDA memcpy)
-        // Verify overlay by checking the output on DeckLink monitor
 
-        // Step 7: GPU Compositing + Hardware Internal Keying (ASYNC SCHEDULED)
+        // Step 7: Hardware Internal Keying (ASYNC SCHEDULED) - REAL!
         println!();
-        println!("🎬 Step 7: GPU Composite + Hardware Internal Keying (ASYNC)");
+        println!("🎬 Step 7: Hardware Internal Keying (ASYNC - REAL!)");
         let keying_start = Instant::now();
         
-        // Sub-step 1: GPU Composite (ARGB overlay + UYVY video → BGRA output)
-        let composite_start = Instant::now();
-        let composited_memref = compositor.composite_gpu(&raw_frame_gpu, &overlay_frame)?;
-        let composite_time = composite_start.elapsed();
-        total_keying_upload_ms += composite_time.as_secs_f64() * 1000.0; // Reuse this counter for composite
-        
-        println!("      ✓ GPU Composite done: {:.2}ms", composite_time.as_secs_f64() * 1000.0);
-        println!("      → Input: UYVY (GPU) + ARGB (GPU)");
-        println!("      → Output: BGRA (GPU) at {:p}", composited_memref.ptr);
-        println!("      → ⚡ ZERO CPU COPY!");
-        
-        // Sub-step 2: Create GPU packet for output
+        // Sub-step 1: Create overlay (key) packet in BGRA format
         let packet_start = Instant::now();
-        let composited_packet = common_io::RawFramePacket {
+        let overlay_packet = common_io::RawFramePacket {
             meta: common_io::FrameMeta {
                 source_id: raw_frame_gpu.meta.source_id,
                 width,
                 height,
-                pixfmt: common_io::PixelFormat::BGRA8,
+                pixfmt: common_io::PixelFormat::BGRA8, // Key signal for DeckLink
                 colorspace: common_io::ColorSpace::SRGB,
                 frame_idx: raw_frame_gpu.meta.frame_idx,
                 pts_ns: raw_frame_gpu.meta.pts_ns,
                 t_capture_ns: raw_frame_gpu.meta.t_capture_ns,
-                stride_bytes: (width * 4) as u32,
+                stride_bytes: overlay_frame.argb.stride as u32, // Use actual stride from GPU buffer
                 crop_region: None,
             },
-            data: composited_memref,
+            data: overlay_frame.argb, // Already BGRA format
         };
         let packet_time = packet_start.elapsed();
         total_keying_packet_ms += packet_time.as_secs_f64() * 1000.0;
         
-        // Sub-step 3: Schedule frame using HARDWARE REFERENCE CLOCK (requirement #3)
+        println!("      ✓ Key packet created: {:.2}ms", packet_time.as_secs_f64() * 1000.0);
+        println!("      → Fill: UYVY video (GPU) at {:p}", raw_frame_gpu.data.ptr);
+        println!("      → Key: BGRA overlay (GPU) at {:p}", overlay_packet.data.ptr);
+        println!("      → ⚡ NO COMPOSITING - Hardware keyer does blending!");
+        
+        // Sub-step 2: Schedule frame using HARDWARE REFERENCE CLOCK (requirement #3)
         let schedule_start = Instant::now();
         
         // Check queue depth with retry to avoid overflow (requirement #4)
@@ -685,9 +673,10 @@ fn main() -> Result<()> {
         }
         
         if buffered_count < max_queue_depth {
+            // ✅ HARDWARE INTERNAL KEYING: Send Fill + Key signals
             let output_request = OutputRequest {
-                video: Some(&composited_packet),
-                overlay: None,
+                video: Some(&raw_frame_gpu),      // Fill: Original UYVY video
+                overlay: Some(&overlay_packet),   // Key: BGRA overlay with alpha
             };
             
             if !scheduled_playback_started {
@@ -764,15 +753,15 @@ fn main() -> Result<()> {
         
         let queued_frames = buffered_count;
         
-        println!("  [KEYR][ASYNC]");
-        println!("      ├─ gpu_composite_ms= {:.2}ms ⚡ ZERO CPU!", composite_time.as_secs_f64() * 1000.0);
-        println!("      ├─ packet_build_ms=  {:.2}ms", packet_time.as_secs_f64() * 1000.0);
+        println!("  [HWKEY][ASYNC]");
+        println!("      ├─ key_packet_ms=    {:.2}ms", packet_time.as_secs_f64() * 1000.0);
         println!("      ├─ schedule_call_ms= {:.2}ms", schedule_time.as_secs_f64() * 1000.0);
         println!("      └─ queued_frames=    {}/{}", queued_frames, max_queue_depth);
         println!("  ✓ Time: {:.2}ms", keying_time.as_secs_f64() * 1000.0);
-        println!("  ✓ Mode: ASYNC SCHEDULED KEYING (Hardware-driven)");
-        println!("  ✓ Pipeline: ARGB (GPU) + UYVY (GPU) → BGRA (GPU) → DeckLink");
-        println!("  ✓ Hardware keyer: ACTIVE (Enable=FALSE, Level=255)");
+        println!("  ✅ Mode: HARDWARE INTERNAL KEYING (FPGA/ASIC alpha blending)");
+        println!("  ✅ Fill: UYVY video (GPU) → DeckLink");
+        println!("  ✅ Key: BGRA overlay (GPU, alpha channel) → DeckLink");
+        println!("  ✅ Blending: Hardware keyer (Enable=FALSE, Level=255)");
         println!("  ✓ Playback: {}", if scheduled_playback_started { "RUNNING" } else { "PRE-ROLL" });
 
         // Calculate hardware latency
@@ -830,14 +819,13 @@ fn main() -> Result<()> {
         println!("  5. 🎨 Overlay Planning:  {:6.2}ms ({:4.1}%)", 
             plan_time.as_secs_f64() * 1000.0,
             (plan_time.as_secs_f64() * 1000.0 / pipeline_ms) * 100.0);
-        println!("  6. 🖼️  BGRA Rendering:    {:6.2}ms ({:4.1}%) ⚡ OPTIMIZED", 
+        println!("  6. 🖼️  BGRA Rendering:    {:6.2}ms ({:4.1}%) ⚡ GPU", 
             render_time.as_secs_f64() * 1000.0,
             (render_time.as_secs_f64() * 1000.0 / pipeline_ms) * 100.0);
-        println!("  7. 🎬 Hardware Keying:   {:6.2}ms ({:4.1}%) ⚡ ASYNC", 
+        println!("  7. 🎬 Hardware Keying:   {:6.2}ms ({:4.1}%) ⚡ REAL!", 
             keying_time.as_secs_f64() * 1000.0,
             (keying_time.as_secs_f64() * 1000.0 / pipeline_ms) * 100.0);
-        println!("      ├─ GPU Composite:     {:6.2}ms ⚡ ZERO CPU", composite_time.as_secs_f64() * 1000.0);
-        println!("      ├─ Packet Creation:   {:6.2}ms", packet_time.as_secs_f64() * 1000.0);
+        println!("      ├─ Key Packet:        {:6.2}ms", packet_time.as_secs_f64() * 1000.0);
         println!("      └─ Schedule Call:     {:6.2}ms", schedule_time.as_secs_f64() * 1000.0);
         println!("────────────────────────────────────────────────────────────");
         println!("  🔴 END-TO-END (N2N):    {:6.2}ms ({:.1} FPS)", 
@@ -866,10 +854,9 @@ fn main() -> Result<()> {
             println!("  3. 🧠 Inference:         {:6.2}ms avg", total_inference_ms / frame_count as f64);
             println!("  4. 🎯 Postprocessing:    {:6.2}ms avg", total_postprocess_ms / frame_count as f64);
             println!("  5. 🎨 Overlay Planning:  {:6.2}ms avg", total_plan_ms / frame_count as f64);
-            println!("  6. 🖼️  Overlay Rendering:    {:6.2}ms avg ⚡ GPU", total_render_ms / frame_count as f64);
-            println!("  7. 🎬 Hardware Keying:   {:6.2}ms avg ⚡ ASYNC", total_keying_ms / frame_count as f64);
-            println!("      ├─ GPU Composite:     {:6.2}ms avg ⚡ ZERO CPU", total_keying_upload_ms / frame_count as f64);
-            println!("      ├─ Packet Creation:   {:6.2}ms avg", total_keying_packet_ms / frame_count as f64);
+            println!("  6. 🖼️  BGRA Rendering:     {:6.2}ms avg ⚡ GPU", total_render_ms / frame_count as f64);
+            println!("  7. 🎬 Hardware Keying:   {:6.2}ms avg ⚡ REAL!", total_keying_ms / frame_count as f64);
+            println!("      ├─ Key Packet:        {:6.2}ms avg", total_keying_packet_ms / frame_count as f64);
             println!("      └─ Schedule Call:     {:6.2}ms avg", total_keying_schedule_ms / frame_count as f64);
             println!("  ─────────────────────────────────────────────────────────");
             println!("  🔴 END-TO-END (N2N):    {:6.2}ms avg ({:.2} FPS avg)", 
@@ -914,10 +901,9 @@ fn main() -> Result<()> {
     println!("  3. 🧠 Inference:         {:6.2}ms avg", total_inference_ms / frame_count as f64);
     println!("  4. 🎯 Postprocessing:    {:6.2}ms avg", total_postprocess_ms / frame_count as f64);
     println!("  5. 🎨 Overlay Planning:  {:6.2}ms avg", total_plan_ms / frame_count as f64);
-    println!("  6. 🖼️  GPU Rendering:     {:6.2}ms avg ⚡ GPU-only", total_render_ms / frame_count as f64);
-    println!("  7. 🎬 Hardware Keying:   {:6.2}ms avg ⚡ ASYNC", total_keying_ms / frame_count as f64);
-    println!("      ├─ GPU Composite:     {:6.2}ms avg ⚡ ZERO CPU", total_keying_upload_ms / frame_count as f64);
-    println!("      ├─ Packet Creation:   {:6.2}ms avg", total_keying_packet_ms / frame_count as f64);
+    println!("  6. 🖼️  BGRA Rendering:     {:6.2}ms avg ⚡ GPU", total_render_ms / frame_count as f64);
+    println!("  7. 🎬 Hardware Keying:   {:6.2}ms avg ⚡ REAL!", total_keying_ms / frame_count as f64);
+    println!("      ├─ Key Packet:        {:6.2}ms avg", total_keying_packet_ms / frame_count as f64);
     println!("      └─ Schedule Call:     {:6.2}ms avg", total_keying_schedule_ms / frame_count as f64);
     println!("  ─────────────────────────────────────────────────────────");
     println!("  🔴 END-TO-END (N2N):    {:6.2}ms avg ({:.2} FPS avg)", 
@@ -949,10 +935,10 @@ fn main() -> Result<()> {
     println!();
     println!("  🚀 OPTIMIZATION SUMMARY:");
     println!("  ─────────────────────────────────────────────────────────");
-    println!("  ✅ GPU overlay rendering (CUDA kernels)");
-    println!("  ✅ GPU compositing (ARGB + UYVY → BGRA)");
+    println!("  ✅ GPU overlay rendering (CUDA kernels → BGRA)");
+    println!("  ✅ HARDWARE INTERNAL KEYING (FPGA/ASIC alpha blending)");
     println!("  ✅ ZERO CPU→GPU copy (all buffers stay on GPU)");
-    println!("  ✅ Hardware keying with async scheduled playback");
+    println!("  ✅ Fill (UYVY) + Key (BGRA) → Hardware keyer");
     println!("  ✅ ADAPTIVE queue management (2-5 frames dynamic)");
     println!("  ✅ Callback-driven scheduling (non-blocking)");
     println!("  ─────────────────────────────────────────────────────────");

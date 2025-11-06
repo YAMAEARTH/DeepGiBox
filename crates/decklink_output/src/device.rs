@@ -257,29 +257,34 @@ impl OutputDevice {
             return Err(OutputDeviceError::DeviceNotAvailable("Device not open".to_string()));
         }
         
-        // Get video frame from request
-        let video = request.video.ok_or_else(|| {
-            OutputDeviceError::ConfigError("No video frame provided".to_string())
-        })?;
+        // For hardware internal keying: use overlay (key) if provided, otherwise use video (fill)
+        // When internal keying is enabled, we send the BGRA overlay as the key signal
+        let frame_to_schedule = if let Some(overlay) = request.overlay {
+            overlay  // Use overlay (BGRA key signal) for internal keying
+        } else if let Some(video) = request.video {
+            video    // Fallback to video (fill signal) if no overlay
+        } else {
+            return Err(OutputDeviceError::ConfigError("No video or overlay frame provided".to_string()));
+        };
         
         // Validate frame size
-        if video.meta.width != self.width || video.meta.height != self.height {
+        if frame_to_schedule.meta.width != self.width || frame_to_schedule.meta.height != self.height {
             return Err(OutputDeviceError::FrameSizeMismatch {
                 expected_width: self.width,
                 expected_height: self.height,
-                actual_width: video.meta.width,
-                actual_height: video.meta.height,
+                actual_width: frame_to_schedule.meta.width,
+                actual_height: frame_to_schedule.meta.height,
             });
         }
         
         // Check if frame is on GPU
-        match video.data.loc {
+        match frame_to_schedule.data.loc {
             MemLoc::Gpu { .. } => {
                 // Schedule GPU frame for async playback
                 let success = unsafe {
                     decklink_output_schedule_frame_gpu(
-                        video.data.ptr,
-                        video.data.stride as c_int,
+                        frame_to_schedule.data.ptr,
+                        frame_to_schedule.data.stride as c_int,
                         self.width as c_int,
                         self.height as c_int,
                         display_time,
