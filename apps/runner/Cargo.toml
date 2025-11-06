@@ -2,12 +2,20 @@
 name = "runner"
 version = "0.1.0"
 edition = "2021"
+
 [dependencies]
 anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+ctrlc = "3"
+cudarc = { version = "0.12", features = ["cuda-12060"] }
+device_query = "2.1"
+
+# Internal crates
 common_io = { path = "../../crates/common_io" }
 decklink_input = { path = "../../crates/decklink_input" }
 preprocess_cuda = { path = "../../crates/preprocess_cuda" }
-inference = { path = "../../crates/inference" }
+inference_v2 = { path = "../../crates/inference_v2" }
 postprocess = { path = "../../crates/postprocess" }
 overlay_plan = { path = "../../crates/overlay_plan" }
 overlay_render = { path = "../../crates/overlay_render" }

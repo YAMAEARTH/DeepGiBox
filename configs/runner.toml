@@ -1,0 +1,119 @@
+# =============================================================================
+# DeepGiBox Runner Configuration (Universal)
+# =============================================================================
+# Single config file for all endoscope types
+# Press keys 1, 2, 3 during runtime to switch between:
+#   1 = Fuji
+#   2 = Olympus  
+#   3 = Pentax
+# =============================================================================
+
+# Pipeline mode: "hardware_keying", "inference_only", or "visualization"
+mode = "hardware_keying"
+
+[general]
+test_duration_seconds = 0          # 0 = run indefinitely
+enable_debug_dumps = false
+debug_dump_frame_count = 5
+stats_print_interval = 60          # Print stats every N frames
+
+# =============================================================================
+# Video Capture Configuration
+# =============================================================================
+[capture]
+device_index = 0                   # DeckLink device index
+expected_resolution = "2160p30"    # 1080p60, 2160p60, etc.
+
+# =============================================================================
+# Preprocessing Configuration
+# =============================================================================
+[preprocessing]
+output_width = 512                 # Model input width (must match engine)
+output_height = 512                # Model input height (must match engine)
+use_fp16 = false                   # Use FP16 for preprocessing
+cuda_device = 0                    # CUDA device index
+mean = [0.0, 0.0, 0.0]            # Normalization mean
+std = [1.0, 1.0, 1.0]             # Normalization std
+chroma_order = "UYVY"              # UYVY or YUY2
+
+# Crop region (will be overridden by endoscope mode at runtime)
+crop_region = "Pentax"             # Legacy field (ignored when using endoscope modes)
+
+# Initial endoscope mode (can be changed with keys 1, 2, 3)
+initial_endoscope_mode = "olympus"  # "fuji", "olympus", or "pentax"
+
+# =============================================================================
+# Inference Configuration
+# =============================================================================
+[inference]
+engine_path = "configs/model/v7_optimized_YOLOv5.engine"
+lib_path = "trt-shim/build/libtrt_shim.so"
+
+# =============================================================================
+# Postprocessing Configuration
+# =============================================================================
+[postprocessing]
+num_classes = 2
+confidence_threshold = 0.25        # Confidence threshold (0.25 = balanced)
+nms_threshold = 0.45               # NMS IoU threshold
+max_detections = 100
+verbose_stats = false              # Print detailed postprocessing stats (anchors, NMS, temporal smoothing)
+
+[postprocessing.temporal_smoothing]
+enable = true
+window_size = 4                    # Number of frames for smoothing
+
+[postprocessing.tracking]
+enable = true
+max_age = 30                       # Maximum frames to keep track without detection
+min_confidence = 0.3               # Minimum confidence for tracking
+iou_threshold = 0.3                # IoU threshold for matching
+
+# =============================================================================
+# Overlay Configuration
+# =============================================================================
+[overlay]
+enable_full_ui = true
+
+[overlay.bbox]
+base_thickness = 4                 # Base thickness for bounding box
+corner_length_factor = 0.15        # Corner length as factor of box size
+corner_min_length = 30.0           # Minimum corner length in pixels
+corner_max_length = 80.0           # Maximum corner length in pixels
+corner_thickness = 6               # Corner line thickness
+
+[overlay.label]
+font_size = 24                     # Font size for labels
+show_confidence = true             # Show confidence score
+show_track_id = true               # Show tracking ID
+label_offset_y = -15.0             # Label offset from bbox top
+
+# =============================================================================
+# Rendering Configuration
+# =============================================================================
+[rendering]
+text_antialiasing = true
+# Enable debug rendering messages (prints [DEBUG] overlay operation details)
+debug_rendering = false
+
+# =============================================================================
+# Keying Configuration
+# =============================================================================
+[keying]
+keyer_level = 255                  # Keyer level (0-255)
+enable_internal_keying = true      # Enable DeckLink internal keying
+
+# =============================================================================
+# Performance Configuration
+# =============================================================================
+[performance]
+gpu_buffer_pool_size = 10
+gpu_buffer_reuse = true
+print_detailed_timings = true
+print_per_frame_latency = true
+
+# =============================================================================
+# Class Configuration
+# =============================================================================
+[classes]
+labels = ["polyp", "other"]

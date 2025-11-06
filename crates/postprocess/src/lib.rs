@@ -61,6 +61,16 @@ impl PostStage {
         ));
         self
     }
+
+    pub fn with_verbose_stats(mut self, verbose: bool) -> Self {
+        self.config.verbose_stats = verbose;
+        self
+    }
+
+    /// Update confidence threshold dynamically
+    pub fn set_confidence_threshold(&mut self, threshold: f32) {
+        self.config.confidence_threshold = threshold;
+    }
 }
 
 impl Stage<RawDetectionsPacket, DetectionsPacket> for PostStage {
@@ -102,11 +112,14 @@ impl Stage<RawDetectionsPacket, DetectionsPacket> for PostStage {
         );
 
         let duration = start.elapsed();
-        println!(
-            "  ✓ Postprocess time: {:.2}ms",
-            duration.as_secs_f64() * 1000.0
-        );
-        println!("  ✓ Detections found: {}", result.detections.len());
+        
+        if config.verbose_stats {
+            println!(
+                "  ✓ Postprocess time: {:.2}ms",
+                duration.as_secs_f64() * 1000.0
+            );
+            println!("  ✓ Detections found: {}", result.detections.len());
+        }
 
         // Apply SORT tracking if enabled
         let items = if let Some(tracker) = &mut self.tracker {
@@ -126,10 +139,12 @@ impl Stage<RawDetectionsPacket, DetectionsPacket> for PostStage {
             // Update tracker and get tracked detections
             let tracked = tracker.update(&detections_for_tracking);
 
-            println!(
-                "  ✓ SORT tracking: {} active tracks",
-                tracker.get_active_track_count()
-            );
+            if config.verbose_stats {
+                println!(
+                    "  ✓ SORT tracking: {} active tracks",
+                    tracker.get_active_track_count()
+                );
+            }
 
             // Convert tracked detections to common_io::Detection format
             tracked
@@ -191,6 +206,7 @@ impl Postprocess {
             use_stretch_resize: true,  // CUDA preprocessor uses stretch resize, not letterbox
             skip_sigmoid: false,  // Default: apply sigmoid (for models that output logits)
             crop_region: None,  // No crop by default (set per-frame in process())
+            verbose_stats: false,  // Disable verbose stats by default
         };
 
         Ok(Self {
@@ -424,6 +440,7 @@ pub fn from_path(_cfg: &str) -> Result<PostStage> {
         use_stretch_resize: true,  // CUDA preprocessor uses stretch resize, not letterbox
         skip_sigmoid: true,  // v7_optimized model outputs probabilities, not logits
         crop_region: None,  // No crop by default (set per-frame in process())
+        verbose_stats: false,  // Disable verbose stats by default
     };
 
     Ok(PostStage::new(config).with_temporal_smoothing(4))

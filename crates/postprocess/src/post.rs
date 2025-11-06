@@ -106,6 +106,8 @@ pub struct YoloPostConfig {
     /// Format: (crop_x, crop_y, crop_width, crop_height)
     /// When set, coordinates are scaled to crop dimensions and offset is added
     pub crop_region: Option<(u32, u32, u32, u32)>,
+    /// Print verbose statistics (anchor stats, temporal smoothing, NMS, etc.)
+    pub verbose_stats: bool,
 }
 
 pub fn postprocess_yolov5_with_temporal_smoothing(
@@ -118,12 +120,14 @@ pub fn postprocess_yolov5_with_temporal_smoothing(
     let mut decoded = decode_predictions(predictions, cfg);
     let decoded_count = decoded.len();
 
-    println!(
-        "    Postprocess stats: {} total anchors → {} passed confidence threshold ({:.1}%)",
-        total_anchors,
-        decoded_count,
-        (decoded_count as f32 / total_anchors as f32) * 100.0
-    );
+    if cfg.verbose_stats {
+        println!(
+            "    Postprocess stats: {} total anchors → {} passed confidence threshold ({:.1}%)",
+            total_anchors,
+            decoded_count,
+            (decoded_count as f32 / total_anchors as f32) * 100.0
+        );
+    }
 
     // Apply temporal smoothing if smoother is provided
     if let Some(smoother) = smoother {
@@ -139,7 +143,7 @@ pub fn postprocess_yolov5_with_temporal_smoothing(
         }
 
         // Debug: Print smoothing info for first few detections before moving current_scores
-        if !current_scores.is_empty() && smoothed_scores.len() > 0 {
+        if cfg.verbose_stats && !current_scores.is_empty() && smoothed_scores.len() > 0 {
             let history_size = smoother.frame_scores.len();
             if history_size >= 2 {
                 // Only print when we have enough history for actual smoothing
@@ -165,7 +169,9 @@ pub fn postprocess_yolov5_with_temporal_smoothing(
     let retained = apply_nms(decoded, cfg);
     let nms_count = retained.len();
 
-    println!("    After NMS: {} detections retained", nms_count);
+    if cfg.verbose_stats {
+        println!("    After NMS: {} detections retained", nms_count);
+    }
 
     let detections = retained
         .iter()
@@ -186,6 +192,20 @@ pub fn decode_predictions(predictions: &[f32], cfg: &YoloPostConfig) -> Vec<Cand
     };
     let (pad_x, pad_y) = cfg.letterbox_pad;
     let (orig_w, orig_h) = (cfg.original_size.0 as f32, cfg.original_size.1 as f32);
+    
+    // DEBUG: Sample first few predictions
+    if cfg.verbose_stats && predictions.len() >= stride * 3 {
+        println!("    [DEBUG decode] First 3 anchors:");
+        for i in 0..3 {
+            let offset = i * stride;
+            let obj = predictions[offset + 4];
+            let c0 = if stride > 5 { predictions[offset + 5] } else { 0.0 };
+            let c1 = if stride > 6 { predictions[offset + 6] } else { 0.0 };
+            println!("      Anchor {}: cx={:.2} cy={:.2} w={:.2} h={:.2} obj={:.4} cls=[{:.4}, {:.4}]",
+                     i, predictions[offset], predictions[offset+1], predictions[offset+2],
+                     predictions[offset+3], obj, c0, c1);
+        }
+    }
     
     // Pre-allocate with reasonable capacity to avoid reallocation
     let estimated_capacity = (predictions.len() / stride / 10).max(100).min(1000);

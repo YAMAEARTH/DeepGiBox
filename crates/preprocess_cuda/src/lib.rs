@@ -30,6 +30,8 @@ pub enum CropRegion {
     /// No cropping (use full frame)
     #[serde(rename = "none")]
     None,
+    /// Custom crop region (x, y, width, height)
+    Custom { x: u32, y: u32, width: u32, height: u32 },
 }
 
 impl CropRegion {
@@ -62,6 +64,10 @@ impl CropRegion {
             CropRegion::None => {
                 // Full frame - use actual input size
                 (0, 0, input_width, input_height)
+            }
+            CropRegion::Custom { x, y, width, height } => {
+                // Custom crop region - use as-is
+                (*x, *y, *width, *height)
             }
         }
     }
@@ -218,6 +224,12 @@ impl Preprocessor {
         self.expected_input_sizes = expected_sizes;
         self.skip_invalid_frames = skip_invalid;
         self
+    }
+
+    /// Update crop region dynamically (for runtime mode switching)
+    pub fn update_crop_region(&mut self, new_crop: CropRegion) -> Result<()> {
+        self.crop_region = new_crop;
+        Ok(())
     }
 
     /// Get or create output buffer

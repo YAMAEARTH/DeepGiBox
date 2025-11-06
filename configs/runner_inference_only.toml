@@ -1,0 +1,88 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# DeepGiBox Runner Configuration - Inference Only Pipeline
+# ═══════════════════════════════════════════════════════════════════════════
+# Benchmark mode: Maximum throughput without output overhead
+# Pipeline: Capture → Preprocess → Inference → Postprocess (no overlay/output)
+
+mode = "inference_only"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# GENERAL SETTINGS
+# ═══════════════════════════════════════════════════════════════════════════
+[general]
+# Test duration in seconds (0 = unlimited)
+test_duration_seconds = 60
+# Enable debug dumps
+enable_debug_dumps = true
+# Number of frames to dump
+debug_dump_frame_count = 10
+# Print statistics every N frames
+stats_print_interval = 30
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CAPTURE SETTINGS
+# ═══════════════════════════════════════════════════════════════════════════
+[capture]
+device_index = 0
+expected_resolution = "1080p60"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PREPROCESSING SETTINGS
+# ═══════════════════════════════════════════════════════════════════════════
+[preprocessing]
+output_width = 512
+output_height = 512
+use_fp16 = false
+cuda_device = 0
+mean = [0.0, 0.0, 0.0]
+std = [1.0, 1.0, 1.0]
+chroma_order = "UYVY"
+crop_region = "Olympus"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# INFERENCE SETTINGS
+# ═══════════════════════════════════════════════════════════════════════════
+[inference]
+engine_path = "configs/model/v7_optimized_YOLOv5.engine"
+lib_path = "trt-shim/build/libtrt_shim.so"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# POSTPROCESSING SETTINGS
+# ═══════════════════════════════════════════════════════════════════════════
+[postprocessing]
+num_classes = 2
+confidence_threshold = 0.25
+nms_threshold = 0.45
+max_detections = 100
+
+[postprocessing.temporal_smoothing]
+enable = true
+window_size = 4
+
+[postprocessing.tracking]
+enable = true
+max_age = 30
+min_confidence = 0.3
+iou_threshold = 0.3
+
+# ═══════════════════════════════════════════════════════════════════════════
+# OVERLAY SETTINGS (not used in inference-only mode)
+# ═══════════════════════════════════════════════════════════════════════════
+[overlay]
+enable_full_ui = false
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PERFORMANCE SETTINGS
+# ═══════════════════════════════════════════════════════════════════════════
+[performance]
+gpu_buffer_pool_size = 10
+gpu_buffer_reuse = true
+print_detailed_timings = false
+print_per_frame_latency = true
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CLASS LABELS
+# ═══════════════════════════════════════════════════════════════════════════
+[classes]
+labels = ["Hyper", "Neo"]
+modes = ["COLON", "EGD"]

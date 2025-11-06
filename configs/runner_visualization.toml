@@ -1,0 +1,118 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# DeepGiBox Runner Configuration - Visualization Pipeline  
+# ═══════════════════════════════════════════════════════════════════════════
+# Offline analysis mode: Save detection frames to disk for review
+# Pipeline: Capture → Preprocess → Inference → Postprocess → Overlay → Save to Disk
+# (Not yet implemented - placeholder for future feature)
+
+mode = "visualization"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# GENERAL SETTINGS
+# ═══════════════════════════════════════════════════════════════════════════
+[general]
+# Test duration in seconds (0 = unlimited)
+test_duration_seconds = 30
+# Enable debug dumps
+enable_debug_dumps = true
+# Number of frames to dump
+debug_dump_frame_count = 100
+# Print statistics every N frames
+stats_print_interval = 10
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CAPTURE SETTINGS
+# ═══════════════════════════════════════════════════════════════════════════
+[capture]
+device_index = 0
+expected_resolution = "1080p60"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PREPROCESSING SETTINGS
+# ═══════════════════════════════════════════════════════════════════════════
+[preprocessing]
+output_width = 512
+output_height = 512
+use_fp16 = false
+cuda_device = 0
+mean = [0.0, 0.0, 0.0]
+std = [1.0, 1.0, 1.0]
+chroma_order = "UYVY"
+crop_region = "Olympus"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# INFERENCE SETTINGS
+# ═══════════════════════════════════════════════════════════════════════════
+[inference]
+engine_path = "configs/model/v7_optimized_YOLOv5.engine"
+lib_path = "trt-shim/build/libtrt_shim.so"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# POSTPROCESSING SETTINGS
+# ═══════════════════════════════════════════════════════════════════════════
+[postprocessing]
+num_classes = 2
+confidence_threshold = 0.25
+nms_threshold = 0.45
+max_detections = 100
+
+[postprocessing.temporal_smoothing]
+enable = true
+window_size = 4
+
+[postprocessing.tracking]
+enable = true
+max_age = 30
+min_confidence = 0.3
+iou_threshold = 0.3
+
+# ═══════════════════════════════════════════════════════════════════════════
+# OVERLAY SETTINGS
+# ═══════════════════════════════════════════════════════════════════════════
+[overlay]
+enable_full_ui = true
+
+[overlay.bbox]
+base_thickness = 3
+corner_length_factor = 0.22
+corner_min_length = 18.0
+corner_max_length = 40.0
+corner_thickness = 4
+
+[overlay.label]
+font_size = 18
+show_confidence = true
+show_track_id = true
+label_offset_y = 10.0
+
+# ═══════════════════════════════════════════════════════════════════════════
+# RENDERING SETTINGS
+# ═══════════════════════════════════════════════════════════════════════════
+[rendering]
+text_antialiasing = true
+
+# ═══════════════════════════════════════════════════════════════════════════
+# VISUALIZATION SETTINGS (future feature)
+# ═══════════════════════════════════════════════════════════════════════════
+# [visualization]
+# output_directory = "output/visualization"
+# output_format = "png"  # "png", "jpeg", "mp4"
+# save_interval = 1  # Save every N frames
+# include_timestamp = true
+# include_metadata = true
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PERFORMANCE SETTINGS
+# ═══════════════════════════════════════════════════════════════════════════
+[performance]
+gpu_buffer_pool_size = 10
+gpu_buffer_reuse = true
+print_detailed_timings = true
+print_per_frame_latency = false
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CLASS LABELS
+# ═══════════════════════════════════════════════════════════════════════════
+[classes]
+labels = ["Hyper", "Neo"]
+modes = ["COLON", "EGD"]

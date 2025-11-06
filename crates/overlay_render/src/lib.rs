@@ -81,6 +81,7 @@ pub struct RenderStage {
     height: u32,
     stride: usize,
     device_id: u32,
+    debug_mode: bool,
 }
 
 impl RenderStage {
@@ -122,6 +123,11 @@ pub fn from_path(cfg: &str) -> Result<RenderStage> {
         .and_then(|s| s.trim_start_matches("device=").parse::<u32>().ok())
         .unwrap_or(0);
     
+    // Parse debug mode from config (default: false)
+    let debug_mode = cfg
+        .split(',')
+        .any(|s| s.trim() == "debug" || s.trim() == "debug=true");
+    
     // Create CUDA stream
     let mut stream: *mut c_void = ptr::null_mut();
     let result = unsafe { cudaStreamCreate(&mut stream) };
@@ -136,6 +142,7 @@ pub fn from_path(cfg: &str) -> Result<RenderStage> {
         height: 0,
         stride: 0,
         device_id,
+        debug_mode,
     })
 }
 
@@ -177,8 +184,10 @@ impl Stage<OverlayPlanPacket, OverlayFramePacket> for RenderStage {
         for (i, op) in input.ops.iter().enumerate() {
             match op {
                 DrawOp::Rect { xywh, thickness, color } => {
-                    eprintln!("[DEBUG] Op #{}: Rect at ({},{}) size {}x{} thickness={} color=RGBA({},{},{},{})",
-                              i, xywh.0, xywh.1, xywh.2, xywh.3, thickness, color.0, color.1, color.2, color.3);
+                    if self.debug_mode {
+                        eprintln!("[DEBUG] Op #{}: Rect at ({},{}) size {}x{} thickness={} color=RGBA({},{},{},{})",
+                                  i, xywh.0, xywh.1, xywh.2, xywh.3, thickness, color.0, color.1, color.2, color.3);
+                    }
                     unsafe {
                         launch_draw_rect(
                             gpu_ptr,
@@ -196,8 +205,10 @@ impl Stage<OverlayPlanPacket, OverlayFramePacket> for RenderStage {
                     }
                 }
                 DrawOp::FillRect { xywh, color } => {
-                    eprintln!("[DEBUG] Op #{}: FillRect at ({},{}) size {}x{} color=RGBA({},{},{},{})",
-                              i, xywh.0, xywh.1, xywh.2, xywh.3, color.0, color.1, color.2, color.3);
+                    if self.debug_mode {
+                        eprintln!("[DEBUG] Op #{}: FillRect at ({},{}) size {}x{} color=RGBA({},{},{},{})",
+                                  i, xywh.0, xywh.1, xywh.2, xywh.3, color.0, color.1, color.2, color.3);
+                    }
                     unsafe {
                         launch_fill_rect(
                             gpu_ptr,
@@ -215,8 +226,10 @@ impl Stage<OverlayPlanPacket, OverlayFramePacket> for RenderStage {
                 }
                 DrawOp::Poly { pts, thickness, color } => {
                     if pts.len() >= 2 {
-                        eprintln!("[DEBUG] Op #{}: Line from ({},{}) to ({},{}) thickness={} color=RGBA({},{},{},{})",
-                                  i, pts[0].0, pts[0].1, pts[1].0, pts[1].1, thickness, color.0, color.1, color.2, color.3);
+                        if self.debug_mode {
+                            eprintln!("[DEBUG] Op #{}: Line from ({},{}) to ({},{}) thickness={} color=RGBA({},{},{},{})",
+                                      i, pts[0].0, pts[0].1, pts[1].0, pts[1].1, thickness, color.0, color.1, color.2, color.3);
+                        }
                         unsafe {
                             launch_draw_line(
                                 gpu_ptr,
@@ -247,7 +260,7 @@ impl Stage<OverlayPlanPacket, OverlayFramePacket> for RenderStage {
         };
         if sync_result != CUDA_SUCCESS {
             eprintln!("[ERROR] cudaStreamSynchronize failed: {}", sync_result);
-        } else {
+        } else if self.debug_mode {
             eprintln!("[DEBUG] Stream synchronized successfully");
         }
         
