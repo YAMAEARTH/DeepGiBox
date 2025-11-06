@@ -5,7 +5,7 @@ use std::{fmt, ptr};
 extern "C" {
     fn cudaMalloc(dev_ptr: *mut *mut c_void, size: usize) -> c_int;
     fn cudaFree(dev_ptr: *mut c_void) -> c_int;
-    fn cudaMemcpy(
+    pub(crate) fn cudaMemcpy(
         dst: *mut c_void,
         src: *const c_void,
         count: usize,

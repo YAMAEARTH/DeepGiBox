@@ -12,6 +12,9 @@ fn main() {
     let keying_dir = workspace_root.join("keying");
     let cuda_compat_h = keying_dir.join("cuda_compat.h");
     
+    // compositor_gpu.cu in src directory
+    let compositor_gpu_cu = manifest_dir.join("src").join("compositor_gpu.cu");
+    
     let mut build = cc::Build::new();
     build
         .cuda(true)
@@ -69,6 +72,12 @@ fn main() {
     if build_kernel {
         println!("cargo:warning=Building CUDA kernel: {}", keying_cu.display());
         build.file(&keying_cu);
+        
+        // Build compositor_gpu.cu if exists
+        if compositor_gpu_cu.exists() {
+            println!("cargo:warning=Building compositor GPU kernel: {}", compositor_gpu_cu.display());
+            build.file(&compositor_gpu_cu);
+        }
     }
 
     for dir in extra_link_search.iter().filter(|p| p.exists()) {
@@ -79,6 +88,7 @@ fn main() {
     }
 
     println!("cargo:rerun-if-changed={}", keying_cu.display());
+    println!("cargo:rerun-if-changed={}", compositor_gpu_cu.display());
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
 

@@ -1,100 +1,273 @@
 use anyhow::Result;
 use common_io::{MemLoc, MemRef, OverlayFramePacket, OverlayPlanPacket, Stage, DrawOp};
+use std::os::raw::{c_int, c_void};
+use std::ptr;
 
-// ----- Minimal CPU drawing helpers (ARGB) -----
-fn put_pixel(buf: &mut [u8], stride: usize, w: usize, h: usize, x: i32, y: i32, a: u8, r: u8, g: u8, b: u8) {
-    if x < 0 || y < 0 { return; }
-    let (x, y) = (x as usize, y as usize);
-    if x >= w || y >= h { return; }
-    let idx = y * stride + x * 4;
-    buf[idx + 0] = a;
-    buf[idx + 1] = r;
-    buf[idx + 2] = g;
-    buf[idx + 3] = b;
+// ==================== CUDA FFI ====================
+extern "C" {
+    fn cudaMalloc(dev_ptr: *mut *mut c_void, size: usize) -> c_int;
+    fn cudaFree(dev_ptr: *mut c_void) -> c_int;
+    fn cudaStreamCreate(stream: *mut *mut c_void) -> c_int;
+    fn cudaStreamDestroy(stream: *mut c_void) -> c_int;
+    fn cudaStreamSynchronize(stream: *mut c_void) -> c_int;
+    
+    // CUDA kernels จาก overlay_render.cu
+    fn launch_clear_buffer(
+        gpu_buf: *mut u8,
+        stride: c_int,
+        width: c_int,
+        height: c_int,
+        stream: *mut c_void,
+    );
+    
+    fn launch_draw_line(
+        gpu_buf: *mut u8,
+        stride: c_int,
+        width: c_int,
+        height: c_int,
+        x0: c_int,
+        y0: c_int,
+        x1: c_int,
+        y1: c_int,
+        thickness: c_int,
+        a: u8,
+        r: u8,
+        g: u8,
+        b: u8,
+        stream: *mut c_void,
+    );
+    
+    fn launch_draw_rect(
+        gpu_buf: *mut u8,
+        stride: c_int,
+        width: c_int,
+        height: c_int,
+        x: c_int,
+        y: c_int,
+        w: c_int,
+        h: c_int,
+        thickness: c_int,
+        a: u8,
+        r: u8,
+        g: u8,
+        b: u8,
+        stream: *mut c_void,
+    );
+    
+    fn launch_fill_rect(
+        gpu_buf: *mut u8,
+        stride: c_int,
+        width: c_int,
+        height: c_int,
+        x: c_int,
+        y: c_int,
+        w: c_int,
+        h: c_int,
+        a: u8,
+        r: u8,
+        g: u8,
+        b: u8,
+        stream: *mut c_void,
+    );
 }
 
-fn draw_line(buf: &mut [u8], stride: usize, w: usize, h: usize, x0: i32, y0: i32, x1: i32, y1: i32, thickness: i32, color: (u8, u8, u8, u8)) {
-    // Bresenham with naive thickness (square brush)
-    let (mut x0, mut y0, x1, y1) = (x0, y0, x1, y1);
-    let dx = (x1 - x0).abs();
-    let sx = if x0 < x1 { 1 } else { -1 };
-    let dy = -(y1 - y0).abs();
-    let sy = if y0 < y1 { 1 } else { -1 };
-    let mut err = dx + dy;
-    let rad = thickness.max(1) / 2;
-    loop {
-        for oy in -rad..=rad {
-            for ox in -rad..=rad {
-                put_pixel(buf, stride, w, h, x0 + ox, y0 + oy, color.0, color.1, color.2, color.3);
-            }
+const CUDA_SUCCESS: c_int = 0;
+
+// ==================== GPU Render Stage ====================
+pub struct RenderStage {
+    gpu_buf: Option<*mut u8>,
+    stream: *mut c_void,
+    width: u32,
+    height: u32,
+    stride: usize,
+    device_id: u32,
+}
+
+impl RenderStage {
+    fn ensure_buffer(&mut self, width: u32, height: u32) -> Result<()> {
+        // ถ้ามี buffer แล้วและขนาดตรง ไม่ต้องทำอะไร
+        if self.gpu_buf.is_some() && self.width == width && self.height == height {
+            return Ok(());
         }
-        if x0 == x1 && y0 == y1 { break; }
-        let e2 = 2 * err;
-        if e2 >= dy { err += dy; x0 += sx; }
-        if e2 <= dx { err += dx; y0 += sy; }
+        
+        // ถ้ามี buffer เก่า free ก่อน
+        if let Some(ptr) = self.gpu_buf {
+            unsafe { cudaFree(ptr as *mut c_void); }
+        }
+        
+        // Allocate GPU buffer ใหม่
+        let stride = (width * 4) as usize;
+        let size = stride * height as usize;
+        let mut dev_ptr: *mut c_void = ptr::null_mut();
+        
+        let result = unsafe { cudaMalloc(&mut dev_ptr, size) };
+        if result != CUDA_SUCCESS || dev_ptr.is_null() {
+            anyhow::bail!("Failed to allocate GPU buffer for overlay rendering");
+        }
+        
+        self.gpu_buf = Some(dev_ptr as *mut u8);
+        self.width = width;
+        self.height = height;
+        self.stride = stride;
+        
+        Ok(())
     }
 }
 
-fn draw_rect_outline(buf: &mut [u8], stride: usize, w: usize, h: usize, x: i32, y: i32, ww: i32, hh: i32, thickness: i32, color: (u8, u8, u8, u8)) {
-    if ww <= 0 || hh <= 0 { return; }
-    let x2 = x + ww;
-    let y2 = y + hh;
-    draw_line(buf, stride, w, h, x, y, x2, y, thickness, color);
-    draw_line(buf, stride, w, h, x2, y, x2, y2, thickness, color);
-    draw_line(buf, stride, w, h, x2, y2, x, y2, thickness, color);
-    draw_line(buf, stride, w, h, x, y2, x, y, thickness, color);
+pub fn from_path(cfg: &str) -> Result<RenderStage> {
+    // Parse device ID from config (default: 0)
+    let device_id = cfg
+        .split(',')
+        .find(|s| s.starts_with("device="))
+        .and_then(|s| s.trim_start_matches("device=").parse::<u32>().ok())
+        .unwrap_or(0);
+    
+    // Create CUDA stream
+    let mut stream: *mut c_void = ptr::null_mut();
+    let result = unsafe { cudaStreamCreate(&mut stream) };
+    if result != CUDA_SUCCESS {
+        anyhow::bail!("Failed to create CUDA stream for overlay rendering");
+    }
+    
+    Ok(RenderStage {
+        gpu_buf: None,
+        stream,
+        width: 0,
+        height: 0,
+        stride: 0,
+        device_id,
+    })
 }
 
-pub fn from_path(_cfg: &str) -> Result<RenderStage> {
-    Ok(RenderStage {})
-}
-pub struct RenderStage {}
 impl Stage<OverlayPlanPacket, OverlayFramePacket> for RenderStage {
     fn process(&mut self, input: OverlayPlanPacket) -> OverlayFramePacket {
-        // Create ARGB buffer
-        let w = input.canvas.0 as usize;
-        let h = input.canvas.1 as usize;
-        let stride = w * 4;
-
-        let mut buf = vec![0u8; h * stride];
-
-        // Execute ops
+        let w = input.canvas.0;
+        let h = input.canvas.1;
+        
+        // Ensure GPU buffer is allocated
+        if let Err(e) = self.ensure_buffer(w, h) {
+            eprintln!("GPU overlay render error: {}", e);
+            // Fallback: return empty overlay
+            return OverlayFramePacket {
+                from: input.from,
+                argb: MemRef {
+                    ptr: ptr::null_mut(),
+                    len: 0,
+                    stride: 0,
+                    loc: MemLoc::Gpu { device: self.device_id },
+                },
+                stride: 0,
+            };
+        }
+        
+        let gpu_ptr = self.gpu_buf.unwrap();
+        
+        // Clear buffer (transparent)
+        unsafe {
+            launch_clear_buffer(
+                gpu_ptr,
+                self.stride as c_int,
+                w as c_int,
+                h as c_int,
+                self.stream,
+            );
+        }
+        
+        // Execute drawing operations on GPU
         for op in &input.ops {
             match op {
                 DrawOp::Rect { xywh, thickness, color } => {
-                    let (x, y, ww, hh) = (xywh.0 as i32, xywh.1 as i32, xywh.2 as i32, xywh.3 as i32);
-                    draw_rect_outline(&mut buf, stride, w, h, x, y, ww, hh, *thickness as i32, *color);
+                    unsafe {
+                        launch_draw_rect(
+                            gpu_ptr,
+                            self.stride as c_int,
+                            w as c_int,
+                            h as c_int,
+                            xywh.0 as c_int,
+                            xywh.1 as c_int,
+                            xywh.2 as c_int,
+                            xywh.3 as c_int,
+                            *thickness as c_int,
+                            color.0, color.1, color.2, color.3,
+                            self.stream,
+                        );
+                    }
                 }
                 DrawOp::FillRect { xywh, color } => {
-                    let (x, y, ww, hh) = (xywh.0 as i32, xywh.1 as i32, xywh.2 as i32, xywh.3 as i32);
-                    for yy in y.max(0)..(y+hh).min(h as i32) {
-                        for xx in x.max(0)..(x+ww).min(w as i32) {
-                            put_pixel(&mut buf, stride, w, h, xx, yy, color.0, color.1, color.2, color.3);
-                        }
+                    unsafe {
+                        launch_fill_rect(
+                            gpu_ptr,
+                            self.stride as c_int,
+                            w as c_int,
+                            h as c_int,
+                            xywh.0 as c_int,
+                            xywh.1 as c_int,
+                            xywh.2 as c_int,
+                            xywh.3 as c_int,
+                            color.0, color.1, color.2, color.3,
+                            self.stream,
+                        );
                     }
                 }
                 DrawOp::Poly { pts, thickness, color } => {
                     if pts.len() >= 2 {
-                        let (x0, y0) = (pts[0].0 as i32, pts[0].1 as i32);
-                        let (x1, y1) = (pts[1].0 as i32, pts[1].1 as i32);
-                        draw_line(&mut buf, stride, w, h, x0, y0, x1, y1, *thickness as i32, *color);
+                        unsafe {
+                            launch_draw_line(
+                                gpu_ptr,
+                                self.stride as c_int,
+                                w as c_int,
+                                h as c_int,
+                                pts[0].0 as c_int,
+                                pts[0].1 as c_int,
+                                pts[1].0 as c_int,
+                                pts[1].1 as c_int,
+                                *thickness as c_int,
+                                color.0, color.1, color.2, color.3,
+                                self.stream,
+                            );
+                        }
                     }
                 }
-                DrawOp::Label { anchor: _, text: _, font_px: _, color: _ } => {
-                    // No-op for text in minimal renderer (color parsed)
+                DrawOp::Label { .. } => {
+                    // TODO: GPU text rendering (ใช้ texture atlas หรือ SDF fonts)
+                    // ตอนนี้ skip ไปก่อน
                 }
             }
         }
-
-        // Leak buffer to keep memory alive (since MemRef carries a raw pointer w/o ownership)
-        let len = buf.len();
-        let boxed = buf.into_boxed_slice();
-        let ptr = Box::into_raw(boxed) as *mut u8;
-
+        
+        // Synchronize stream เพื่อให้แน่ใจว่า rendering เสร็จ
+        unsafe {
+            cudaStreamSynchronize(self.stream);
+        }
+        
+        // Return GPU buffer (ไม่มี CPU copy!)
         OverlayFramePacket {
             from: input.from,
-            argb: MemRef { ptr, len, stride, loc: MemLoc::Cpu },
-            stride,
+            argb: MemRef {
+                ptr: gpu_ptr,
+                len: self.stride * h as usize,
+                stride: self.stride,
+                loc: MemLoc::Gpu { device: self.device_id },
+            },
+            stride: self.stride,
         }
     }
 }
+
+impl Drop for RenderStage {
+    fn drop(&mut self) {
+        if let Some(ptr) = self.gpu_buf {
+            unsafe {
+                cudaFree(ptr as *mut c_void);
+            }
+        }
+        if !self.stream.is_null() {
+            unsafe {
+                cudaStreamDestroy(self.stream);
+            }
+        }
+    }
+}
+
+unsafe impl Send for RenderStage {}
+unsafe impl Sync for RenderStage {}

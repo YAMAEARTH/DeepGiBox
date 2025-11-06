@@ -8,7 +8,33 @@
 use crate::image_loader::BgraImage;
 use crate::output::{GpuBuffer, OutputError, OutputSession};
 use common_io::{MemLoc, MemRef, OverlayFramePacket, RawFramePacket};
+use std::os::raw::{c_int, c_void};
 use std::path::Path;
+use std::ptr;
+
+// ==================== GPU Compositor FFI ====================
+extern "C" {
+    fn cudaMalloc(dev_ptr: *mut *mut c_void, size: usize) -> c_int;
+    fn cudaFree(dev_ptr: *mut c_void) -> c_int;
+    fn cudaStreamCreate(stream: *mut *mut c_void) -> c_int;
+    fn cudaStreamDestroy(stream: *mut c_void) -> c_int;
+    fn cudaStreamSynchronize(stream: *mut c_void) -> c_int;
+    
+    // จาก compositor_gpu.cu
+    fn launch_composite_argb_overlay(
+        decklink_uyvy_gpu: *const u8,
+        overlay_argb_gpu: *const u8,
+        output_bgra_gpu: *mut u8,
+        width: c_int,
+        height: c_int,
+        decklink_pitch: c_int,
+        overlay_pitch: c_int,
+        output_pitch: c_int,
+        stream: *mut c_void,
+    );
+}
+
+const CUDA_SUCCESS: c_int = 0;
 
 /// Source of overlay graphics
 #[derive(Debug, Clone)]
@@ -24,8 +50,12 @@ pub struct PipelineCompositor {
     session: OutputSession,
     source: OverlaySource,
     overlay_buffer: Option<GpuBuffer>,
+    // GPU compositor (ไม่ใช้ OutputSession แล้ว)
+    output_buffer: Option<*mut u8>,
+    stream: *mut c_void,
     width: u32,
     height: u32,
+    use_gpu_compositor: bool,
 }
 
 impl PipelineCompositor {
@@ -46,32 +76,85 @@ impl PipelineCompositor {
                 png_path.as_ref().to_string_lossy().to_string(),
             ),
             overlay_buffer: None,
+            output_buffer: None,
+            stream: ptr::null_mut(),
             width,
             height,
+            use_gpu_compositor: false,
         })
     }
 
     /// Create compositor that uses dynamic overlay from pipeline
     pub fn from_pipeline(width: u32, height: u32) -> Result<Self, OutputError> {
-        // Create empty BGRA image as placeholder
-        let empty_data = vec![0u8; (width * height * 4) as usize];
-        let empty_image = BgraImage {
-            data: empty_data,
-            width,
-            height,
-            pitch: (width * 4) as usize,
-        };
+        Self::from_pipeline_with_mode(width, height, true)
+    }
+    
+    /// Create compositor with explicit GPU mode control
+    pub fn from_pipeline_with_mode(width: u32, height: u32, use_gpu: bool) -> Result<Self, OutputError> {
+        if use_gpu {
+            // GPU compositor - ไม่ต้องใช้ OutputSession เลย
+            // Allocate output buffer
+            let stride = (width * 4) as usize;
+            let size = stride * height as usize;
+            let mut dev_ptr: *mut c_void = ptr::null_mut();
+            
+            let result = unsafe { cudaMalloc(&mut dev_ptr, size) };
+            if result != CUDA_SUCCESS || dev_ptr.is_null() {
+                return Err(OutputError::CudaAllocationFailed);
+            }
+            
+            // Create CUDA stream
+            let mut stream: *mut c_void = ptr::null_mut();
+            let result = unsafe { cudaStreamCreate(&mut stream) };
+            if result != CUDA_SUCCESS {
+                unsafe { cudaFree(dev_ptr); }
+                return Err(OutputError::CudaStreamFailed);
+            }
+            
+            // Create dummy session (ไว้ compatibility)
+            let empty_data = vec![0u8; (width * height * 4) as usize];
+            let empty_image = BgraImage {
+                data: empty_data,
+                width,
+                height,
+                pitch: (width * 4) as usize,
+            };
+            let session = OutputSession::new(width, height, &empty_image)?;
+            
+            Ok(PipelineCompositor {
+                session,
+                source: OverlaySource::Pipeline,
+                overlay_buffer: None,
+                output_buffer: Some(dev_ptr as *mut u8),
+                stream,
+                width,
+                height,
+                use_gpu_compositor: true,
+            })
+        } else {
+            // Legacy mode (CPU conversion)
+            let empty_data = vec![0u8; (width * height * 4) as usize];
+            let empty_image = BgraImage {
+                data: empty_data,
+                width,
+                height,
+                pitch: (width * 4) as usize,
+            };
 
-        let session = OutputSession::new(width, height, &empty_image)?;
-        let overlay_buffer = GpuBuffer::new(width, height)?;
+            let session = OutputSession::new(width, height, &empty_image)?;
+            let overlay_buffer = GpuBuffer::new(width, height)?;
 
-        Ok(PipelineCompositor {
-            session,
-            source: OverlaySource::Pipeline,
-            overlay_buffer: Some(overlay_buffer),
-            width,
-            height,
-        })
+            Ok(PipelineCompositor {
+                session,
+                source: OverlaySource::Pipeline,
+                overlay_buffer: Some(overlay_buffer),
+                output_buffer: None,
+                stream: ptr::null_mut(),
+                width,
+                height,
+                use_gpu_compositor: false,
+            })
+        }
     }
 
     /// Update overlay from pipeline (only for Pipeline source)
@@ -119,7 +202,62 @@ impl PipelineCompositor {
         }
     }
 
-    /// Composite overlay onto video frame
+    /// Composite overlay onto video frame (GPU version - zero CPU copy)
+    /// 
+    /// # Arguments
+    /// * `video_frame` - Input video frame (UYVY on GPU from DeckLink)
+    /// * `overlay_frame` - Overlay (ARGB on GPU from overlay_render)
+    /// 
+    /// # Returns
+    /// * Composited BGRA frame on GPU
+    pub fn composite_gpu(
+        &mut self,
+        video_frame: &RawFramePacket,
+        overlay_frame: &OverlayFramePacket,
+    ) -> Result<MemRef, OutputError> {
+        if !self.use_gpu_compositor {
+            return Err(OutputError::InvalidDimensions); // fallback to old method
+        }
+        
+        // Validate frames are on GPU
+        match (&video_frame.data.loc, &overlay_frame.argb.loc) {
+            (MemLoc::Gpu { .. }, MemLoc::Gpu { .. }) => {}
+            _ => return Err(OutputError::NullPointer),
+        }
+        
+        let output_ptr = self.output_buffer.ok_or(OutputError::NullPointer)?;
+        let stride = (self.width * 4) as usize;
+        
+        // Launch GPU composite kernel
+        unsafe {
+            launch_composite_argb_overlay(
+                video_frame.data.ptr,
+                overlay_frame.argb.ptr,
+                output_ptr,
+                self.width as c_int,
+                self.height as c_int,
+                video_frame.data.stride as c_int,
+                overlay_frame.stride as c_int,
+                stride as c_int,
+                self.stream,
+            );
+            
+            // Synchronize
+            let result = cudaStreamSynchronize(self.stream);
+            if result != CUDA_SUCCESS {
+                return Err(OutputError::CudaStreamFailed);
+            }
+        }
+        
+        Ok(MemRef {
+            ptr: output_ptr,
+            len: stride * self.height as usize,
+            stride,
+            loc: MemLoc::Gpu { device: 0 },
+        })
+    }
+    
+    /// Composite overlay onto video frame (legacy version)
     /// 
     /// # Arguments
     /// * `video_frame` - Input video frame (UYVY on GPU from DeckLink)
@@ -162,7 +300,46 @@ impl PipelineCompositor {
 
     /// Download composited frame to CPU (for debugging/preview)
     pub fn download_output(&self) -> Result<Vec<u8>, OutputError> {
-        self.session.download_output()
+        if self.use_gpu_compositor {
+            // Download from GPU output buffer
+            if let Some(ptr) = self.output_buffer {
+                let size = (self.width * self.height * 4) as usize;
+                let mut host_data = vec![0u8; size];
+                
+                unsafe {
+                    let result = crate::output::cudaMemcpy(
+                        host_data.as_mut_ptr() as *mut std::os::raw::c_void,
+                        ptr as *const std::os::raw::c_void,
+                        size,
+                        2, // CUDA_MEMCPY_DEVICE_TO_HOST
+                    );
+                    if result != CUDA_SUCCESS {
+                        return Err(OutputError::CudaMemcpyFailed);
+                    }
+                }
+                
+                Ok(host_data)
+            } else {
+                Err(OutputError::NullPointer)
+            }
+        } else {
+            self.session.download_output()
+        }
+    }
+}
+
+impl Drop for PipelineCompositor {
+    fn drop(&mut self) {
+        if let Some(ptr) = self.output_buffer {
+            unsafe {
+                cudaFree(ptr as *mut c_void);
+            }
+        }
+        if !self.stream.is_null() {
+            unsafe {
+                cudaStreamDestroy(self.stream);
+            }
+        }
     }
 }
 
