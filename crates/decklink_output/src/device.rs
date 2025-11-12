@@ -10,6 +10,8 @@ extern "C" {
     fn decklink_output_open(device_index: c_int, width: c_int, height: c_int, fps: c_double) -> bool;
     fn decklink_output_send_frame_gpu(gpu_bgra_data: *const u8, gpu_pitch: c_int, width: c_int, height: c_int) -> bool;
     fn decklink_output_schedule_frame_gpu(gpu_bgra_data: *const u8, gpu_pitch: c_int, width: c_int, height: c_int, display_time: u64, display_duration: u64) -> bool;
+    fn decklink_output_schedule_frame_gpu_dvp(gpu_bgra_data: *const u8, gpu_pitch: c_int, width: c_int, height: c_int, display_time: u64, display_duration: u64) -> bool;
+    fn decklink_output_get_last_frame_timing(packet_prep: *mut c_double, queue_mgmt: *mut c_double, dma_copy: *mut c_double, api: *mut c_double, scheduling: *mut c_double) -> bool;
     fn decklink_output_start_scheduled_playback(start_time: u64, time_scale: c_double) -> bool;
     fn decklink_output_stop_scheduled_playback() -> bool;
     fn decklink_output_close();
@@ -306,6 +308,84 @@ impl OutputDevice {
         }
         
         Ok(())
+    }
+    
+    /// Schedule a frame for async playback using DVP (DMA transfer, zero-copy)
+    pub fn schedule_frame_dvp(&mut self, request: OutputRequest, display_time: u64, display_duration: u64) -> Result<(), OutputDeviceError> {
+        if !self.is_open {
+            return Err(OutputDeviceError::DeviceNotAvailable("Device not open".to_string()));
+        }
+        
+        // For hardware internal keying: use overlay (key) if provided, otherwise use video (fill)
+        let frame_to_schedule = if let Some(overlay) = request.overlay {
+            overlay  // Use overlay (BGRA key signal) for internal keying
+        } else if let Some(video) = request.video {
+            video    // Fallback to video (fill signal) if no overlay
+        } else {
+            return Err(OutputDeviceError::ConfigError("No video or overlay frame provided".to_string()));
+        };
+        
+        // Validate frame size
+        if frame_to_schedule.meta.width != self.width || frame_to_schedule.meta.height != self.height {
+            return Err(OutputDeviceError::FrameSizeMismatch {
+                expected_width: self.width,
+                expected_height: self.height,
+                actual_width: frame_to_schedule.meta.width,
+                actual_height: frame_to_schedule.meta.height,
+            });
+        }
+        
+        // Check if frame is on GPU
+        match frame_to_schedule.data.loc {
+            MemLoc::Gpu { .. } => {
+                // Schedule GPU frame using DVP (DMA)
+                let success = unsafe {
+                    decklink_output_schedule_frame_gpu_dvp(
+                        frame_to_schedule.data.ptr,
+                        frame_to_schedule.data.stride as c_int,
+                        self.width as c_int,
+                        self.height as c_int,
+                        display_time,
+                        display_duration,
+                    )
+                };
+                
+                if !success {
+                    return Err(OutputDeviceError::DeviceNotAvailable(
+                        "Failed to schedule GPU frame via DVP for DeckLink output".to_string()
+                    ));
+                }
+            }
+            MemLoc::Cpu => {
+                return Err(OutputDeviceError::ConfigError(
+                    "CPU frames not supported - frame must be on GPU for DVP".to_string()
+                ));
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Get detailed timing breakdown of last frame scheduling operation
+    /// Returns (packet_prep_ms, queue_mgmt_ms, dma_copy_ms, api_ms, scheduling_ms)
+    pub fn get_last_frame_timing(&self) -> (f64, f64, f64, f64, f64) {
+        let mut packet_prep = 0.0;
+        let mut queue_mgmt = 0.0;
+        let mut dma_copy = 0.0;
+        let mut api = 0.0;
+        let mut scheduling = 0.0;
+        
+        unsafe {
+            decklink_output_get_last_frame_timing(
+                &mut packet_prep as *mut c_double,
+                &mut queue_mgmt as *mut c_double,
+                &mut dma_copy as *mut c_double,
+                &mut api as *mut c_double,
+                &mut scheduling as *mut c_double,
+            );
+        }
+        
+        (packet_prep, queue_mgmt, dma_copy, api, scheduling)
     }
     
     /// Start scheduled playback (async mode)

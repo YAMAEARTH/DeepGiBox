@@ -110,6 +110,8 @@ bool decklink_output_open(int32_t device_index, int32_t width, int32_t height, d
 bool decklink_output_send_frame(const uint8_t* bgra_data, int32_t width, int32_t height);
 bool decklink_output_send_frame_gpu(const uint8_t* gpu_bgra_data, int32_t gpu_pitch, int32_t width, int32_t height);
 bool decklink_output_schedule_frame_gpu(const uint8_t* gpu_bgra_data, int32_t gpu_pitch, int32_t width, int32_t height, uint64_t display_time, uint64_t display_duration);
+bool decklink_output_schedule_frame_gpu_dvp(const uint8_t* gpu_bgra_data, int32_t gpu_pitch, int32_t width, int32_t height, uint64_t display_time, uint64_t display_duration);
+bool decklink_output_get_last_frame_timing(double* packet_prep, double* queue_mgmt, double* dma_copy, double* api, double* scheduling);
 bool decklink_output_start_scheduled_playback(uint64_t start_time, double time_scale);
 bool decklink_output_stop_scheduled_playback();
 void decklink_output_close();
@@ -482,6 +484,19 @@ public:
         if (!allocatedBuffer || bufferSize == 0) {
             return E_POINTER;
         }
+        
+        // Try to reuse an existing buffer of the same size
+        {
+            std::lock_guard<std::mutex> lk(m_mutex);
+            for (auto& alloc : m_allocations) {
+                if (alloc.size == static_cast<size_t>(bufferSize) && !alloc.in_use) {
+                    alloc.in_use = true;
+                    *allocatedBuffer = alloc.host;
+                    return S_OK;
+                }
+            }
+        }
+        
         uint32_t target_device = 0;
         {
             std::lock_guard<std::mutex> lk(g_shared.mtx);
@@ -539,6 +554,7 @@ public:
                 host_ptr,
                 static_cast<size_t>(bufferSize),
                 handle,
+                true  // in_use = true
             });
         }
 
@@ -551,30 +567,16 @@ public:
             return E_POINTER;
         }
 
-        Allocation alloc{};
-        {
-            std::lock_guard<std::mutex> lk(m_mutex);
-            auto it = std::find_if(
-                m_allocations.begin(),
-                m_allocations.end(),
-                [&](const Allocation& a) { return a.host == buffer; });
-            if (it == m_allocations.end()) {
-                return E_FAIL;
+        // Mark buffer as available for reuse instead of destroying it
+        std::lock_guard<std::mutex> lk(m_mutex);
+        for (auto& alloc : m_allocations) {
+            if (alloc.host == buffer) {
+                alloc.in_use = false;  // Mark as available for reuse
+                return S_OK;
             }
-            alloc = *it;
-            m_allocations.erase(it);
         }
-
-        DVPStatus unbind_status = dvpUnbindFromCUDACtx(alloc.handle);
-        if (unbind_status != DVP_STATUS_OK) {
-            log_dvp_error("dvpUnbindFromCUDACtx", unbind_status);
-        }
-        DVPStatus destroy_status = dvpDestroyBuffer(alloc.handle);
-        if (destroy_status != DVP_STATUS_OK) {
-            log_dvp_error("dvpDestroyBuffer", destroy_status);
-        }
-        std::free(alloc.host);
-        return S_OK;
+        
+        return E_FAIL;  // Buffer not found
     }
 
     HRESULT Commit() override { return S_OK; }
@@ -597,6 +599,7 @@ private:
         void* host;
         size_t size;
         DVPBufferHandle handle;
+        bool in_use;  // Track if buffer is currently allocated to DeckLink
     };
 
     void release_all() {
@@ -1514,6 +1517,12 @@ public:
     HRESULT ScheduledFrameCompleted(IDeckLinkVideoFrame_v14_2_1* completedFrame, BMDOutputFrameCompletionResult result) override {
         g_completed_frames_count.fetch_add(1, std::memory_order_relaxed);
         
+        // CRITICAL: Release frame reference now that DeckLink is done with it
+        // This allows DVP buffers to be properly freed
+        if (completedFrame) {
+            completedFrame->Release();
+        }
+        
         // Log completion result for debugging
         static std::atomic<uint64_t> s_last_log_frame{0};
         uint64_t current_frame = g_completed_frames_count.load(std::memory_order_relaxed);
@@ -1686,6 +1695,27 @@ extern "C" bool decklink_output_open(int32_t device_index, int32_t width, int32_
         }
     }
 
+    // Set up DVP memory allocator for output (enables zero-copy DMA)
+    if (!g_allocator) {
+        DvpAllocator* alloc = new DvpAllocator();
+        if (alloc) {
+            g_allocator = alloc;
+            g_allocator->AddRef(); // keep global reference alive
+            fprintf(stderr, "[shim][output] Created DVP allocator for output\n");
+        } else {
+            fprintf(stderr, "[shim][output] Warning: Failed to create DVP allocator, will use standard memory\n");
+        }
+    }
+    
+    if (g_allocator) {
+        HRESULT alloc_hr = g_output->SetVideoOutputFrameMemoryAllocator(g_allocator);
+        if (alloc_hr == S_OK) {
+            fprintf(stderr, "[shim][output] DVP allocator set successfully - zero-copy DMA enabled!\n");
+        } else {
+            fprintf(stderr, "[shim][output] Warning: SetVideoOutputFrameMemoryAllocator failed hr=0x%08x, will use standard memory\n", (unsigned)alloc_hr);
+        }
+    }
+
     HRESULT enable_hr = g_output->EnableVideoOutput(chosen_mode, bmdVideoOutputFlagDefault);
     if (enable_hr != S_OK) {
         fprintf(stderr, "[shim][output] EnableVideoOutput failed hr=0x%08x\n", (unsigned)enable_hr);
@@ -1812,7 +1842,30 @@ extern "C" bool decklink_output_send_frame_gpu(const uint8_t* gpu_bgra_data, int
 // Async Scheduled Playback Functions
 // ============================================================================
 
-extern "C" bool decklink_output_schedule_frame_gpu(const uint8_t* gpu_bgra_data, int32_t gpu_pitch, int32_t width, int32_t height, uint64_t display_time, uint64_t display_duration) {
+// Structure to track output frame timing breakdown
+struct OutputFrameTiming {
+    double packet_prep_ms = 0.0;
+    double queue_mgmt_ms = 0.0;
+    double dma_copy_ms = 0.0;
+    double decklink_api_ms = 0.0;
+    double scheduling_ms = 0.0;
+};
+
+static OutputFrameTiming g_last_frame_timing;
+
+extern "C" bool decklink_output_get_last_frame_timing(double* packet_prep, double* queue_mgmt, double* dma_copy, double* api, double* scheduling) {
+    if (packet_prep) *packet_prep = g_last_frame_timing.packet_prep_ms;
+    if (queue_mgmt) *queue_mgmt = g_last_frame_timing.queue_mgmt_ms;
+    if (dma_copy) *dma_copy = g_last_frame_timing.dma_copy_ms;
+    if (api) *api = g_last_frame_timing.decklink_api_ms;
+    if (scheduling) *scheduling = g_last_frame_timing.scheduling_ms;
+    return true;
+}
+
+// DVP-based GPU→DeckLink direct transfer (zero-copy via DMA)
+extern "C" bool decklink_output_schedule_frame_gpu_dvp(const uint8_t* gpu_bgra_data, int32_t gpu_pitch, int32_t width, int32_t height, uint64_t display_time, uint64_t display_duration) {
+    auto timing_start = std::chrono::high_resolution_clock::now();
+    
     if (!g_output || !gpu_bgra_data) {
         return false;
     }
@@ -1822,6 +1875,155 @@ extern "C" bool decklink_output_schedule_frame_gpu(const uint8_t* gpu_bgra_data,
                 g_output_width, g_output_height, width, height);
         return false;
     }
+
+    auto packet_prep_end = std::chrono::high_resolution_clock::now();
+    g_last_frame_timing.packet_prep_ms = std::chrono::duration<double, std::milli>(packet_prep_end - timing_start).count();
+
+    // Initialize DVP if needed
+    if (!g_dvp.initialized) {
+        if (!ensure_dvp_initialized_locked(g_shared)) {
+            fprintf(stderr, "[shim][output] DVP not available, falling back to cudaMemcpy\n");
+            return decklink_output_schedule_frame_gpu(gpu_bgra_data, gpu_pitch, width, height, display_time, display_duration);
+        }
+    }
+
+    auto queue_mgmt_end = std::chrono::high_resolution_clock::now();
+    g_last_frame_timing.queue_mgmt_ms = std::chrono::duration<double, std::milli>(queue_mgmt_end - packet_prep_end).count();
+
+    // Create video frame (BGRA format: bmdFormat8BitBGRA)
+    // If DVP allocator is set, frame will be allocated with DVP-compatible memory
+    IDeckLinkMutableVideoFrame_v14_2_1* frame = nullptr;
+    int32_t row_bytes = width * 4; // BGRA = 4 bytes per pixel
+    HRESULT create_hr = g_output->CreateVideoFrame(width, height, row_bytes, bmdFormat8BitBGRA, bmdFrameFlagDefault, &frame);
+    if (create_hr != S_OK || !frame) {
+        fprintf(stderr, "[shim][output] CreateVideoFrame failed hr=0x%08x\n", (unsigned)create_hr);
+        return false;
+    }
+
+    // Get frame buffer pointer (allocated by DVP allocator if set)
+    void* frame_bytes = nullptr;
+    HRESULT getbytes_hr = frame->GetBytes(&frame_bytes);
+    if (getbytes_hr != S_OK || !frame_bytes) {
+        fprintf(stderr, "[shim][output] GetBytes failed hr=0x%08x\n", (unsigned)getbytes_hr);
+        frame->Release();
+        return false;
+    }
+
+    auto api_end = std::chrono::high_resolution_clock::now();
+    g_last_frame_timing.decklink_api_ms = std::chrono::duration<double, std::milli>(api_end - queue_mgmt_end).count();
+
+    // Get DVP handles for both GPU source and DeckLink destination
+    DVPBufferHandle dst_handle = 0;
+    if (!get_dvp_host_handle(frame_bytes, &dst_handle) || dst_handle == 0) {
+        // Frame buffer not allocated by DVP allocator - fallback to cudaMemcpy
+        frame->Release();
+        return decklink_output_schedule_frame_gpu(gpu_bgra_data, gpu_pitch, width, height, display_time, display_duration);
+    }
+
+    // Create temporary DVP handle for GPU source buffer
+    CUdeviceptr cu_src = reinterpret_cast<CUdeviceptr>(gpu_bgra_data);
+    DVPBufferHandle gpu_src_handle = 0;
+    DVPStatus create_status = dvpCreateGPUCUDADevicePtr(cu_src, &gpu_src_handle);
+    if (create_status != DVP_STATUS_OK) {
+        log_dvp_error("dvpCreateGPUCUDADevicePtr (output src)", create_status);
+        frame->Release();
+        return decklink_output_schedule_frame_gpu(gpu_bgra_data, gpu_pitch, width, height, display_time, display_duration);
+    }
+
+    // DMA transfer via DVP (GPU → DeckLink buffer via PCIe DMA)
+    size_t total_bytes = static_cast<size_t>(row_bytes) * static_cast<size_t>(height);
+    
+    DVPStatus begin_status = dvpBegin();
+    if (begin_status != DVP_STATUS_OK) {
+        log_dvp_error("dvpBegin (output)", begin_status);
+        dvpFreeBuffer(gpu_src_handle);
+        frame->Release();
+        return decklink_output_schedule_frame_gpu(gpu_bgra_data, gpu_pitch, width, height, display_time, display_duration);
+    }
+
+    auto dma_start = std::chrono::high_resolution_clock::now();
+    
+    DVPStatus copy_status = dvpMemcpy(
+        gpu_src_handle,           // src (GPU)
+        0,                        // src offset
+        0,                        // src line pitch (0 = contiguous)
+        DVP_TIMEOUT_IGNORED,      // timeout
+        dst_handle,               // dst (DeckLink DVP buffer)
+        0,                        // dst offset
+        0,                        // dst line pitch
+        0,                        // dst GPU offset
+        0,                        // dst GPU line pitch
+        static_cast<uint32_t>(total_bytes)  // size
+    );
+
+    DVPStatus end_status = dvpEnd();
+    
+    auto dma_end = std::chrono::high_resolution_clock::now();
+    g_last_frame_timing.dma_copy_ms = std::chrono::duration<double, std::milli>(dma_end - dma_start).count();
+
+    dvpFreeBuffer(gpu_src_handle);
+
+    if (copy_status != DVP_STATUS_OK) {
+        log_dvp_error("dvpMemcpy (output)", copy_status);
+        frame->Release();
+        return decklink_output_schedule_frame_gpu(gpu_bgra_data, gpu_pitch, width, height, display_time, display_duration);
+    }
+
+    if (end_status != DVP_STATUS_OK) {
+        log_dvp_error("dvpEnd (output)", end_status);
+        frame->Release();
+        return decklink_output_schedule_frame_gpu(gpu_bgra_data, gpu_pitch, width, height, display_time, display_duration);
+    }
+
+    // Schedule frame for async playback
+    auto scheduling_start = std::chrono::high_resolution_clock::now();
+    
+    BMDTimeScale timebase = (BMDTimeScale)g_output_fps_num;
+    HRESULT schedule_hr = g_output->ScheduleVideoFrame(frame, display_time, display_duration, timebase);
+    
+    // CRITICAL: Do NOT release frame here! 
+    // DeckLink holds the frame and will pass it to ScheduledFrameCompleted callback
+    // The callback will release it after the frame is displayed
+    // This keeps DVP buffer alive until DeckLink finishes with the frame
+    // frame->Release(); // REMOVED - callback will do this
+
+    auto scheduling_end = std::chrono::high_resolution_clock::now();
+    g_last_frame_timing.scheduling_ms = std::chrono::duration<double, std::milli>(scheduling_end - scheduling_start).count();
+
+    if (schedule_hr != S_OK) {
+        fprintf(stderr, "[shim][output] ScheduleVideoFrame failed hr=0x%08x (display_time=%llu, duration=%llu, timebase=%d)\n",
+                (unsigned)schedule_hr, (unsigned long long)display_time, (unsigned long long)display_duration, (int)timebase);
+        frame->Release(); // Release on error
+        return false;
+    }
+
+    uint64_t frame_num = g_scheduled_frames_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (frame_num <= 5 || frame_num % 60 == 0) {
+        fprintf(stderr, "[shim][output] DVP Scheduled frame #%llu (DMA: %.2fms)\n",
+                (unsigned long long)frame_num, g_last_frame_timing.dma_copy_ms);
+    }
+    return true;
+}
+
+// Fallback: cudaMemcpy-based GPU→CPU transfer (original implementation)
+extern "C" bool decklink_output_schedule_frame_gpu(const uint8_t* gpu_bgra_data, int32_t gpu_pitch, int32_t width, int32_t height, uint64_t display_time, uint64_t display_duration) {
+    auto timing_start = std::chrono::high_resolution_clock::now();
+    
+    if (!g_output || !gpu_bgra_data) {
+        return false;
+    }
+
+    if (width != g_output_width || height != g_output_height) {
+        fprintf(stderr, "[shim][output] Frame dimension mismatch: expected %dx%d, got %dx%d\n",
+                g_output_width, g_output_height, width, height);
+        return false;
+    }
+
+    auto packet_prep_end = std::chrono::high_resolution_clock::now();
+    g_last_frame_timing.packet_prep_ms = std::chrono::duration<double, std::milli>(packet_prep_end - timing_start).count();
+
+    auto queue_mgmt_end = std::chrono::high_resolution_clock::now();
+    g_last_frame_timing.queue_mgmt_ms = std::chrono::duration<double, std::milli>(queue_mgmt_end - packet_prep_end).count();
 
     // Create video frame (BGRA format: bmdFormat8BitBGRA)
     IDeckLinkMutableVideoFrame_v14_2_1* frame = nullptr;
@@ -1841,7 +2043,12 @@ extern "C" bool decklink_output_schedule_frame_gpu(const uint8_t* gpu_bgra_data,
         return false;
     }
 
-    // Copy directly from GPU to DeckLink frame buffer (GPU → CPU)
+    auto api_end = std::chrono::high_resolution_clock::now();
+    g_last_frame_timing.decklink_api_ms = std::chrono::duration<double, std::milli>(api_end - queue_mgmt_end).count();
+
+    // Copy directly from GPU to DeckLink frame buffer (GPU → CPU via cudaMemcpy)
+    auto dma_start = std::chrono::high_resolution_clock::now();
+    
     cudaError_t copy_err = cudaMemcpy2D(
         frame_bytes,           // dst (CPU/DeckLink buffer)
         row_bytes,             // dst pitch
@@ -1852,6 +2059,9 @@ extern "C" bool decklink_output_schedule_frame_gpu(const uint8_t* gpu_bgra_data,
         cudaMemcpyDeviceToHost
     );
 
+    auto dma_end = std::chrono::high_resolution_clock::now();
+    g_last_frame_timing.dma_copy_ms = std::chrono::duration<double, std::milli>(dma_end - dma_start).count();
+
     if (copy_err != cudaSuccess) {
         fprintf(stderr, "[shim][output] cudaMemcpy2D failed: %s\n", cudaGetErrorString(copy_err));
         frame->Release();
@@ -1859,17 +2069,23 @@ extern "C" bool decklink_output_schedule_frame_gpu(const uint8_t* gpu_bgra_data,
     }
 
     // Schedule frame for async playback
-    // Per SDK: display_time and display_duration are in timebase units
-    // timeScale parameter should match the timebase used (e.g., 90000 for 90kHz)
-    // For standard video, use frame rate timebase
-    BMDTimeScale timebase = (BMDTimeScale)g_output_fps_num; // Use fps numerator as timebase
+    auto scheduling_start = std::chrono::high_resolution_clock::now();
     
+    BMDTimeScale timebase = (BMDTimeScale)g_output_fps_num;
     HRESULT schedule_hr = g_output->ScheduleVideoFrame(frame, display_time, display_duration, timebase);
-    frame->Release();
+    
+    // CRITICAL: Do NOT release frame here! 
+    // DeckLink holds the frame and will pass it to ScheduledFrameCompleted callback
+    // The callback will release it after the frame is displayed
+    // frame->Release(); // REMOVED - callback will do this
+
+    auto scheduling_end = std::chrono::high_resolution_clock::now();
+    g_last_frame_timing.scheduling_ms = std::chrono::duration<double, std::milli>(scheduling_end - scheduling_start).count();
 
     if (schedule_hr != S_OK) {
         fprintf(stderr, "[shim][output] ScheduleVideoFrame failed hr=0x%08x (display_time=%llu, duration=%llu, timebase=%d)\n",
                 (unsigned)schedule_hr, (unsigned long long)display_time, (unsigned long long)display_duration, (int)timebase);
+        frame->Release(); // Release on error
         return false;
     }
 

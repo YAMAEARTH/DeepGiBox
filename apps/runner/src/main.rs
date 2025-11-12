@@ -313,6 +313,14 @@ fn run_keying_pipeline(config: &PipelineConfig) -> Result<()> {
     let mut pipeline_time_sma = 35.0;
     const SMA_ALPHA: f64 = 0.1;
     let frame_period_ms = 1000.0 / fps_calc;
+    
+    // 🎯 FRAME RATE LIMITING: Target frame time to match output FPS
+    let target_frame_time = Duration::from_secs_f64(1.0 / fps_calc);
+    println!("  🎯 Frame rate limiting enabled:");
+    println!("      → Target FPS: {:.2}", fps_calc);
+    println!("      → Target frame time: {:.2}ms", target_frame_time.as_secs_f64() * 1000.0);
+    println!("      → This prevents pipeline from running faster than output");
+    println!();
 
     println!("╔══════════════════════════════════════════════════════════╗");
     println!("║  PIPELINE RUNNING - Press Ctrl+C to stop               ║");
@@ -352,6 +360,9 @@ fn run_keying_pipeline(config: &PipelineConfig) -> Result<()> {
     let mut total_plan_ms = 0.0;
     let mut total_render_ms = 0.0;
     let mut total_keying_ms = 0.0;
+    let mut total_packet_prep_ms = 0.0;
+    let mut total_queue_mgmt_ms = 0.0;
+    let mut total_timing_calc_ms = 0.0;
 
     let mut gpu_buffers: Vec<CudaSlice<u8>> = Vec::new();
     let pipeline_start_time = Instant::now();
@@ -474,8 +485,11 @@ fn run_keying_pipeline(config: &PipelineConfig) -> Result<()> {
         let render_time = render_start.elapsed();
         total_render_ms += render_time.as_secs_f64() * 1000.0;
 
-        // 7. Hardware Keying
+        // 7. Hardware Keying (with DVP DMA)
         let keying_start = Instant::now();
+        
+        // 7a. Packet preparation
+        let packet_prep_start = Instant::now();
         let overlay_packet = common_io::RawFramePacket {
             meta: common_io::FrameMeta {
                 source_id: raw_frame_gpu.meta.source_id,
@@ -491,8 +505,10 @@ fn run_keying_pipeline(config: &PipelineConfig) -> Result<()> {
             },
             data: overlay_frame.argb,
         };
+        let packet_prep_time = packet_prep_start.elapsed().as_secs_f64() * 1000.0;
 
-        // Queue management
+        // 7b. Queue management
+        let queue_mgmt_start = Instant::now();
         let mut buffered_count = decklink_out.get_buffered_frame_count().unwrap_or(0);
         let mut retry_count = 0;
         while buffered_count >= max_queue_depth && retry_count < 50 {
@@ -501,7 +517,10 @@ fn run_keying_pipeline(config: &PipelineConfig) -> Result<()> {
             buffered_count = decklink_out.get_buffered_frame_count().unwrap_or(0);
             retry_count += 1;
         }
+        let queue_mgmt_time = queue_mgmt_start.elapsed().as_secs_f64() * 1000.0;
 
+        // 7c. Timing calculation and scheduling
+        let timing_calc_start = Instant::now();
         if buffered_count < max_queue_depth {
             let output_request = OutputRequest {
                 video: Some(&raw_frame_gpu),
@@ -510,7 +529,8 @@ fn run_keying_pipeline(config: &PipelineConfig) -> Result<()> {
 
             if !scheduled_playback_started {
                 let display_time = (frame_count * frame_duration as u64) as u64;
-                decklink_out.schedule_frame(output_request, display_time, frame_duration as u64)?;
+                // Use DVP (DMA) for zero-copy GPU→DeckLink transfer
+                decklink_out.schedule_frame_dvp(output_request, display_time, frame_duration as u64)?;
 
                 if frame_count >= (preroll_count - 1) {
                     let (hw_time, _hw_timebase) = decklink_out
@@ -526,16 +546,37 @@ fn run_keying_pipeline(config: &PipelineConfig) -> Result<()> {
                     .get_hardware_time()
                     .expect("Failed to get hardware reference clock");
                 let display_time = hw_current_time + (frames_ahead * frame_duration as u64);
-                decklink_out.schedule_frame(output_request, display_time, frame_duration as u64)?;
+                // Use DVP (DMA) for zero-copy GPU→DeckLink transfer
+                decklink_out.schedule_frame_dvp(output_request, display_time, frame_duration as u64)?;
             }
         }
+        let timing_calc_time = timing_calc_start.elapsed().as_secs_f64() * 1000.0;
 
         let keying_time = keying_start.elapsed();
         total_keying_ms += keying_time.as_secs_f64() * 1000.0;
+        total_packet_prep_ms += packet_prep_time;
+        total_queue_mgmt_ms += queue_mgmt_time;
+        total_timing_calc_ms += timing_calc_time;
 
         let pipeline_time = pipeline_start.elapsed();
         let pipeline_ms = pipeline_time.as_secs_f64() * 1000.0;
         total_latency_ms += pipeline_ms;
+
+        // 🎯 FRAME RATE LIMITING: Sleep if pipeline finished too fast
+        // This prevents pipeline from running faster than output FPS
+        // which reduces queue buildup and latency
+        if pipeline_time < target_frame_time {
+            let sleep_duration = target_frame_time - pipeline_time;
+            std::thread::sleep(sleep_duration);
+            
+            if frame_count % 60 == 0 {
+                println!("  ⏱️  Frame rate limit: slept {:.2}ms (pipeline took {:.2}ms, target {:.2}ms)",
+                    sleep_duration.as_secs_f64() * 1000.0,
+                    pipeline_ms,
+                    target_frame_time.as_secs_f64() * 1000.0
+                );
+            }
+        }
 
         // Adaptive queue adjustment
         pipeline_time_sma = SMA_ALPHA * pipeline_ms + (1.0 - SMA_ALPHA) * pipeline_time_sma;
@@ -556,14 +597,35 @@ fn run_keying_pipeline(config: &PipelineConfig) -> Result<()> {
             if frame_count % config.general.stats_print_interval == 0 {
                 let elapsed = pipeline_start_time.elapsed().as_secs_f64();
                 let avg_fps = frame_count as f64 / elapsed;
-                println!(
-                    "📊 Frame {} | Latency: {:.2}ms | FPS: {:.2} | Queue: {}/{}",
-                    frame_count,
-                    total_latency_ms / frame_count as f64,
-                    avg_fps,
-                    buffered_count,
-                    max_queue_depth
-                );
+                
+                // Calculate average latencies
+                let avg_capture = total_capture_ms / frame_count as f64;
+                let avg_preprocess = total_preprocess_ms / frame_count as f64;
+                let avg_inference = total_inference_ms / frame_count as f64;
+                let avg_postprocess = total_postprocess_ms / frame_count as f64;
+                let avg_plan = total_plan_ms / frame_count as f64;
+                let avg_render = total_render_ms / frame_count as f64;
+                let avg_keying = total_keying_ms / frame_count as f64;
+                let avg_total = total_latency_ms / frame_count as f64;
+                
+                println!("╔══════════════════════════════════════════════════════════╗");
+                println!("║  📊 STATISTICS - Frame {}                              ", frame_count);
+                println!("╚══════════════════════════════════════════════════════════╝");
+                println!("  🎯 Pipeline Performance:");
+                println!("    FPS:                {:.2}", avg_fps);
+                println!("    Queue:              {}/{}", buffered_count, max_queue_depth);
+                println!();
+                println!("  ⏱️  Average Latency Breakdown:");
+                println!("    1. Capture:         {:.2}ms ({:.1}%)", avg_capture, (avg_capture / avg_total) * 100.0);
+                println!("    2. Preprocessing:   {:.2}ms ({:.1}%)", avg_preprocess, (avg_preprocess / avg_total) * 100.0);
+                println!("    3. Inference:       {:.2}ms ({:.1}%)", avg_inference, (avg_inference / avg_total) * 100.0);
+                println!("    4. Postprocessing:  {:.2}ms ({:.1}%)", avg_postprocess, (avg_postprocess / avg_total) * 100.0);
+                println!("    5. Overlay Plan:    {:.2}ms ({:.1}%)", avg_plan, (avg_plan / avg_total) * 100.0);
+                println!("    6. GPU Rendering:   {:.2}ms ({:.1}%)", avg_render, (avg_render / avg_total) * 100.0);
+                println!("    7. Hardware Keying: {:.2}ms ({:.1}%)", avg_keying, (avg_keying / avg_total) * 100.0);
+                println!("    ─────────────────────────────────────────────────");
+                println!("    TOTAL:              {:.2}ms (100%)", avg_total);
+                println!();
             }
         }
     }
@@ -607,10 +669,29 @@ fn run_keying_pipeline(config: &PipelineConfig) -> Result<()> {
         "    GPU Rendering:      {:.2}ms",
         total_render_ms / frame_count as f64
     );
+    
+    // Calculate averages for hardware keying breakdown
+    let avg_keying = total_keying_ms / frame_count as f64;
+    let avg_packet_prep = total_packet_prep_ms / frame_count as f64;
+    let avg_queue_mgmt = total_queue_mgmt_ms / frame_count as f64;
+    let avg_timing_calc = total_timing_calc_ms / frame_count as f64;
+    
+    // Get DVP-specific timings from last frame
+    let (_packet_prep_dvp, _queue_mgmt_dvp, dma_copy, api, scheduling_dvp) = decklink_out.get_last_frame_timing();
+    
     println!(
         "    Hardware Keying:    {:.2}ms",
-        total_keying_ms / frame_count as f64
+        avg_keying
     );
+    println!("      ├─ Packet prep:     {:.2}ms", avg_packet_prep);
+    println!("      ├─ Queue mgmt:      {:.2}ms", avg_queue_mgmt);
+    println!("      ├─ Timing calc:     {:.2}ms", avg_timing_calc);
+    println!("      │   ├─ DMA transfer: {:.2}ms", dma_copy);
+    println!("      │   ├─ DeckLink API: {:.2}ms", api);
+    println!("      │   └─ Scheduling:   {:.2}ms", scheduling_dvp);
+    println!("      └─ (Other overhead): {:.2}ms", 
+        avg_keying - avg_packet_prep - avg_queue_mgmt - avg_timing_calc);
+    
     println!("    ─────────────────────────────────");
     println!(
         "    Total (E2E):        {:.2}ms",
