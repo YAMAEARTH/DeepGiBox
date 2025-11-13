@@ -364,7 +364,6 @@ fn run_keying_pipeline(config: &PipelineConfig) -> Result<()> {
     let mut total_queue_mgmt_ms = 0.0;
     let mut total_timing_calc_ms = 0.0;
 
-    let mut gpu_buffers: Vec<CudaSlice<u8>> = Vec::new();
     let pipeline_start_time = Instant::now();
     let test_duration = if config.general.test_duration_seconds > 0 {
         Some(Duration::from_secs(config.general.test_duration_seconds))
@@ -404,26 +403,9 @@ fn run_keying_pipeline(config: &PipelineConfig) -> Result<()> {
         let capture_latency_ms = capture_latency_ns as f64 / 1_000_000.0;
         total_capture_ms += capture_latency_ms;
 
-        // Copy to GPU if needed
-        let raw_frame_gpu = if matches!(raw_frame.data.loc, MemLoc::Cpu) {
-            let cpu_data =
-                unsafe { std::slice::from_raw_parts(raw_frame.data.ptr, raw_frame.data.len) };
-            let gpu_buffer = cuda_device.htod_sync_copy(cpu_data)?;
-            let gpu_ptr = *gpu_buffer.device_ptr() as *mut u8;
-            let gpu_packet = common_io::RawFramePacket {
-                meta: raw_frame.meta.clone(),
-                data: MemRef {
-                    ptr: gpu_ptr,
-                    len: raw_frame.data.len,
-                    stride: raw_frame.data.stride,
-                    loc: MemLoc::Gpu { device: 0 },
-                },
-            };
-            gpu_buffers.push(gpu_buffer);
-            gpu_packet
-        } else {
-            raw_frame.clone()
-        };
+        // Frame is already on GPU via DVP capture (zero-copy DMA)
+        // No need to copy CPU→GPU - use DVP frame directly
+        let raw_frame_gpu = raw_frame.clone();
 
         // 2. Preprocessing (update crop region if mode changed)
         let current_mode_val = current_mode.load(Ordering::SeqCst);
@@ -783,7 +765,6 @@ fn run_inference_only_pipeline(config: &PipelineConfig) -> Result<()> {
 
     let mut frame_count = 0u64;
     let mut total_latency_ms = 0.0;
-    let mut gpu_buffers: Vec<CudaSlice<u8>> = Vec::new();
     let pipeline_start_time = Instant::now();
     let test_duration = if config.general.test_duration_seconds > 0 {
         Some(Duration::from_secs(config.general.test_duration_seconds))
@@ -818,26 +799,8 @@ fn run_inference_only_pipeline(config: &PipelineConfig) -> Result<()> {
             }
         };
 
-        // Copy to GPU
-        let raw_frame_gpu = if matches!(raw_frame.data.loc, MemLoc::Cpu) {
-            let cpu_data =
-                unsafe { std::slice::from_raw_parts(raw_frame.data.ptr, raw_frame.data.len) };
-            let gpu_buffer = cuda_device.htod_sync_copy(cpu_data)?;
-            let gpu_ptr = *gpu_buffer.device_ptr() as *mut u8;
-            let gpu_packet = common_io::RawFramePacket {
-                meta: raw_frame.meta.clone(),
-                data: MemRef {
-                    ptr: gpu_ptr,
-                    len: raw_frame.data.len,
-                    stride: raw_frame.data.stride,
-                    loc: MemLoc::Gpu { device: 0 },
-                },
-            };
-            gpu_buffers.push(gpu_buffer);
-            gpu_packet
-        } else {
-            raw_frame.clone()
-        };
+        // Frame is already on GPU via DVP capture (zero-copy DMA)
+        let raw_frame_gpu = raw_frame.clone();
 
         // Preprocess
         let tensor_packet = match preprocessor.process_checked(raw_frame_gpu) {
