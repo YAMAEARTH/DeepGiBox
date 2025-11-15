@@ -22,8 +22,30 @@ pub enum EndoscopeMode {
     Fuji,
     #[serde(rename = "olympus")]
     Olympus,
-    #[serde(rename = "pentax")]
-    Pentax,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DisplayMode {
+    #[serde(rename = "colon")]
+    Colon,
+    #[serde(rename = "egd")]
+    Egd,
+}
+
+impl DisplayMode {
+    /// Get display mode name for UI
+    pub fn name(&self) -> &'static str {
+        match self {
+            DisplayMode::Colon => "COLON",
+            DisplayMode::Egd => "EGD",
+        }
+    }
+}
+
+impl Default for DisplayMode {
+    fn default() -> Self {
+        DisplayMode::Colon
+    }
 }
 
 impl EndoscopeMode {
@@ -33,7 +55,6 @@ impl EndoscopeMode {
         match self {
             EndoscopeMode::Fuji => (1032, 326, 848, 848),
             EndoscopeMode::Olympus => (830, 330, 655, 490),
-            EndoscopeMode::Pentax => (780, 182, 752, 752),
         }
     }
 
@@ -42,7 +63,6 @@ impl EndoscopeMode {
         match self {
             EndoscopeMode::Fuji => preprocess_cuda::CropRegion::Fuji,
             EndoscopeMode::Olympus => preprocess_cuda::CropRegion::Olympus,
-            EndoscopeMode::Pentax => preprocess_cuda::CropRegion::Pentax,
         }
     }
 
@@ -56,14 +76,13 @@ impl EndoscopeMode {
         match self {
             EndoscopeMode::Fuji => "FUJI",
             EndoscopeMode::Olympus => "OLYMPUS",
-            EndoscopeMode::Pentax => "PENTAX",
         }
     }
 }
 
 impl Default for EndoscopeMode {
     fn default() -> Self {
-        EndoscopeMode::Pentax
+        EndoscopeMode::Olympus
     }
 }
 
@@ -77,6 +96,10 @@ pub struct GeneralConfig {
     pub debug_dump_frame_count: u64,
     #[serde(default = "default_stats_print_interval")]
     pub stats_print_interval: u64,
+    #[serde(default = "default_enable_runtime_statistics")]
+    pub enable_runtime_statistics: bool,
+    #[serde(default = "default_enable_final_summary")]
+    pub enable_final_summary: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -105,7 +128,7 @@ pub struct PreprocessingConfig {
     pub chroma_order: String,
     #[serde(default = "default_crop_region")]
     pub crop_region: String,
-    /// Initial endoscope mode (can be changed at runtime with keys 1, 2, 3)
+    /// Initial endoscope mode (can be changed at runtime with keys 1, 2)
     #[serde(default)]
     pub initial_endoscope_mode: EndoscopeMode,
 }
@@ -186,6 +209,10 @@ pub struct OverlayConfig {
     #[serde(default = "default_enable_full_ui")]
     pub enable_full_ui: bool,
     #[serde(default)]
+    pub display_mode: DisplayMode,
+    #[serde(default = "default_show_speaker")]
+    pub show_speaker: bool,
+    #[serde(default)]
     pub bbox: BBoxConfig,
     #[serde(default)]
     pub label: LabelConfig,
@@ -257,6 +284,12 @@ fn default_debug_dump_frame_count() -> u64 {
 }
 fn default_stats_print_interval() -> u64 {
     60
+}
+fn default_enable_runtime_statistics() -> bool {
+    true
+}
+fn default_enable_final_summary() -> bool {
+    true
 }
 fn default_expected_resolution() -> String {
     "1080p60".to_string()
@@ -333,6 +366,9 @@ fn default_label_offset_y() -> f32 {
 fn default_enable_full_ui() -> bool {
     true
 }
+fn default_show_speaker() -> bool {
+    true
+}
 fn default_text_antialiasing() -> bool {
     true
 }
@@ -365,6 +401,8 @@ impl Default for GeneralConfig {
             enable_debug_dumps: false,
             debug_dump_frame_count: default_debug_dump_frame_count(),
             stats_print_interval: default_stats_print_interval(),
+            enable_runtime_statistics: default_enable_runtime_statistics(),
+            enable_final_summary: default_enable_final_summary(),
         }
     }
 }
@@ -455,6 +493,8 @@ impl Default for OverlayConfig {
     fn default() -> Self {
         Self {
             enable_full_ui: default_enable_full_ui(),
+            display_mode: DisplayMode::default(),
+            show_speaker: default_show_speaker(),
             bbox: BBoxConfig::default(),
             label: LabelConfig::default(),
         }

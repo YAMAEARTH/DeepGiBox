@@ -87,6 +87,10 @@ iou_threshold = 0.3
 [overlay]
 # Enable full UI mode (HUD, confidence bars, etc.)
 enable_full_ui = true
+# Display mode: "colon" or "egd" (แสดงข้อความบน UI)
+display_mode = "egd"
+# Show speaker icon in top-right corner (เปิด/ปิดไอคอนลำโพง)
+show_speaker = true
 
 # Bounding box appearance
 [overlay.bbox]

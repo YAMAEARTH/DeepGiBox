@@ -9,6 +9,9 @@ pub fn from_path(cfg: &str) -> Result<PlanStage> {
 pub struct PlanStage {
     pub enable_full_ui: bool,
     pub spk: bool,  // ตัวแปรเปิด/ปิดไอคอนลำโพง (speaker on/off)
+    pub display_mode: String,  // "COLON" หรือ "EGD" - แสดงบน UI
+    pub confidence_threshold: f32,  // ค่า threshold จาก config (แสดงบน UI)
+    pub endoscope_mode: String,  // "OLYMPUS" หรือ "FUJI" - กำหนดตำแหน่ง overlay
 }
 
 fn class_palette(class_id: u32) -> (&'static str, &'static str, (u8, u8, u8, u8)) {
@@ -66,10 +69,16 @@ impl Stage<DetectionsPacket, OverlayPlanPacket> for PlanStage {
             let outline = scaled_thickness(2.0, ui_scale);
             
             // ============================================================
-            // CONFIDENCE BAR (แถบแสดงความมั่นใจ) - ซ้ายมือ 4 ช่อง แนวตั้ง
+            // CONFIDENCE BAR (แถบแสดงความมั่นใจ) - 4 ช่อง แนวตั้ง
+            // ตำแหน่งปรับตาม endoscope_mode: OLYMPUS=ซ้าย, FUJI=ขวา
             // ============================================================
             let bar_scale = ui_scale;  // อัตราส่วนการขยายแถบ
-            let bar_x = 400.0 * ui_scale;  // ตำแหน่ง X (ระยะจากขอบซ้าย) - เพิ่มค่านี้เพื่อขยับขวา
+            // bar_x = ตำแหน่ง X (ซ้าย=OLYMPUS, ขวา=FUJI)
+            let bar_x = if self.endoscope_mode == "FUJI" {
+                cw - 120.0 * ui_scale  // FUJI: ชิดขวา
+            } else {
+                400.0 * ui_scale  // OLYMPUS: ซ้ายมือ
+            };
             let bar_height = 260.0 * bar_scale;  // ความสูงรวมของแถบ
             let num_segments = 4;  // จำนวนช่องในแถบ
             let gap = 10.0 * bar_scale;  // ช่องว่างระหว่างแต่ละช่อง
@@ -116,12 +125,24 @@ impl Stage<DetectionsPacket, OverlayPlanPacket> for PlanStage {
 
             // ============================================================
             // TEXT DISPLAY (แสดงข้อความด้วย DrawOp::Label - ตอนนี้ implement แล้ว!)
+            // ตำแหน่งปรับตาม endoscope_mode: OLYMPUS=ซ้าย, FUJI=กลาง
             // ============================================================
-            let text_y = start_y + effective_bar_height + 28.0 * ui_scale;
+            // label_x = ตำแหน่ง X ของ label (FUJI=กลางจอ, OLYMPUS=ซ้ายมือ)
+            let label_x = if self.endoscope_mode == "FUJI" {
+                cw / 2.0 - 100.0 * ui_scale  // FUJI: กลางหน้าจอ
+            } else {
+                bar_x - 200.0  // OLYMPUS: ซ้ายมือ
+            };
+            // label_y = ตำแหน่ง Y ของ label (FUJI=ล่างสุด, OLYMPUS=ใต้แถบ)
+            let label_y = if self.endoscope_mode == "FUJI" {
+                ch - 80.0 * ui_scale  // FUJI: ใกล้ขอบล่าง
+            } else {
+                start_y + effective_bar_height + 28.0 * ui_scale  // OLYMPUS: ใต้แถบ confidence
+            };
             
             // === CLASS LABEL (แสดงประเภท Hyperplastic/Neoplastic) ===
             ops.push(DrawOp::Label {
-                anchor: (bar_x -200.0, text_y), //ปรับค่า X เพื่อเลื่อนซ้ายขวา
+                anchor: (label_x, label_y),
                 text: best_long_label.to_string(),
                 font_px: scaled_font_px(54.0, ui_scale, 32),
                 color: (255, 255, 0, 255),  // Yellow - สีเหลืองสด
@@ -129,34 +150,37 @@ impl Stage<DetectionsPacket, OverlayPlanPacket> for PlanStage {
         }
 
         // ============================================================
-        // MODE & THRESHOLD (มุมขวาบน - ใต้ลำโพง)
+        // MODE & THRESHOLD TEXT
+        // ตำแหน่งปรับตาม endoscope_mode: OLYMPUS=ขวาบน, FUJI=ซ้ายบน
         // ============================================================
         if self.enable_full_ui {
             let controls_margin = 80.0 * ui_scale;
             let icon_size = (64.0 * ui_scale).max(28.0);
             let square_size = (48.0 * ui_scale).max(22.0);
             
-            // ตำแหน่ง X: ชิดขวา (เหมือนกล่องควบคุม)
-            let right_text_x = cw - controls_margin - square_size - 16.0 * ui_scale - icon_size + icon_size + 12.0 * ui_scale;
-            // ตำแหน่ง Y: ชิดด้านบน (ใช้เฉพาะ controls_margin)
-            let right_text_start_y = controls_margin;
+            // ตำแหน่ง X และ Y ปรับตาม endoscope_mode
+            let (text_x, text_start_y) = if self.endoscope_mode == "FUJI" {
+                // FUJI: มุมซ้ายบน
+                (controls_margin, 80.0 * ui_scale)
+            } else {
+                // OLYMPUS: มุมขวาบน (ใต้ลำโพง)
+                let right_x = cw - controls_margin - square_size - 16.0 * ui_scale - icon_size + icon_size + 12.0 * ui_scale;
+                (right_x, controls_margin)
+            };
 
-            // === MODE TEXT (แสดง COLON/EGD) ===
-            let mode_text = best_detection
-                .map(|d| if d.class_id == 1 { "EGD" } else { "COLON" })
-                .unwrap_or("COLON");
+            // === MODE TEXT (แสดง COLON/EGD จาก config) ===
             ops.push(DrawOp::Label {
-                anchor: (right_text_x, right_text_start_y),
-                text: mode_text.to_string(),
+                anchor: (text_x, text_start_y),
+                text: self.display_mode.clone(),
                 font_px: scaled_font_px(35.0, ui_scale, 36),
                 color: (255, 255, 255, 255),  // White - สีขาว
             });
 
-            // === THRESHOLD TEXT (แสดงค่า T = 0.xx) ===
-            let score_text = format!("T = {:.2}", best_score);
-            let score_y = right_text_start_y + 50.0 * ui_scale;
+            // === THRESHOLD TEXT (แสดงค่า T = 0.xx จาก config) ===
+            let score_text = format!("T = {:.2}", self.confidence_threshold);
+            let score_y = text_start_y + 50.0 * ui_scale;
             ops.push(DrawOp::Label {
-                anchor: (right_text_x, score_y),
+                anchor: (text_x, score_y),
                 text: score_text,
                 font_px: scaled_font_px(35.0, ui_scale, 30),
                 color: (255, 255, 255, 255),  // White - สีขาว
@@ -294,14 +318,25 @@ impl Stage<DetectionsPacket, OverlayPlanPacket> for PlanStage {
 
         if self.enable_full_ui {
             // ============================================================
-            // TOP RIGHT CORNER (มุมขวาบน: กล่องควบคุม + ไอคอนลำโพง + ข้อความ)
+            // CONTROL BOX + SPEAKER ICON
+            // ตำแหน่งปรับตาม endoscope_mode: OLYMPUS=ขวาบน, FUJI=ซ้ายบน
             // ============================================================
-            let controls_margin = 10.0 * ui_scale;  // ระยะห่างจากขอบขวา
+            let controls_margin = 10.0 * ui_scale;  // ระยะห่างจากขอบ
             let icon_size = (64.0 * ui_scale).max(28.0);
             let square_size = (48.0 * ui_scale).max(22.0);
-            // ชิดขอบขวา: วางลำโพงก่อน แล้วคำนวณตำแหน่งกล่องย้อนกลับ
-            let speaker_x = cw - controls_margin - icon_size;  // ลำโพงชิดขวา
-            let block_x = speaker_x - 16.0 * ui_scale - square_size;  // กล่องอยู่ซ้ายลำโพง
+            
+            // ตำแหน่ง block_x, speaker_x ปรับตาม endoscope_mode
+            let (block_x, speaker_x) = if self.endoscope_mode == "FUJI" {
+                // FUJI: มุมซ้ายบน (กล่องซ้ายสุด, ลำโพงขวากล่อง)
+                let blk_x = controls_margin + 70.0 * ui_scale;  // ชิดซ้าย (เว้นระยะให้ MODE TEXT)
+                let spk_x = blk_x + square_size + 16.0 * ui_scale;
+                (blk_x, spk_x)
+            } else {
+                // OLYMPUS: มุมขวาบน (ลำโพงขวาสุด, กล่องซ้ายลำโพง)
+                let spk_x = cw - controls_margin - icon_size;
+                let blk_x = spk_x - 16.0 * ui_scale - square_size;
+                (blk_x, spk_x)
+            };
             let block_y = controls_margin;
 
             // กล่องสีเทา
@@ -404,6 +439,9 @@ impl PlanStage {
         Ok(Self {
             enable_full_ui: Self::parse_enable_full_ui(cfg),
             spk: true,  // ค่าเริ่มต้น: เปิดลำโพง (แสดงไอคอน)
+            display_mode: "COLON".to_string(),  // ค่าเริ่มต้น (จะถูก override จาก config)
+            confidence_threshold: 0.25,  // ค่าเริ่มต้น (จะถูก override จาก config)
+            endoscope_mode: "OLYMPUS".to_string(),  // ค่าเริ่มต้น (จะถูก override จาก main.rs)
         })
     }
 }

@@ -2,10 +2,9 @@
 # DeepGiBox Runner Configuration (Universal)
 # =============================================================================
 # Single config file for all endoscope types
-# Press keys 1, 2, 3 during runtime to switch between:
+# Press keys 1, 2 during runtime to switch between:
 #   1 = Fuji
-#   2 = Olympus  
-#   3 = Pentax
+#   2 = Olympus
 # =============================================================================
 
 # Pipeline mode: "hardware_keying", "inference_only", or "visualization"
@@ -16,13 +15,15 @@ test_duration_seconds = 0          # 0 = run indefinitely
 enable_debug_dumps = false
 debug_dump_frame_count = 5
 stats_print_interval = 60          # Print stats every N frames
+enable_runtime_statistics = false   # Show statistics during runtime (every N frames)
+enable_final_summary = true        # Show final summary when program ends
 
 # =============================================================================
 # Video Capture Configuration
 # =============================================================================
 [capture]
 device_index = 0                   # DeckLink device index
-expected_resolution = "2160p30"    # 1080p60, 2160p60, etc.
+expected_resolution = "1080p60"    # 1080p60, 2160p60, etc.
 
 # =============================================================================
 # Preprocessing Configuration
@@ -36,11 +37,9 @@ mean = [0.0, 0.0, 0.0]            # Normalization mean
 std = [1.0, 1.0, 1.0]             # Normalization std
 chroma_order = "UYVY"              # UYVY or YUY2
 
-# Crop region (will be overridden by endoscope mode at runtime)
-crop_region = "Pentax"             # Legacy field (ignored when using endoscope modes)
 
-# Initial endoscope mode (can be changed with keys 1, 2, 3)
-initial_endoscope_mode = "olympus"  # "fuji", "olympus", or "pentax"
+# Initial endoscope mode (can be changed with keys 1, 2)
+initial_endoscope_mode = "olympus"  # "fuji" or "olympus"
 
 # =============================================================================
 # Inference Configuration
@@ -74,6 +73,10 @@ iou_threshold = 0.3                # IoU threshold for matching
 # =============================================================================
 [overlay]
 enable_full_ui = true
+# Display mode: "colon" or "egd" (text shown on UI overlay)
+display_mode = "egd"
+# Show speaker icon in top-right corner
+show_speaker = true
 
 [overlay.bbox]
 base_thickness = 4                 # Base thickness for bounding box

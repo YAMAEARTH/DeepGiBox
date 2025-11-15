@@ -37,8 +37,7 @@ fn mode_from_u8(value: u8) -> EndoscopeMode {
     match value {
         0 => EndoscopeMode::Fuji,
         1 => EndoscopeMode::Olympus,
-        2 => EndoscopeMode::Pentax,
-        _ => EndoscopeMode::Pentax, // Default fallback
+        _ => EndoscopeMode::Olympus, // Default fallback
     }
 }
 
@@ -47,7 +46,6 @@ fn mode_to_u8(mode: &EndoscopeMode) -> u8 {
     match mode {
         EndoscopeMode::Fuji => 0,
         EndoscopeMode::Olympus => 1,
-        EndoscopeMode::Pentax => 2,
     }
 }
 
@@ -76,10 +74,6 @@ fn spawn_keyboard_listener(
                         Keycode::Key2 => {
                             current_mode.store(mode_to_u8(&EndoscopeMode::Olympus), Ordering::SeqCst);
                             println!("\n🟢 Switched to OLYMPUS mode");
-                        }
-                        Keycode::Key3 => {
-                            current_mode.store(mode_to_u8(&EndoscopeMode::Pentax), Ordering::SeqCst);
-                            println!("\n🟡 Switched to PENTAX mode");
                         }
                         Keycode::Equal => {
                             // '+' key (usually Shift+= on US keyboard, but Equal works for both)
@@ -249,7 +243,10 @@ fn run_keying_pipeline(config: &PipelineConfig) -> Result<()> {
     println!("🎨 [6/7] Overlay Planning & GPU Rendering");
     let mut plan_stage = PlanStage {
         enable_full_ui: config.overlay.enable_full_ui,
-        spk: true,  // เปิดไอคอนลำโพง (สามารถเปลี่ยนเป็น false เพื่อปิด)
+        spk: config.overlay.show_speaker,  // เปิด/ปิดไอคอนลำโพงตาม config
+        display_mode: config.overlay.display_mode.name().to_string(),
+        confidence_threshold: config.postprocessing.confidence_threshold,
+        endoscope_mode: config.preprocessing.initial_endoscope_mode.name().to_string(),
     };
     let render_config = if config.rendering.debug_rendering {
         "gpu,device=0,debug"
@@ -258,6 +255,8 @@ fn run_keying_pipeline(config: &PipelineConfig) -> Result<()> {
     };
     let mut render_stage = overlay_render::from_path(render_config)?;
     println!("  ✓ Full UI: {}", config.overlay.enable_full_ui);
+    println!("  ✓ Display mode: {}", config.overlay.display_mode.name());
+    println!("  ✓ Speaker icon: {}", if config.overlay.show_speaker { "enabled" } else { "disabled" });
     println!("  ✓ GPU rendering initialized (debug: {})", config.rendering.debug_rendering);
     println!();
 
@@ -435,6 +434,11 @@ fn run_keying_pipeline(config: &PipelineConfig) -> Result<()> {
         let current_threshold_bits = confidence_threshold.load(Ordering::SeqCst);
         let current_threshold = f32::from_bits(current_threshold_bits);
         post_stage.set_confidence_threshold(current_threshold);
+        plan_stage.confidence_threshold = current_threshold;  // อัปเดต threshold สำหรับแสดงบน UI
+        
+        // Update endoscope mode for overlay positioning
+        let mode = mode_from_u8(current_mode.load(Ordering::SeqCst));
+        plan_stage.endoscope_mode = mode.name().to_string();  // อัปเดตตำแหน่ง overlay ตามโหมด
         
         let detections = post_stage.process(raw_detections);
         let postprocess_time = postprocess_start.elapsed();
@@ -575,41 +579,39 @@ fn run_keying_pipeline(config: &PipelineConfig) -> Result<()> {
 
         frame_count += 1;
 
-        // Print statistics
-        if config.performance.print_per_frame_latency {
-            if frame_count % config.general.stats_print_interval == 0 {
-                let elapsed = pipeline_start_time.elapsed().as_secs_f64();
-                let avg_fps = frame_count as f64 / elapsed;
-                
-                // Calculate average latencies
-                let avg_capture = total_capture_ms / frame_count as f64;
-                let avg_preprocess = total_preprocess_ms / frame_count as f64;
-                let avg_inference = total_inference_ms / frame_count as f64;
-                let avg_postprocess = total_postprocess_ms / frame_count as f64;
-                let avg_plan = total_plan_ms / frame_count as f64;
-                let avg_render = total_render_ms / frame_count as f64;
-                let avg_keying = total_keying_ms / frame_count as f64;
-                let avg_total = total_latency_ms / frame_count as f64;
-                
-                println!("╔══════════════════════════════════════════════════════════╗");
-                println!("║  📊 STATISTICS - Frame {}                              ", frame_count);
-                println!("╚══════════════════════════════════════════════════════════╝");
-                println!("  🎯 Pipeline Performance:");
-                println!("    FPS:                {:.2}", avg_fps);
-                println!("    Queue:              {}/{}", buffered_count, max_queue_depth);
-                println!();
-                println!("  ⏱️  Average Latency Breakdown:");
-                println!("    1. Capture:         {:.2}ms ({:.1}%)", avg_capture, (avg_capture / avg_total) * 100.0);
-                println!("    2. Preprocessing:   {:.2}ms ({:.1}%)", avg_preprocess, (avg_preprocess / avg_total) * 100.0);
-                println!("    3. Inference:       {:.2}ms ({:.1}%)", avg_inference, (avg_inference / avg_total) * 100.0);
-                println!("    4. Postprocessing:  {:.2}ms ({:.1}%)", avg_postprocess, (avg_postprocess / avg_total) * 100.0);
-                println!("    5. Overlay Plan:    {:.2}ms ({:.1}%)", avg_plan, (avg_plan / avg_total) * 100.0);
-                println!("    6. GPU Rendering:   {:.2}ms ({:.1}%)", avg_render, (avg_render / avg_total) * 100.0);
-                println!("    7. Hardware Keying: {:.2}ms ({:.1}%)", avg_keying, (avg_keying / avg_total) * 100.0);
-                println!("    ─────────────────────────────────────────────────");
-                println!("    TOTAL:              {:.2}ms (100%)", avg_total);
-                println!();
-            }
+        // Print runtime statistics
+        if config.general.enable_runtime_statistics && frame_count % config.general.stats_print_interval == 0 {
+            let elapsed = pipeline_start_time.elapsed().as_secs_f64();
+            let avg_fps = frame_count as f64 / elapsed;
+            
+            // Calculate average latencies
+            let avg_capture = total_capture_ms / frame_count as f64;
+            let avg_preprocess = total_preprocess_ms / frame_count as f64;
+            let avg_inference = total_inference_ms / frame_count as f64;
+            let avg_postprocess = total_postprocess_ms / frame_count as f64;
+            let avg_plan = total_plan_ms / frame_count as f64;
+            let avg_render = total_render_ms / frame_count as f64;
+            let avg_keying = total_keying_ms / frame_count as f64;
+            let avg_total = total_latency_ms / frame_count as f64;
+            
+            println!("╔══════════════════════════════════════════════════════════╗");
+            println!("║  📊 STATISTICS - Frame {}                              ", frame_count);
+            println!("╚══════════════════════════════════════════════════════════╝");
+            println!("  🎯 Pipeline Performance:");
+            println!("    FPS:                {:.2}", avg_fps);
+            println!("    Queue:              {}/{}", buffered_count, max_queue_depth);
+            println!();
+            println!("  ⏱️  Average Latency Breakdown:");
+            println!("    1. Capture:         {:.2}ms ({:.1}%)", avg_capture, (avg_capture / avg_total) * 100.0);
+            println!("    2. Preprocessing:   {:.2}ms ({:.1}%)", avg_preprocess, (avg_preprocess / avg_total) * 100.0);
+            println!("    3. Inference:       {:.2}ms ({:.1}%)", avg_inference, (avg_inference / avg_total) * 100.0);
+            println!("    4. Postprocessing:  {:.2}ms ({:.1}%)", avg_postprocess, (avg_postprocess / avg_total) * 100.0);
+            println!("    5. Overlay Plan:    {:.2}ms ({:.1}%)", avg_plan, (avg_plan / avg_total) * 100.0);
+            println!("    6. GPU Rendering:   {:.2}ms ({:.1}%)", avg_render, (avg_render / avg_total) * 100.0);
+            println!("    7. Hardware Keying: {:.2}ms ({:.1}%)", avg_keying, (avg_keying / avg_total) * 100.0);
+            println!("    ─────────────────────────────────────────────────");
+            println!("    TOTAL:              {:.2}ms (100%)", avg_total);
+            println!();
         }
     }
 
@@ -617,72 +619,74 @@ fn run_keying_pipeline(config: &PipelineConfig) -> Result<()> {
     let total_elapsed = pipeline_start_time.elapsed().as_secs_f64();
     let avg_fps = frame_count as f64 / total_elapsed;
 
-    println!();
-    println!("╔══════════════════════════════════════════════════════════╗");
-    println!("║  FINAL SUMMARY - HARDWARE KEYING PIPELINE               ║");
-    println!("╚══════════════════════════════════════════════════════════╝");
-    println!();
-    println!("  📈 Performance:");
-    println!("    Total frames:       {}", frame_count);
-    println!("    Total time:         {:.2}s", total_elapsed);
-    println!("    Average FPS:        {:.2}", avg_fps);
-    println!();
-    println!("  ⏱️  Average Latency:");
-    println!(
-        "    Capture:            {:.2}ms",
-        total_capture_ms / frame_count as f64
-    );
-    println!(
-        "    Preprocessing:      {:.2}ms",
-        total_preprocess_ms / frame_count as f64
-    );
-    println!(
-        "    Inference:          {:.2}ms",
-        total_inference_ms / frame_count as f64
-    );
-    println!(
-        "    Postprocessing:     {:.2}ms",
-        total_postprocess_ms / frame_count as f64
-    );
-    println!(
-        "    Overlay Planning:   {:.2}ms",
-        total_plan_ms / frame_count as f64
-    );
-    println!(
-        "    GPU Rendering:      {:.2}ms",
-        total_render_ms / frame_count as f64
-    );
-    
-    // Calculate averages for hardware keying breakdown
-    let avg_keying = total_keying_ms / frame_count as f64;
-    let avg_packet_prep = total_packet_prep_ms / frame_count as f64;
-    let avg_queue_mgmt = total_queue_mgmt_ms / frame_count as f64;
-    let avg_timing_calc = total_timing_calc_ms / frame_count as f64;
-    
-    // Get DVP-specific timings from last frame
-    let (_packet_prep_dvp, _queue_mgmt_dvp, dma_copy, api, scheduling_dvp) = decklink_out.get_last_frame_timing();
-    
-    println!(
-        "    Hardware Keying:    {:.2}ms",
-        avg_keying
-    );
-    println!("      ├─ Packet prep:     {:.2}ms", avg_packet_prep);
-    println!("      ├─ Queue mgmt:      {:.2}ms", avg_queue_mgmt);
-    println!("      ├─ Timing calc:     {:.2}ms", avg_timing_calc);
-    println!("      │   ├─ DMA transfer: {:.2}ms", dma_copy);
-    println!("      │   ├─ DeckLink API: {:.2}ms", api);
-    println!("      │   └─ Scheduling:   {:.2}ms", scheduling_dvp);
-    println!("      └─ (Other overhead): {:.2}ms", 
-        avg_keying - avg_packet_prep - avg_queue_mgmt - avg_timing_calc);
-    
-    println!("    ─────────────────────────────────");
-    println!(
-        "    Total (E2E):        {:.2}ms",
-        total_latency_ms / frame_count as f64
-    );
-    println!();
-    println!("✅ Pipeline completed successfully!");
-    println!();
+    if config.general.enable_final_summary {
+        println!();
+        println!("╔══════════════════════════════════════════════════════════╗");
+        println!("║  FINAL SUMMARY - HARDWARE KEYING PIPELINE               ║");
+        println!("╚══════════════════════════════════════════════════════════╝");
+        println!();
+        println!("  📈 Performance:");
+        println!("    Total frames:       {}", frame_count);
+        println!("    Total time:         {:.2}s", total_elapsed);
+        println!("    Average FPS:        {:.2}", avg_fps);
+        println!();
+        println!("  ⏱️  Average Latency:");
+        println!(
+            "    Capture:            {:.2}ms",
+            total_capture_ms / frame_count as f64
+        );
+        println!(
+            "    Preprocessing:      {:.2}ms",
+            total_preprocess_ms / frame_count as f64
+        );
+        println!(
+            "    Inference:          {:.2}ms",
+            total_inference_ms / frame_count as f64
+        );
+        println!(
+            "    Postprocessing:     {:.2}ms",
+            total_postprocess_ms / frame_count as f64
+        );
+        println!(
+            "    Overlay Planning:   {:.2}ms",
+            total_plan_ms / frame_count as f64
+        );
+        println!(
+            "    GPU Rendering:      {:.2}ms",
+            total_render_ms / frame_count as f64
+        );
+        
+        // Calculate averages for hardware keying breakdown
+        let avg_keying = total_keying_ms / frame_count as f64;
+        let avg_packet_prep = total_packet_prep_ms / frame_count as f64;
+        let avg_queue_mgmt = total_queue_mgmt_ms / frame_count as f64;
+        let avg_timing_calc = total_timing_calc_ms / frame_count as f64;
+        
+        // Get DVP-specific timings from last frame
+        let (_packet_prep_dvp, _queue_mgmt_dvp, dma_copy, api, scheduling_dvp) = decklink_out.get_last_frame_timing();
+        
+        println!(
+            "    Hardware Keying:    {:.2}ms",
+            avg_keying
+        );
+        println!("      ├─ Packet prep:     {:.2}ms", avg_packet_prep);
+        println!("      ├─ Queue mgmt:      {:.2}ms", avg_queue_mgmt);
+        println!("      ├─ Timing calc:     {:.2}ms", avg_timing_calc);
+        println!("      │   ├─ DMA transfer: {:.2}ms", dma_copy);
+        println!("      │   ├─ DeckLink API: {:.2}ms", api);
+        println!("      │   └─ Scheduling:   {:.2}ms", scheduling_dvp);
+        println!("      └─ (Other overhead): {:.2}ms", 
+            avg_keying - avg_packet_prep - avg_queue_mgmt - avg_timing_calc);
+        
+        println!("    ─────────────────────────────────");
+        println!(
+            "    Total (E2E):        {:.2}ms",
+            total_latency_ms / frame_count as f64
+        );
+        println!();
+        println!("✅ Pipeline completed successfully!");
+        println!();
+    }
 
     // Wait for keyboard listener thread to finish
     keyboard_handle.join().ok();
