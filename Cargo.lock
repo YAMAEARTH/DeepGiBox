@@ -1421,6 +1421,7 @@ dependencies = [
  "cc",
  "common_io",
  "config",
+ "rusttype",
  "telemetry",
 ]
 

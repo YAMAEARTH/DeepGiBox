@@ -249,6 +249,7 @@ fn run_keying_pipeline(config: &PipelineConfig) -> Result<()> {
     println!("🎨 [6/7] Overlay Planning & GPU Rendering");
     let mut plan_stage = PlanStage {
         enable_full_ui: config.overlay.enable_full_ui,
+        spk: true,  // เปิดไอคอนลำโพง (สามารถเปลี่ยนเป็น false เพื่อปิด)
     };
     let render_config = if config.rendering.debug_rendering {
         "gpu,device=0,debug"

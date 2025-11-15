@@ -1,5 +1,6 @@
 use anyhow::Result;
 use common_io::{MemLoc, MemRef, OverlayFramePacket, OverlayPlanPacket, Stage, DrawOp};
+use rusttype::{Font, Scale, point};
 use std::os::raw::{c_int, c_void};
 use std::ptr;
 
@@ -7,6 +8,7 @@ use std::ptr;
 extern "C" {
     fn cudaMalloc(dev_ptr: *mut *mut c_void, size: usize) -> c_int;
     fn cudaFree(dev_ptr: *mut c_void) -> c_int;
+    fn cudaMemcpy(dst: *mut c_void, src: *const c_void, count: usize, kind: c_int) -> c_int;
     fn cudaStreamCreate(stream: *mut *mut c_void) -> c_int;
     fn cudaStreamDestroy(stream: *mut c_void) -> c_int;
     fn cudaStreamSynchronize(stream: *mut c_void) -> c_int;
@@ -72,16 +74,64 @@ extern "C" {
 }
 
 const CUDA_SUCCESS: c_int = 0;
+const CUDA_MEMCPY_HOST_TO_DEVICE: c_int = 1;
+const CUDA_MEMCPY_DEVICE_TO_HOST: c_int = 2;
 
 // ==================== GPU Render Stage ====================
 pub struct RenderStage {
     gpu_buf: Option<*mut u8>,
+    cpu_buf: Option<Vec<u8>>,  // CPU buffer สำหรับ text rendering
     stream: *mut c_void,
     width: u32,
     height: u32,
     stride: usize,
     device_id: u32,
     debug_mode: bool,
+    font: Font<'static>,  // Font สำหรับ text rendering
+}
+
+// Helper function for text rendering on CPU buffer
+fn draw_text_on_buffer(
+    buf: &mut [u8],
+    stride: usize,
+    w: u32,
+    h: u32,
+    x: i32,
+    y: i32,
+    text: &str,
+    font_size: f32,
+    color: (u8, u8, u8, u8), // R, G, B, A
+    font: &Font,
+) {
+    let scale = Scale::uniform(font_size);
+    let v_metrics = font.v_metrics(scale);
+    let offset = point(0.0, v_metrics.ascent);
+    
+    let glyphs: Vec<_> = font.layout(text, scale, offset).collect();
+    
+    for glyph in glyphs {
+        if let Some(bounding_box) = glyph.pixel_bounding_box() {
+            glyph.draw(|gx, gy, gv| {
+                let px = x + bounding_box.min.x + gx as i32;
+                let py = y + bounding_box.min.y + gy as i32;
+                
+                if px >= 0 && py >= 0 && (px as u32) < w && (py as u32) < h {
+                    let idx = (py as usize) * stride + (px as usize) * 4;
+                    if idx + 3 < buf.len() {
+                        // Alpha blend with existing pixel
+                        // Buffer format is BGRA, color input is RGBA
+                        let alpha = (gv * color.3 as f32) as u32;
+                        let inv_alpha = 255 - alpha;
+                        
+                        buf[idx + 0] = ((color.2 as u32 * alpha + buf[idx + 0] as u32 * inv_alpha) / 255) as u8; // B
+                        buf[idx + 1] = ((color.1 as u32 * alpha + buf[idx + 1] as u32 * inv_alpha) / 255) as u8; // G
+                        buf[idx + 2] = ((color.0 as u32 * alpha + buf[idx + 2] as u32 * inv_alpha) / 255) as u8; // R
+                        buf[idx + 3] = buf[idx + 3].max((alpha) as u8); // A
+                    }
+                }
+            });
+        }
+    }
 }
 
 impl RenderStage {
@@ -135,14 +185,21 @@ pub fn from_path(cfg: &str) -> Result<RenderStage> {
         anyhow::bail!("Failed to create CUDA stream for overlay rendering");
     }
     
+    // Load font
+    let font_data = include_bytes!("../../../testsupport/DejaVuSans.ttf");
+    let font = Font::try_from_bytes(font_data as &[u8])
+        .ok_or_else(|| anyhow::anyhow!("Failed to load DejaVuSans.ttf font"))?;
+    
     Ok(RenderStage {
         gpu_buf: None,
+        cpu_buf: None,
         stream,
         width: 0,
         height: 0,
         stride: 0,
         device_id,
         debug_mode,
+        font,
     })
 }
 
@@ -247,9 +304,13 @@ impl Stage<OverlayPlanPacket, OverlayFramePacket> for RenderStage {
                         }
                     }
                 }
-                DrawOp::Label { .. } => {
-                    // TODO: GPU text rendering (ใช้ texture atlas หรือ SDF fonts)
-                    // ตอนนี้ skip ไปก่อน
+                DrawOp::Label { anchor, text, font_px, color } => {
+                    if self.debug_mode {
+                        eprintln!("[DEBUG] Op #{}: Label at ({},{}) text='{}' size={} color=RGBA({},{},{},{})",
+                                  i, anchor.0, anchor.1, text, font_px, color.0, color.1, color.2, color.3);
+                    }
+                    // Text rendering ทำบน CPU แล้ว composite กับ GPU
+                    // (จะทำข้างล่างหลังจาก process ทุก op)
                 }
             }
         }
@@ -272,6 +333,75 @@ impl Stage<OverlayPlanPacket, OverlayFramePacket> for RenderStage {
         let last_err = unsafe { cudaPeekAtLastError() };
         if last_err != CUDA_SUCCESS {
             eprintln!("[ERROR] CUDA kernel error detected: {}", last_err);
+        }
+        
+        // === TEXT RENDERING (CPU-based) ===
+        // Collect all Label operations
+        let label_ops: Vec<_> = input.ops.iter()
+            .filter_map(|op| match op {
+                DrawOp::Label { anchor, text, font_px, color } => Some((*anchor, text.clone(), *font_px, *color)),
+                _ => None,
+            })
+            .collect();
+        
+        if !label_ops.is_empty() {
+            if self.debug_mode {
+                eprintln!("[DEBUG] Rendering {} text labels on CPU", label_ops.len());
+            }
+            
+            // Ensure CPU buffer
+            let buf_size = self.stride * h as usize;
+            if self.cpu_buf.is_none() || self.cpu_buf.as_ref().unwrap().len() != buf_size {
+                self.cpu_buf = Some(vec![0u8; buf_size]);
+            }
+            
+            // Copy GPU buffer to CPU
+            let cpu_buf = self.cpu_buf.as_mut().unwrap();
+            let copy_result = unsafe {
+                cudaMemcpy(
+                    cpu_buf.as_mut_ptr() as *mut c_void,
+                    gpu_ptr as *const c_void,
+                    buf_size,
+                    CUDA_MEMCPY_DEVICE_TO_HOST,
+                )
+            };
+            if copy_result != CUDA_SUCCESS {
+                eprintln!("[ERROR] cudaMemcpy D2H failed: {}", copy_result);
+            } else {
+                // Draw text on CPU buffer (need to split borrow)
+                let stride = self.stride;
+                let font = &self.font;
+                
+                for (anchor, text, font_px, color) in label_ops {
+                    draw_text_on_buffer(
+                        cpu_buf, 
+                        stride, 
+                        w, 
+                        h, 
+                        anchor.0 as i32, 
+                        anchor.1 as i32, 
+                        &text, 
+                        font_px as f32, 
+                        color,
+                        font,
+                    );
+                }
+                
+                // Copy back to GPU
+                let copy_back = unsafe {
+                    cudaMemcpy(
+                        gpu_ptr as *mut c_void,
+                        cpu_buf.as_ptr() as *const c_void,
+                        buf_size,
+                        CUDA_MEMCPY_HOST_TO_DEVICE,
+                    )
+                };
+                if copy_back != CUDA_SUCCESS {
+                    eprintln!("[ERROR] cudaMemcpy H2D failed: {}", copy_back);
+                } else if self.debug_mode {
+                    eprintln!("[DEBUG] Text rendering completed, copied back to GPU");
+                }
+            }
         }
         
         // Return GPU buffer in BGRA format (ไม่มี CPU copy!)

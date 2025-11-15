@@ -8,6 +8,7 @@ pub fn from_path(cfg: &str) -> Result<PlanStage> {
 
 pub struct PlanStage {
     pub enable_full_ui: bool,
+    pub spk: bool,  // ตัวแปรเปิด/ปิดไอคอนลำโพง (speaker on/off)
 }
 
 fn class_palette(class_id: u32) -> (&'static str, &'static str, (u8, u8, u8, u8)) {
@@ -32,9 +33,12 @@ fn scaled_thickness(base_px: f32, scale: f32) -> u8 {
 
 impl Stage<DetectionsPacket, OverlayPlanPacket> for PlanStage {
     fn process(&mut self, input: DetectionsPacket) -> OverlayPlanPacket {
+        // ops = รายการคำสั่งวาด (Drawing Operations)
         let mut ops = Vec::new();
 
+        // canvas = ขนาดภาพ (width x height)
         let canvas = (input.from.width, input.from.height);
+        // cw, ch = ความกว้าง, ความสูงของภาพ (canvas width, canvas height)
         let (cw, ch) = (canvas.0 as f32, canvas.1 as f32);
 
         if cw <= 0.0 || ch <= 0.0 {
@@ -42,469 +46,342 @@ impl Stage<DetectionsPacket, OverlayPlanPacket> for PlanStage {
             return OverlayPlanPacket { from: input.from, ops, canvas };
         }
 
+        // ui_scale = อัตราส่วนการขยาย UI ตามความสูงของภาพ (1080p = scale 1.0)
         let ui_scale = (ch / 1080.0).max(0.1);
 
+        // best_detection = การตรวจจับที่มี confidence score สูงสุด
         let best_detection = input
             .items
             .iter()
             .max_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(Ordering::Equal));
+        // best_score = คะแนนความมั่นใจสูงสุด (0.0 - 1.0)
         let best_score = best_detection.map(|d| d.score.clamp(0.0, 1.0)).unwrap_or(0.0);
+        // best_long_label = ชื่อประเภทของการตรวจจับ, best_color = สีของการตรวจจับ
         let (_, best_long_label, best_color) = best_detection
             .map(|d| class_palette(d.class_id as u32))
             .unwrap_or(("None", "Awaiting", (80, 80, 80, 255)));
 
         if self.enable_full_ui {
-            let label_color = (238, 240, 230, 255);
-            let accent_color = (200, 200, 200, 255);
-            let icon_outline = scaled_thickness(2.0, ui_scale);
-            let icon_x = 24.0 * ui_scale;
-            let icon_size = (28.0 * ui_scale).max(14.0);
-            let text_x = icon_x + icon_size + 16.0 * ui_scale;
-            let mut row_y = 44.0 * ui_scale;
-            let row_gap = 42.0 * ui_scale;
-            let font_regular = scaled_font_px(20.0, ui_scale, 14);
-
-            ops.push(DrawOp::Rect {
-                xywh: (icon_x, row_y, icon_size, icon_size),
-                thickness: icon_outline,
-                color: accent_color,
-            });
-            ops.push(DrawOp::Poly {
-                pts: vec![
-                    (icon_x + 4.0 * ui_scale, row_y + 6.0 * ui_scale),
-                    (icon_x + icon_size - 4.0 * ui_scale, row_y + 6.0 * ui_scale),
-                ],
-                thickness: icon_outline,
-                color: accent_color,
-            });
-            ops.push(DrawOp::Label {
-                anchor: (text_x, row_y),
-                text: "Patient ID".to_string(),
-                font_px: font_regular,
-                color: label_color,
-            });
-            row_y += row_gap;
-
-            let mid_y = row_y + icon_size * 0.5;
-            ops.push(DrawOp::Poly {
-                pts: vec![
-                    (icon_x + icon_size * 0.2, row_y + icon_size * 0.2),
-                    (icon_x + icon_size * 0.5, row_y),
-                    (icon_x + icon_size * 0.8, row_y + icon_size * 0.2),
-                ],
-                thickness: icon_outline,
-                color: accent_color,
-            });
-            ops.push(DrawOp::Poly {
-                pts: vec![
-                    (icon_x + icon_size * 0.2, mid_y),
-                    (icon_x + icon_size * 0.8, mid_y),
-                ],
-                thickness: icon_outline,
-                color: accent_color,
-            });
-            ops.push(DrawOp::Label {
-                anchor: (text_x, row_y),
-                text: "Patient Name".to_string(),
-                font_px: font_regular,
-                color: label_color,
-            });
-            row_y += row_gap;
-
-            ops.push(DrawOp::Label {
-                anchor: (text_x, row_y),
-                text: "Patient name (add. info)".to_string(),
-                font_px: font_regular,
-                color: label_color,
-            });
-            row_y += row_gap;
-
-            ops.push(DrawOp::Rect {
-                xywh: (icon_x, row_y, icon_size, icon_size),
-                thickness: icon_outline,
-                color: accent_color,
-            });
-            ops.push(DrawOp::Poly {
-                pts: vec![
-                    (icon_x, row_y + icon_size * 0.3),
-                    (icon_x + icon_size, row_y + icon_size * 0.3),
-                ],
-                thickness: icon_outline,
-                color: accent_color,
-            });
-            ops.push(DrawOp::Label {
-                anchor: (text_x, row_y),
-                text: "DOB".to_string(),
-                font_px: font_regular,
-                color: label_color,
-            });
-            ops.push(DrawOp::Label {
-                anchor: (text_x + 148.0 * ui_scale, row_y),
-                text: "Age".to_string(),
-                font_px: font_regular,
-                color: label_color,
-            });
-            row_y += row_gap;
-
-            ops.push(DrawOp::Poly {
-                pts: vec![
-                    (icon_x + icon_size * 0.2, row_y),
-                    (icon_x + icon_size * 0.8, row_y + icon_size),
-                ],
-                thickness: icon_outline,
-                color: accent_color,
-            });
-            ops.push(DrawOp::Poly {
-                pts: vec![
-                    (icon_x + icon_size * 0.8, row_y),
-                    (icon_x + icon_size * 0.2, row_y + icon_size),
-                ],
-                thickness: icon_outline,
-                color: accent_color,
-            });
-            ops.push(DrawOp::Label {
-                anchor: (text_x, row_y),
-                text: "Sex".to_string(),
-                font_px: font_regular,
-                color: label_color,
-            });
-            row_y += row_gap;
-
-            ops.push(DrawOp::Rect {
-                xywh: (icon_x, row_y, icon_size, icon_size),
-                thickness: icon_outline,
-                color: accent_color,
-            });
-            ops.push(DrawOp::Label {
-                anchor: (text_x, row_y),
-                text: "0".to_string(),
-                font_px: font_regular,
-                color: label_color,
-            });
-            row_y += row_gap;
-
-            let cam_w = icon_size * 1.6;
-            let cam_h = icon_size * 0.9;
-            let cam_y = row_y + (icon_size - cam_h) * 0.5;
-            let cam_outline = std::cmp::max(icon_outline, 2);
-            ops.push(DrawOp::FillRect {
-                xywh: (icon_x, cam_y, cam_w, cam_h),
-                color: (255, 200, 0, 255),
-            });
-            ops.push(DrawOp::Rect {
-                xywh: (icon_x, cam_y, cam_w, cam_h),
-                thickness: cam_outline,
-                color: (0, 0, 0, 255),
-            });
-            ops.push(DrawOp::Poly {
-                pts: vec![
-                    (icon_x + cam_w * 0.2, cam_y + cam_h * 0.5),
-                    (icon_x + cam_w * 0.8, cam_y + cam_h * 0.5),
-                ],
-                thickness: cam_outline,
-                color: (0, 0, 0, 255),
-            });
-            ops.push(DrawOp::Label {
-                anchor: (text_x, row_y),
-                text: " ".to_string(),
-                font_px: font_regular,
-                color: label_color,
-            });
-            row_y += row_gap;
-
-            ops.push(DrawOp::Label {
-                anchor: (text_x, row_y),
-                text: "OFF".to_string(),
-                font_px: font_regular,
-                color: label_color,
-            });
-            row_y += row_gap;
-
-            let bar_width = 4.0 * ui_scale;
-            for i in 0..3 {
-                let height_factor = (i + 1) as f32 / 3.0;
-                let bar_height = (icon_size * height_factor).max(4.0 * ui_scale);
-                let bar_x = icon_x + i as f32 * (6.0 * ui_scale);
-                let bar_y = row_y + icon_size - bar_height;
-                ops.push(DrawOp::FillRect {
-                    xywh: (bar_x, bar_y, bar_width, bar_height),
-                    color: accent_color,
-                });
-            }
-            ops.push(DrawOp::Label {
-                anchor: (text_x, row_y),
-                text: "".to_string(),
-                font_px: font_regular,
-                color: label_color,
-            });
-            row_y += row_gap;
-
-            let bubble_h = icon_size * 0.7;
-            ops.push(DrawOp::Rect {
-                xywh: (icon_x, row_y, icon_size, bubble_h),
-                thickness: icon_outline,
-                color: accent_color,
-            });
-            ops.push(DrawOp::Poly {
-                pts: vec![
-                    (icon_x + icon_size * 0.3, row_y + bubble_h),
-                    (icon_x + icon_size * 0.45, row_y + bubble_h + 6.0 * ui_scale),
-                    (icon_x + icon_size * 0.55, row_y + bubble_h),
-                ],
-                thickness: icon_outline,
-                color: accent_color,
-            });
-            ops.push(DrawOp::Label {
-                anchor: (text_x, row_y),
-                text: "Comment".to_string(),
-                font_px: font_regular,
-                color: label_color,
-            });
-
-            let bar_scale = ui_scale;
-            let bar_x = (cw - 80.0 * bar_scale).max(8.0 * bar_scale);
-            let bar_height = 200.0 * bar_scale;
-            let num_segments = 3;
-            let gap = 12.0 * bar_scale;
+            // outline = ความหนาของเส้นขอบ
+            let outline = scaled_thickness(2.0, ui_scale);
+            
+            // ============================================================
+            // CONFIDENCE BAR (แถบแสดงความมั่นใจ) - ซ้ายมือ 4 ช่อง แนวตั้ง
+            // ============================================================
+            let bar_scale = ui_scale;  // อัตราส่วนการขยายแถบ
+            let bar_x = 400.0 * ui_scale;  // ตำแหน่ง X (ระยะจากขอบซ้าย) - เพิ่มค่านี้เพื่อขยับขวา
+            let bar_height = 260.0 * bar_scale;  // ความสูงรวมของแถบ
+            let num_segments = 4;  // จำนวนช่องในแถบ
+            let gap = 10.0 * bar_scale;  // ช่องว่างระหว่างแต่ละช่อง
+            // segment_height = ความสูงของแต่ละช่อง
             let segment_height =
                 ((bar_height - (num_segments as f32 - 1.0) * gap) / num_segments as f32)
                     .max(20.0 * bar_scale);
+            // effective_bar_height = ความสูงรวมที่แท้จริง (รวมช่องว่าง)
             let effective_bar_height =
                 segment_height * num_segments as f32 + gap * (num_segments as f32 - 1.0);
+            // start_y = ตำแหน่ง Y เริ่มต้น (กึ่งกลางแนวตั้ง)
             let start_y = ((ch - effective_bar_height) / 2.0).max(32.0 * bar_scale);
+            // active_segments = จำนวนช่องที่ active (ตามคะแนน confidence)
             let active_segments =
                 (best_score * num_segments as f32).ceil().clamp(0.0, num_segments as f32) as i32;
+            // bar_width = ความกว้างของแถบ
             let bar_width = 28.0 * bar_scale;
+            // diag_thickness = ความหนาของเส้นทแยงมุม
             let diag_thickness = scaled_thickness(2.0, ui_scale);
 
+            // วนวาดแต่ละช่องของ Confidence Bar
             for i in 0..num_segments {
+                // top = ตำแหน่ง Y ของช่องปัจจุบัน
                 let top = start_y + i as f32 * (segment_height + gap);
+                // seg_color = สีของช่อง (ขาวเข้มถ้า active, เทาอ่อนถ้า inactive)
                 let seg_color = if (i as i32) < active_segments {
-                    (0, 255, 0, 255)
+                    (255, 255, 255, 255)  // สีขาวเข้ม สำหรับช่อง active
                 } else {
-                    (80, 80, 80, 255)
+                    (80, 80, 80, 255)  // สีเทาอ่อน สำหรับช่อง inactive
                 };
+                // วาดสี่เหลี่ยมเติมสี (ตัวช่อง)
                 ops.push(DrawOp::FillRect {
                     xywh: (bar_x, top, bar_width, segment_height),
                     color: seg_color,
                 });
+                // วาดเส้นขอบช่อง
                 ops.push(DrawOp::Rect {
                     xywh: (bar_x, top, bar_width, segment_height),
-                    thickness: icon_outline,
+                    thickness: outline,
                     color: (220, 220, 220, 255),
                 });
-                if (i as i32) < active_segments {
-                    ops.push(DrawOp::Poly {
-                        pts: vec![
-                            (bar_x + 6.0 * bar_scale, top + segment_height - 6.0 * bar_scale),
-                            (bar_x + bar_width - 6.0 * bar_scale, top + 6.0 * bar_scale),
-                        ],
-                        thickness: diag_thickness,
-                        color: (230, 255, 230, 255),
-                    });
-                }
+                // ไม่มีเส้นทแยงมุม - ลบออกแล้ว
             }
 
-            let bottom_width = (240.0 * ui_scale).min(cw * 0.5).max(160.0 * ui_scale);
-            let bottom_height = 36.0 * ui_scale;
-            let bottom_x = (cw - bottom_width) / 2.0;
-            let bottom_y = ch - bottom_height - 32.0 * ui_scale;
-            ops.push(DrawOp::FillRect {
-                xywh: (bottom_x, bottom_y, bottom_width, bottom_height),
-                color: best_color,
-            });
-            ops.push(DrawOp::Rect {
-                xywh: (bottom_x, bottom_y, bottom_width, bottom_height),
-                thickness: icon_outline,
-                color: (255, 255, 255, 255),
-            });
+            // ============================================================
+            // TEXT DISPLAY (แสดงข้อความด้วย DrawOp::Label - ตอนนี้ implement แล้ว!)
+            // ============================================================
+            let text_y = start_y + effective_bar_height + 28.0 * ui_scale;
+            
+            // === CLASS LABEL (แสดงประเภท Hyperplastic/Neoplastic) ===
             ops.push(DrawOp::Label {
-                anchor: (bottom_x + 24.0 * ui_scale, bottom_y + bottom_height / 4.0),
+                anchor: (bar_x -200.0, text_y), //ปรับค่า X เพื่อเลื่อนซ้ายขวา
                 text: best_long_label.to_string(),
-                font_px: scaled_font_px(18.0, ui_scale, 14),
-                color: (255, 255, 255, 255),
+                font_px: scaled_font_px(54.0, ui_scale, 32),
+                color: (255, 255, 0, 255),  // Yellow - สีเหลืองสด
             });
         }
 
-        let bbox_scale = ui_scale;
-        let bbox_outline = scaled_thickness(2.0, bbox_scale);
-        let corner_outline = scaled_thickness(3.0, bbox_scale);
-        let label_font = scaled_font_px(20.0, ui_scale, 14);
-
-        for det in &input.items {
-            let (short_label, _, class_color) = class_palette(det.class_id as u32);
-            let (x, y, w, h) = (det.bbox.x, det.bbox.y, det.bbox.w, det.bbox.h);
-
-            ops.push(DrawOp::Rect {
-                xywh: (x, y, w, h),
-                thickness: bbox_outline,
-                color: class_color,
-            });
-
-            if self.enable_full_ui {
-                let corner_len = (w.min(h) * 0.22)
-                    .max(18.0 * ui_scale)
-                    .min(40.0 * ui_scale);
-                let x2 = x + w;
-                let y2 = y + h;
-
-                ops.push(DrawOp::Poly {
-                    pts: vec![(x, y), (x + corner_len, y)],
-                    thickness: corner_outline,
-                    color: class_color,
-                });
-                ops.push(DrawOp::Poly {
-                    pts: vec![(x, y), (x, y + corner_len)],
-                    thickness: corner_outline,
-                    color: class_color,
-                });
-                ops.push(DrawOp::Poly {
-                    pts: vec![(x2, y), (x2 - corner_len, y)],
-                    thickness: corner_outline,
-                    color: class_color,
-                });
-                ops.push(DrawOp::Poly {
-                    pts: vec![(x2, y), (x2, y + corner_len)],
-                    thickness: corner_outline,
-                    color: class_color,
-                });
-                ops.push(DrawOp::Poly {
-                    pts: vec![(x, y2), (x + corner_len, y2)],
-                    thickness: corner_outline,
-                    color: class_color,
-                });
-                ops.push(DrawOp::Poly {
-                    pts: vec![(x, y2), (x, y2 - corner_len)],
-                    thickness: corner_outline,
-                    color: class_color,
-                });
-                ops.push(DrawOp::Poly {
-                    pts: vec![(x2, y2), (x2 - corner_len, y2)],
-                    thickness: corner_outline,
-                    color: class_color,
-                });
-                ops.push(DrawOp::Poly {
-                    pts: vec![(x2, y2), (x2, y2 - corner_len)],
-                    thickness: corner_outline,
-                    color: class_color,
-                });
-            }
-
-            let track_info = if let Some(track_id) = det.track_id {
-                format!(" ID:{}", track_id)
-            } else {
-                String::new()
-            };
-            let label_text = format!("{} {:.2}{}", short_label, det.score, track_info);
-            let preferred_top = y - 28.0 * ui_scale;
-            let label_y = if preferred_top > 12.0 * ui_scale {
-                preferred_top
-            } else {
-                y + h + 16.0 * ui_scale
-            };
-            ops.push(DrawOp::Label {
-                anchor: (x, label_y),
-                text: label_text,
-                font_px: label_font,
-                color: class_color,
-            });
-        }
-
+        // ============================================================
+        // MODE & THRESHOLD (มุมขวาบน - ใต้ลำโพง)
+        // ============================================================
         if self.enable_full_ui {
-            let corner_padding = 32.0 * ui_scale;
-            let icon_outline = scaled_thickness(2.0, ui_scale);
-            let icon_size = (32.0 * ui_scale).max(14.0);
-            let corner_x = cw - icon_size - corner_padding;
-            let mut corner_y = corner_padding;
+            let controls_margin = 80.0 * ui_scale;
+            let icon_size = (64.0 * ui_scale).max(28.0);
+            let square_size = (48.0 * ui_scale).max(22.0);
+            
+            // ตำแหน่ง X: ชิดขวา (เหมือนกล่องควบคุม)
+            let right_text_x = cw - controls_margin - square_size - 16.0 * ui_scale - icon_size + icon_size + 12.0 * ui_scale;
+            // ตำแหน่ง Y: ชิดด้านบน (ใช้เฉพาะ controls_margin)
+            let right_text_start_y = controls_margin;
 
-            ops.push(DrawOp::Rect {
-                xywh: (corner_x, corner_y, icon_size, icon_size),
-                thickness: icon_outline,
-                color: (255, 255, 255, 255),
-            });
-
-            let speaker_x = corner_x + icon_size + 16.0 * ui_scale;
-            let speaker_h = icon_size * 0.7;
-            let speaker_body_w = icon_size * 0.3;
-            let speaker_y = corner_y + (icon_size - speaker_h) / 2.0;
-
-            ops.push(DrawOp::FillRect {
-                xywh: (speaker_x, speaker_y, speaker_body_w, speaker_h),
-                color: (255, 255, 255, 255),
-            });
-
-            let horn_pts = vec![
-                (speaker_x + speaker_body_w, speaker_y),
-                (
-                    speaker_x + speaker_body_w + speaker_h * 0.55,
-                    speaker_y + speaker_h * 0.5,
-                ),
-                (speaker_x + speaker_body_w, speaker_y + speaker_h),
-            ];
-            ops.push(DrawOp::Poly {
-                pts: horn_pts,
-                thickness: icon_outline,
-                color: (255, 255, 255, 255),
-            });
-
-            let wave_inner = vec![
-                (
-                    speaker_x + speaker_body_w + speaker_h * 0.35,
-                    speaker_y + speaker_h * 0.2,
-                ),
-                (
-                    speaker_x + speaker_body_w + speaker_h * 0.58,
-                    speaker_y + speaker_h * 0.5,
-                ),
-                (
-                    speaker_x + speaker_body_w + speaker_h * 0.35,
-                    speaker_y + speaker_h * 0.8,
-                ),
-            ];
-            let wave_outer = vec![
-                (
-                    speaker_x + speaker_body_w + speaker_h * 0.55,
-                    speaker_y + speaker_h * 0.05,
-                ),
-                (
-                    speaker_x + speaker_body_w + speaker_h * 0.86,
-                    speaker_y + speaker_h * 0.5,
-                ),
-                (
-                    speaker_x + speaker_body_w + speaker_h * 0.55,
-                    speaker_y + speaker_h * 0.95,
-                ),
-            ];
-            ops.push(DrawOp::Poly {
-                pts: wave_inner,
-                thickness: icon_outline,
-                color: (255, 255, 255, 255),
-            });
-            ops.push(DrawOp::Poly {
-                pts: wave_outer,
-                thickness: icon_outline,
-                color: (255, 255, 255, 255),
-            });
-
-            corner_y += icon_size + 12.0 * ui_scale;
-
+            // === MODE TEXT (แสดง COLON/EGD) ===
             let mode_text = best_detection
                 .map(|d| if d.class_id == 1 { "EGD" } else { "COLON" })
                 .unwrap_or("COLON");
-            let font_regular = scaled_font_px(20.0, ui_scale, 14);
             ops.push(DrawOp::Label {
-                anchor: (corner_x, corner_y),
+                anchor: (right_text_x, right_text_start_y),
                 text: mode_text.to_string(),
-                font_px: font_regular,
-                color: (255, 255, 255, 255),
+                font_px: scaled_font_px(35.0, ui_scale, 36),
+                color: (255, 255, 255, 255),  // White - สีขาว
             });
-            corner_y += 24.0 * ui_scale;
+
+            // === THRESHOLD TEXT (แสดงค่า T = 0.xx) ===
+            let score_text = format!("T = {:.2}", best_score);
+            let score_y = right_text_start_y + 50.0 * ui_scale;
             ops.push(DrawOp::Label {
-                anchor: (corner_x, corner_y),
-                text: format!("T = {:.2}", best_score),
-                font_px: scaled_font_px(18.0, ui_scale, 14),
-                color: (255, 255, 255, 255),
+                anchor: (right_text_x, score_y),
+                text: score_text,
+                font_px: scaled_font_px(35.0, ui_scale, 30),
+                color: (255, 255, 255, 255),  // White - สีขาว
             });
+        }
+
+        // ============================================================
+        // BOUNDING BOXES (กรอบวัตถุที่ตรวจพบ)
+        // ============================================================
+        let bbox_scale = ui_scale;  // อัตราส่วนการขยายกรอบ
+        let bbox_outline = scaled_thickness(2.0, bbox_scale);  // ความหนาเส้นกรอบ
+        let corner_outline = scaled_thickness(3.0, bbox_scale);  // ความหนาเส้นมุม
+        let label_font = scaled_font_px(20.0, ui_scale, 14);  // ขนาดฟอนต์ label
+
+        // วนวาดกรอบสำหรับแต่ละวัตถุที่ตรวจพบ
+        for det in &input.items {
+            // short_label = ชื่อสั้น, class_color = สีของคลาส (ใช้สีฟ้าสำหรับทุกคลาส)
+            let (short_label, _, _) = class_palette(det.class_id as u32);
+            // box_color = สีฟ้าสำหรับกรอบ (ไม่แยกตามคลาส)
+            let box_color = (0, 180, 255, 255);  // สีฟ้า (Cyan Blue)
+            // x, y, w, h = ตำแหน่งและขนาดของกรอบ
+            let (x, y, w, h) = (det.bbox.x, det.bbox.y, det.bbox.w, det.bbox.h);
+
+            // ไม่วาดกรอบสี่เหลี่ยมเต็มรูป - ใช้เฉพาะเส้นมุมโค้งมนแทน
+
+            // วาดเส้นมุมโค้งมน (Rounded Corner Brackets) - 4 มุมของกรอบ สีฟ้า
+            if self.enable_full_ui {
+                // corner_len = ความยาวของเส้นมุม (22% ของด้านที่สั้นกว่า)
+                let corner_len = (w.min(h) * 0.22)
+                    .max(18.0 * ui_scale)
+                    .min(40.0 * ui_scale);
+                // radius = รัศมีความโค้งของมุม (ประมาณ 30% ของความยาวเส้น)
+                let radius = (corner_len * 0.3).max(4.0 * ui_scale);
+                // x2, y2 = ตำแหน่งมุมขวาล่าง
+                let x2 = x + w;
+                let y2 = y + h;
+
+                // === มุมซ้ายบน (Top-Left) - มุมโค้งมน ===
+                // เส้นนอน (แนวนอนจากซ้าย) โค้งเข้ามุม
+                ops.push(DrawOp::Poly {
+                    pts: vec![
+                        (x, y + radius),
+                        (x, y + radius * 0.5),
+                        (x + radius * 0.5, y),
+                        (x + radius, y),
+                    ],
+                    thickness: corner_outline,
+                    color: box_color,
+                });
+                // เส้นนอนยาวออกไป
+                ops.push(DrawOp::Poly {
+                    pts: vec![(x + radius, y), (x + corner_len, y)],
+                    thickness: corner_outline,
+                    color: box_color,
+                });
+                // เส้นตั้งยาวลงมา
+                ops.push(DrawOp::Poly {
+                    pts: vec![(x, y + radius), (x, y + corner_len)],
+                    thickness: corner_outline,
+                    color: box_color,
+                });
+
+                // === มุมขวาบน (Top-Right) - มุมโค้งมน ===
+                ops.push(DrawOp::Poly {
+                    pts: vec![
+                        (x2 - radius, y),
+                        (x2 - radius * 0.5, y),
+                        (x2, y + radius * 0.5),
+                        (x2, y + radius),
+                    ],
+                    thickness: corner_outline,
+                    color: box_color,
+                });
+                ops.push(DrawOp::Poly {
+                    pts: vec![(x2 - corner_len, y), (x2 - radius, y)],
+                    thickness: corner_outline,
+                    color: box_color,
+                });
+                ops.push(DrawOp::Poly {
+                    pts: vec![(x2, y + radius), (x2, y + corner_len)],
+                    thickness: corner_outline,
+                    color: box_color,
+                });
+
+                // === มุมซ้ายล่าง (Bottom-Left) - มุมโค้งมน ===
+                ops.push(DrawOp::Poly {
+                    pts: vec![
+                        (x, y2 - radius),
+                        (x, y2 - radius * 0.5),
+                        (x + radius * 0.5, y2),
+                        (x + radius, y2),
+                    ],
+                    thickness: corner_outline,
+                    color: box_color,
+                });
+                ops.push(DrawOp::Poly {
+                    pts: vec![(x, y2 - corner_len), (x, y2 - radius)],
+                    thickness: corner_outline,
+                    color: box_color,
+                });
+                ops.push(DrawOp::Poly {
+                    pts: vec![(x + radius, y2), (x + corner_len, y2)],
+                    thickness: corner_outline,
+                    color: box_color,
+                });
+
+                // === มุมขวาล่าง (Bottom-Right) - มุมโค้งมน ===
+                ops.push(DrawOp::Poly {
+                    pts: vec![
+                        (x2 - radius, y2),
+                        (x2 - radius * 0.5, y2),
+                        (x2, y2 - radius * 0.5),
+                        (x2, y2 - radius),
+                    ],
+                    thickness: corner_outline,
+                    color: box_color,
+                });
+                ops.push(DrawOp::Poly {
+                    pts: vec![(x2 - corner_len, y2), (x2 - radius, y2)],
+                    thickness: corner_outline,
+                    color: box_color,
+                });
+                ops.push(DrawOp::Poly {
+                    pts: vec![(x2, y2 - corner_len), (x2, y2 - radius)],
+                    thickness: corner_outline,
+                    color: box_color,
+                });
+            }
+
+            // ============================================================
+            // DETECTION LABEL (ข้อความข้างกรอบวัตถุ) - ลบออกแล้ว
+            // ============================================================
+            // ไม่แสดงข้อความบนกรอบสีฟ้าอีกต่อไป
+        }
+
+        if self.enable_full_ui {
+            // ============================================================
+            // TOP RIGHT CORNER (มุมขวาบน: กล่องควบคุม + ไอคอนลำโพง + ข้อความ)
+            // ============================================================
+            let controls_margin = 10.0 * ui_scale;  // ระยะห่างจากขอบขวา
+            let icon_size = (64.0 * ui_scale).max(28.0);
+            let square_size = (48.0 * ui_scale).max(22.0);
+            // ชิดขอบขวา: วางลำโพงก่อน แล้วคำนวณตำแหน่งกล่องย้อนกลับ
+            let speaker_x = cw - controls_margin - icon_size;  // ลำโพงชิดขวา
+            let block_x = speaker_x - 16.0 * ui_scale - square_size;  // กล่องอยู่ซ้ายลำโพง
+            let block_y = controls_margin;
+
+            // กล่องสีเทา
+            ops.push(DrawOp::FillRect {
+                xywh: (block_x, block_y, square_size, square_size),
+                color: (58, 58, 58, 255),
+            });
+            ops.push(DrawOp::Rect {
+                xywh: (block_x, block_y, square_size, square_size),
+                thickness: scaled_thickness(2.0, ui_scale),
+                color: (150, 150, 150, 255),
+            });
+
+            // ไอคอนลำโพง (วาดด้วย shapes แบบง่ายๆ ให้เห็นชัด)
+            if self.spk {
+                let center_y = block_y + square_size / 2.0;
+                let spk_size = square_size * 0.6;
+                let spk_x = speaker_x + (icon_size - spk_size) / 2.0;
+                
+                // === ตัวลำโพง (สี่เหลี่ยม) ===
+                let body_w = spk_size * 0.25;
+                let body_h = spk_size * 0.50;
+                let body_x = spk_x;
+                let body_y = center_y - body_h / 2.0;
+                
+                ops.push(DrawOp::FillRect {
+                    xywh: (body_x, body_y, body_w, body_h),
+                    color: (255, 255, 255, 255),
+                });
+                
+                // === แตร (trapezoid) ===
+                let horn_x = body_x + body_w;
+                let horn_w = spk_size * 0.40;
+                
+                ops.push(DrawOp::Poly {
+                    pts: vec![
+                        (horn_x, body_y),
+                        (horn_x + horn_w, body_y - body_h * 0.30),
+                        (horn_x + horn_w, body_y + body_h + body_h * 0.30),
+                        (horn_x, body_y + body_h),
+                        (horn_x, body_y),
+                    ],
+                    thickness: 0,
+                    color: (255, 255, 255, 255),
+                });
+                
+                // เติมสีแตร
+                for i in 0..10 {
+                    let t = i as f32 / 10.0;
+                    let x = horn_x + horn_w * t;
+                    let h_expand = body_h * 0.30 * t;
+                    let y1 = body_y - h_expand;
+                    let y2 = body_y + body_h + h_expand;
+                    
+                    ops.push(DrawOp::Poly {
+                        pts: vec![(x, y1), (x, y2)],
+                        thickness: scaled_thickness(2.0, ui_scale),
+                        color: (255, 255, 255, 255),
+                    });
+                }
+                
+                // === คลื่นเสียง 3 เส้น ===
+                let wave_x = horn_x + horn_w + spk_size * 0.15;
+                let wave_gap = spk_size * 0.10;
+                
+                for i in 0..3 {
+                    let x = wave_x + i as f32 * wave_gap;
+                    let h = body_h * 0.30 + i as f32 * body_h * 0.15;
+                    
+                    ops.push(DrawOp::Poly {
+                        pts: vec![
+                            (x, center_y - h),
+                            (x + wave_gap * 0.4, center_y),
+                            (x, center_y + h),
+                        ],
+                        thickness: scaled_thickness(2.5, ui_scale),
+                        color: (255, 255, 255, 255),
+                    });
+                }
+            }
         }
 
         OverlayPlanPacket {
@@ -526,6 +403,7 @@ impl PlanStage {
     pub fn from_path(cfg: &str) -> Result<Self> {
         Ok(Self {
             enable_full_ui: Self::parse_enable_full_ui(cfg),
+            spk: true,  // ค่าเริ่มต้น: เปิดลำโพง (แสดงไอคอน)
         })
     }
 }
