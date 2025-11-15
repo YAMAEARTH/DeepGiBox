@@ -224,19 +224,26 @@ fn run_keying_pipeline(config: &PipelineConfig) -> Result<()> {
     // 5. Postprocessing
     println!("🎯 [5/7] Postprocessing");
     let mut post_stage = if config.postprocessing.tracking.enable {
-        postprocess::from_path("")?
+        let mut stage = postprocess::from_path("")?
             .with_sort_tracking(
                 config.postprocessing.tracking.max_age,
                 config.postprocessing.tracking.min_confidence,
                 config.postprocessing.tracking.iou_threshold,
             )
-            .with_verbose_stats(config.postprocessing.verbose_stats)
+            .with_verbose_stats(config.postprocessing.verbose_stats);
+        
+        // Enable EMA smoothing for smoother bounding boxes
+        // alpha_position = 0.3 (smoother position changes)
+        // alpha_size = 0.4 (slightly more responsive size changes)
+        stage = stage.with_ema_smoothing(0.3, 0.4);
+        stage
     } else {
         postprocess::from_path("")?
             .with_verbose_stats(config.postprocessing.verbose_stats)
     };
     println!("  ✓ Confidence threshold: {}", config.postprocessing.confidence_threshold);
     println!("  ✓ Tracking: {}", if config.postprocessing.tracking.enable { "enabled" } else { "disabled" });
+    println!("  ✓ EMA smoothing: {} (α_pos=0.3, α_size=0.4)", if config.postprocessing.tracking.enable { "enabled" } else { "disabled" });
     println!();
 
     // 6. Overlay Planning & Rendering
@@ -308,11 +315,16 @@ fn run_keying_pipeline(config: &PipelineConfig) -> Result<()> {
     let mut hw_start_time: Option<u64> = None;
     let frames_ahead = 0u64;
 
-    // Adaptive queue management
-    let mut max_queue_depth = 3u32;
-    let mut pipeline_time_sma = 35.0;
+    // Adaptive queue management - Start at optimal depth 2
+    let mut max_queue_depth = 2u32;
+    let mut pipeline_time_sma = 15.0;  // Expected ~15ms at queue=2
     const SMA_ALPHA: f64 = 0.1;
     let frame_period_ms = 1000.0 / fps_calc;
+    
+    // Debouncing counters to prevent oscillation
+    let mut counter_to_increase = 0u32;
+    let mut counter_to_decrease = 0u32;
+    const DEBOUNCE_THRESHOLD: u32 = 10; // Must exceed threshold for 10 frames consecutively
     
     // 🎯 FRAME RATE LIMITING: Target frame time to match output FPS
     let target_frame_time = Duration::from_secs_f64(1.0 / fps_calc);
@@ -366,8 +378,10 @@ fn run_keying_pipeline(config: &PipelineConfig) -> Result<()> {
 
     let pipeline_start_time = Instant::now();
     let test_duration = if config.general.test_duration_seconds > 0 {
+        println!("⏱️  Test duration set to {} seconds", config.general.test_duration_seconds);
         Some(Duration::from_secs(config.general.test_duration_seconds))
     } else {
+        println!("⏱️  Running indefinitely (test_duration_seconds = 0)");
         None
     };
 
@@ -416,7 +430,13 @@ fn run_keying_pipeline(config: &PipelineConfig) -> Result<()> {
         let preprocess_start = Instant::now();
         let tensor_packet = match preprocessor.process_checked(raw_frame_gpu.clone()) {
             Some(packet) => packet,
-            None => continue,
+            None => {
+                eprintln!("❌ Frame {} skipped by preprocessor - size {}x{}", 
+                          frame_count, 
+                          raw_frame_gpu.meta.width, 
+                          raw_frame_gpu.meta.height);
+                continue;
+            }
         };
         let preprocess_time = preprocess_start.elapsed();
         total_preprocess_ms += preprocess_time.as_secs_f64() * 1000.0;
@@ -565,17 +585,85 @@ fn run_keying_pipeline(config: &PipelineConfig) -> Result<()> {
             }
         }
 
-        // Adaptive queue adjustment
+        // Adaptive queue adjustment with debouncing to prevent oscillation
+        // STRATEGY: Stay at queue=2 as optimal depth, only change if really necessary
         pipeline_time_sma = SMA_ALPHA * pipeline_ms + (1.0 - SMA_ALPHA) * pipeline_time_sma;
-        max_queue_depth = if pipeline_time_sma < frame_period_ms * 0.9 {
-            2
-        } else if pipeline_time_sma < frame_period_ms * 1.2 {
-            3
-        } else if pipeline_time_sma < frame_period_ms * 1.5 {
-            4
-        } else {
-            5
+        
+        let current_depth = max_queue_depth;
+        let utilization = pipeline_time_sma / frame_period_ms;
+        
+        // Determine desired queue depth based on utilization
+        // Use VERY wide thresholds to keep queue stable at depth 2
+        let desired_depth = match current_depth {
+            1 => {
+                // Currently at 1: increase to 2 if above 80% (we almost never want to be at 1)
+                if utilization >= 0.80 {
+                    2
+                } else {
+                    1
+                }
+            }
+            2 => {
+                // Currently at 2 (OPTIMAL): only decrease if extremely fast (<60%), only increase if very slow (>100%)
+                if utilization < 0.60 {
+                    1  // Extremely fast - can drop to 1
+                } else if utilization >= 1.00 {
+                    3  // Getting slow - increase to 3
+                } else {
+                    2  // Stay at 2 (normal range: 60-100% = 10-16.67ms pipeline)
+                }
+            }
+            3 => {
+                // Currently at 3: decrease to 2 if below 95%, increase if above 110%
+                if utilization < 0.95 {
+                    2
+                } else if utilization >= 1.10 {
+                    4
+                } else {
+                    3
+                }
+            }
+            _ => {
+                // 4 or higher: decrease to 3 if below 105%
+                if utilization < 1.05 {
+                    3
+                } else {
+                    current_depth
+                }
+            }
         };
+        
+        // Apply debouncing: only change if desired_depth differs from current_depth
+        // for DEBOUNCE_THRESHOLD consecutive frames
+        if desired_depth > current_depth {
+            // Want to increase
+            counter_to_increase += 1;
+            counter_to_decrease = 0;
+            
+            if counter_to_increase >= DEBOUNCE_THRESHOLD {
+                max_queue_depth = desired_depth;
+                counter_to_increase = 0;
+                let utilization_pct = utilization * 100.0;
+                println!("[queue] 🔧 Queue depth INCREASED: {} → {} (pipeline: {:.2}ms = {:.1}% of {:.2}ms, debounced {} frames)", 
+                         current_depth, max_queue_depth, pipeline_time_sma, utilization_pct, frame_period_ms, DEBOUNCE_THRESHOLD);
+            }
+        } else if desired_depth < current_depth {
+            // Want to decrease
+            counter_to_decrease += 1;
+            counter_to_increase = 0;
+            
+            if counter_to_decrease >= DEBOUNCE_THRESHOLD {
+                max_queue_depth = desired_depth;
+                counter_to_decrease = 0;
+                let utilization_pct = utilization * 100.0;
+                println!("[queue] 🔧 Queue depth DECREASED: {} → {} (pipeline: {:.2}ms = {:.1}% of {:.2}ms, debounced {} frames)", 
+                         current_depth, max_queue_depth, pipeline_time_sma, utilization_pct, frame_period_ms, DEBOUNCE_THRESHOLD);
+            }
+        } else {
+            // desired_depth == current_depth, reset counters
+            counter_to_increase = 0;
+            counter_to_decrease = 0;
+        }
 
         frame_count += 1;
 

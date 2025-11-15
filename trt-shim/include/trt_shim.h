@@ -48,6 +48,10 @@ typedef struct {
 
 DeviceBuffers* get_device_buffers(InferenceSession session);
 
+// Free DeviceBuffers structure allocated by get_device_buffers
+// MUST be called after you're done with the buffers to prevent memory leak
+void free_device_buffers(DeviceBuffers* buffers);
+
 // Copy output data from GPU buffer to CPU (for postprocessing/visualization)
 // Use this after run_inference_device() to retrieve results
 void copy_output_to_cpu(

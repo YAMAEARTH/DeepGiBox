@@ -5,9 +5,11 @@ use telemetry::{now_ns, record_ms};
 mod post;
 mod sort_tracker;
 mod fast_nms;
+mod ema_smoother;
 
 use post::{postprocess_yolov5_with_temporal_smoothing, TemporalSmoother, YoloPostConfig};
 use sort_tracker::SortTrackerWrapper;
+use ema_smoother::EmaSmoother;
 
 // Re-export config structs for external use
 pub use post::PostprocessConfig;
@@ -30,6 +32,7 @@ pub struct PostStage {
     config: YoloPostConfig,
     smoother: Option<TemporalSmoother>,
     tracker: Option<SortTrackerWrapper>,
+    ema_smoother: Option<EmaSmoother>,
     current_epoch: usize,
 }
 
@@ -39,6 +42,7 @@ impl PostStage {
             config,
             smoother: None,
             tracker: None,
+            ema_smoother: None,
             current_epoch: 0,
         }
     }
@@ -59,6 +63,13 @@ impl PostStage {
             min_confidence,
             iou_threshold,
         ));
+        self
+    }
+
+    /// Enable EMA (Exponential Moving Average) smoothing for bounding boxes
+    /// This reduces jitter/shake in detection boxes
+    pub fn with_ema_smoothing(mut self, alpha_position: f32, alpha_size: f32) -> Self {
+        self.ema_smoother = Some(EmaSmoother::with_alpha(alpha_position, alpha_size));
         self
     }
 
@@ -137,13 +148,43 @@ impl Stage<RawDetectionsPacket, DetectionsPacket> for PostStage {
                 .collect();
 
             // Update tracker and get tracked detections
-            let tracked = tracker.update(&detections_for_tracking);
+            let mut tracked = tracker.update(&detections_for_tracking);
 
             if config.verbose_stats {
                 println!(
                     "  ✓ SORT tracking: {} active tracks",
                     tracker.get_active_track_count()
                 );
+            }
+
+            // Apply EMA smoothing if enabled (after tracking)
+            if let Some(ema_smoother) = &mut self.ema_smoother {
+                // Convert tracked detections to EMA format: (track_id, x, y, w, h, class_id, score)
+                // SORT returns: (u64, f32, f32, f32, f32, usize, f32)
+                let ema_input: Vec<_> = tracked
+                    .iter()
+                    .map(|(track_id, x1, y1, x2, y2, class_id, score)| {
+                        (*track_id as i32, *x1, *y1, x2 - x1, y2 - y1, *class_id as i32, *score)
+                    })
+                    .collect();
+
+                // Apply smoothing
+                let smoothed = ema_smoother.smooth(ema_input);
+
+                if config.verbose_stats {
+                    println!(
+                        "  ✓ EMA smoothing: {} smoothed tracks",
+                        ema_smoother.active_count()
+                    );
+                }
+
+                // Convert back to tracked format: (u64, f32, f32, f32, f32, usize, f32)
+                tracked = smoothed
+                    .iter()
+                    .map(|(track_id, x, y, w, h, class_id, score)| {
+                        (*track_id as u64, *x, *y, x + w, y + h, *class_id as usize, *score)
+                    })
+                    .collect();
             }
 
             // Convert tracked detections to common_io::Detection format

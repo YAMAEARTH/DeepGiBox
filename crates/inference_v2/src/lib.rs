@@ -78,21 +78,29 @@ impl TrtInferenceStage {
             ) -> *mut DeviceBuffers> = 
                 lib.get(b"get_device_buffers")
                     .map_err(|e| format!("Failed to load get_device_buffers symbol: {}", e))?;
+            
+            let free_device_buffers: Symbol<unsafe extern "C" fn(*mut DeviceBuffers)> = 
+                lib.get(b"free_device_buffers")
+                    .map_err(|e| format!("Failed to load free_device_buffers symbol: {}", e))?;
 
             let buffers_ptr = get_device_buffers(session);
             if buffers_ptr.is_null() {
                 return Err("get_device_buffers returned null pointer".to_string());
             }
-            let buffers = Box::from_raw(buffers_ptr);
+            let buffers = &*buffers_ptr;  // Don't take ownership - just borrow
 
             let output_size = if buffers.output_size > 0 {
                 buffers.output_size as usize
             } else {
+                free_device_buffers(buffers_ptr);  // Clean up before returning error
                 return Err("TensorRT reported zero-sized output buffer".to_string());
             };
             
             let output_gpu_ptr = buffers.d_output as *mut f32;
             let num_detections = output_size / 7; // 2-class YOLOv5: 7 values per detection
+            
+            // Free the buffers structure (but NOT the GPU pointers inside - they're managed by TensorRT)
+            free_device_buffers(buffers_ptr);
             
             // Pre-allocate CPU output buffer (will be reused)
             let output_cpu = vec![0.0f32; output_size];

@@ -292,10 +292,19 @@ struct InferenceSessionImpl {
     
     int main_output_idx;  // Index of the main detection output (largest output)
     
+    // **FIX: Pre-allocated threshold buffers (reused every frame to prevent leak)**
+    float* d_threshold_buffers[3];
+    int num_threshold_buffers;
+    
     ~InferenceSessionImpl() {
         // Cleanup GPU buffers
         for (auto buf : inputBuffers) cudaFree(buf);
         for (auto buf : outputBuffers) cudaFree(buf);
+        
+        // Cleanup threshold buffers
+        for (int i = 0; i < num_threshold_buffers; ++i) {
+            if (d_threshold_buffers[i]) cudaFree(d_threshold_buffers[i]);
+        }
         
         // Cleanup CUDA stream
         if (stream) cudaStreamDestroy(stream);
@@ -426,8 +435,29 @@ InferenceSession create_session(const char* engine_path) {
     // Store the main output index
     session->main_output_idx = largest_output_idx;
     
+    // **FIX: Pre-allocate threshold buffers (reused every frame)**
+    // Count how many scalar inputs (thresholds) we have
+    session->num_threshold_buffers = 0;
+    for (int i = 0; i < 3; ++i) {
+        session->d_threshold_buffers[i] = nullptr;
+    }
+    
+    for (const auto& name : session->inputNames) {
+        auto dims = session->engine->getTensorShape(name);
+        int64_t size = 1;
+        for (int j = 0; j < dims.nbDims; j++) size *= dims.d[j];
+        
+        if (size == 1 && session->num_threshold_buffers < 3) {
+            cudaMalloc(reinterpret_cast<void**>(&session->d_threshold_buffers[session->num_threshold_buffers]), sizeof(float));
+            std::cout << "  ✓ Pre-allocated threshold buffer #" << session->num_threshold_buffers 
+                      << " for '" << name << "'" << std::endl;
+            session->num_threshold_buffers++;
+        }
+    }
+    
     std::cout << "✅ Session ready (inputs: " << session->inputNames.size() 
-              << ", outputs: " << session->outputNames.size() << ")" << std::endl;
+              << ", outputs: " << session->outputNames.size() 
+              << ", thresholds: " << session->num_threshold_buffers << ")" << std::endl;
     
     if (!session->outputNames.empty()) {
         std::cout << "✅ Main detection output: #" << largest_output_idx 
@@ -555,6 +585,13 @@ DeviceBuffers* get_device_buffers(InferenceSession session_ptr) {
     return buffers;
 }
 
+// Free DeviceBuffers structure to prevent memory leak
+void free_device_buffers(DeviceBuffers* buffers) {
+    if (buffers) {
+        delete buffers;
+    }
+}
+
 // Copy output data from GPU to CPU after zero-copy inference
 void copy_output_to_cpu(InferenceSession session_ptr, float* output_cpu, int output_size) {
     if (!session_ptr || !output_cpu) {
@@ -623,51 +660,21 @@ void run_inference_device_multiple_input(
     }
 
     auto session = static_cast<InferenceSessionImpl*>(session_ptr);
-    static std::map<InferenceSession, std::vector<void*>> threshold_buffers;
-
-    if (threshold_buffers.find(session_ptr) == threshold_buffers.end()) {
-        std::cout << "📌 Initializing threshold buffers for multi-input model..." << std::endl;
-        std::vector<void*> thresholds;
-
-        for (const auto& name : session->inputNames) {
-            auto dims = session->engine->getTensorShape(name);
-            int64_t size = 1;
-            for (int j = 0; j < dims.nbDims; j++) size *= dims.d[j];
-
-            if (size == 1) {
-                float* d_threshold = nullptr;
-                cudaError_t err = cudaMalloc(reinterpret_cast<void**>(&d_threshold), sizeof(float));
-                if (err != cudaSuccess) {
-                    std::cerr << "[ERROR] cudaMalloc failed for threshold: " << cudaGetErrorString(err) << std::endl;
-                    continue;
-                }
-                thresholds.push_back(d_threshold);
-            }
-        }
-
-        threshold_buffers[session_ptr] = thresholds;
-        std::cout << "   ✓ Threshold buffers allocated\n" << std::endl;
+    
+    // **FIX: Reuse pre-allocated threshold buffers instead of allocating each frame**
+    float h_thresholds[3] = {threshold_nbi, threshold_wle, c_threshold};
+    
+    // Copy threshold values to pre-allocated GPU buffers
+    for (int i = 0; i < session->num_threshold_buffers; ++i) {
+        cudaMemcpyAsync(session->d_threshold_buffers[i], &h_thresholds[i], 
+                       sizeof(float), cudaMemcpyHostToDevice, session->stream);
     }
 
-    // Update threshold values on GPU
-    auto& thresholds = threshold_buffers[session_ptr];
-    float threshold_values[] = {threshold_nbi, threshold_wle, c_threshold};
-    
-    std::cout << "   🔧 Setting thresholds: NBI=" << threshold_nbi 
-              << ", WLE=" << threshold_wle 
-              << ", C=" << c_threshold << std::endl;
-    
-    std::cout << "   📋 Copying to GPU buffers:" << std::endl;
-    for (size_t i = 0; i < thresholds.size() && i < 3; ++i) {
-        std::cout << "      Buffer[" << i << "] = " << threshold_values[i] << std::endl;
-        cudaMemcpy(thresholds[i], &threshold_values[i], sizeof(float), cudaMemcpyHostToDevice);
-    }
-
+    // Set tensor addresses
     int32_t numIO = session->engine->getNbIOTensors();
     int thresholdIdx = 0;
     int outputIdx = 0;
 
-    std::cout << "   🔗 Assigning buffers to tensors:" << std::endl;
     for (int32_t i = 0; i < numIO; ++i) {
         const char* name = session->engine->getIOTensorName(i);
         TensorIOMode mode = session->engine->getTensorIOMode(name);
@@ -678,28 +685,24 @@ void run_inference_device_multiple_input(
             for (int j = 0; j < dims.nbDims; j++) size *= dims.d[j];
 
             if (size == 1) {
-                // Match threshold by name explicitly instead of relying on order
+                // **FIX: Use pre-allocated threshold buffers**
                 int bufferIdx = -1;
                 if (std::string(name) == "threshold_NBI") {
                     bufferIdx = 0;
-                    std::cout << "      Tensor 'threshold_NBI' -> Buffer[0] = " << threshold_nbi << std::endl;
                 } else if (std::string(name) == "threshold_WLE") {
                     bufferIdx = 1;
-                    std::cout << "      Tensor 'threshold_WLE' -> Buffer[1] = " << threshold_wle << std::endl;
                 } else if (std::string(name) == "c_threshold") {
                     bufferIdx = 2;
-                    std::cout << "      Tensor 'c_threshold' -> Buffer[2] = " << c_threshold << std::endl;
                 } else {
-                    // Unknown scalar input, assign sequentially
-                    std::cout << "      Tensor '" << name << "' (unknown) -> Buffer[" << thresholdIdx << "]" << std::endl;
                     bufferIdx = thresholdIdx;
                     thresholdIdx++;
                 }
                 
-                if (bufferIdx >= 0 && bufferIdx < static_cast<int>(threshold_buffers[session_ptr].size())) {
-                    session->context->setTensorAddress(name, threshold_buffers[session_ptr][bufferIdx]);
+                if (bufferIdx >= 0 && bufferIdx < session->num_threshold_buffers && session->d_threshold_buffers[bufferIdx]) {
+                    session->context->setTensorAddress(name, session->d_threshold_buffers[bufferIdx]);
                 }
             } else {
+                // Main input tensor (image data)
                 session->context->setTensorAddress(name, const_cast<float*>(d_input));
             }
         } else if (mode == TensorIOMode::kOUTPUT) {
@@ -708,13 +711,18 @@ void run_inference_device_multiple_input(
         }
     }
 
+    // Execute inference
     bool success = session->context->enqueueV3(session->stream);
+    
+    // Wait for completion
+    cudaStreamSynchronize(session->stream);
+    
+    // **FIX: No need to free - we reuse pre-allocated buffers (freed in destructor)**
+    
     if (!success) {
         std::cerr << "❌ Inference execution failed!" << std::endl;
         return;
     }
-
-    cudaStreamSynchronize(session->stream);
 }
 
 void destroy_session(InferenceSession session_ptr) {
