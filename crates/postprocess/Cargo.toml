@@ -2,9 +2,17 @@
 name = "postprocess"
 version = "0.1.0"
 edition = "2021"
+
+[features]
+default = []
+gpu = []  # Enable GPU-accelerated postprocessing
+
 [dependencies]
 anyhow = "1"
 similari = "0.26"
 common_io = { path = "../common_io" }
 telemetry = { path = "../telemetry" }
 config = { path = "../config" }
+
+[build-dependencies]
+cc = "1.0"

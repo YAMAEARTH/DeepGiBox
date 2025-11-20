@@ -109,12 +109,18 @@ void decklink_capture_close();
 bool decklink_output_open(int32_t device_index, int32_t width, int32_t height, double fps);
 bool decklink_output_send_frame(const uint8_t* bgra_data, int32_t width, int32_t height);
 bool decklink_output_send_frame_gpu(const uint8_t* gpu_bgra_data, int32_t gpu_pitch, int32_t width, int32_t height);
+bool decklink_output_schedule_frame(const uint8_t* cpu_bgra_data, int32_t pitch, int32_t width, int32_t height, uint64_t display_time, uint64_t display_duration);
 bool decklink_output_schedule_frame_gpu(const uint8_t* gpu_bgra_data, int32_t gpu_pitch, int32_t width, int32_t height, uint64_t display_time, uint64_t display_duration);
 bool decklink_output_schedule_frame_gpu_dvp(const uint8_t* gpu_bgra_data, int32_t gpu_pitch, int32_t width, int32_t height, uint64_t display_time, uint64_t display_duration);
 bool decklink_output_get_last_frame_timing(double* packet_prep, double* queue_mgmt, double* dma_copy, double* api, double* scheduling);
 bool decklink_output_start_scheduled_playback(uint64_t start_time, double time_scale);
 bool decklink_output_stop_scheduled_playback();
 void decklink_output_close();
+
+// DVP-compatible GPU memory allocation (for overlay_render)
+bool decklink_initialize_dvp_context();
+void* decklink_allocate_dvp_compatible_buffer(size_t size);
+void decklink_free_dvp_compatible_buffer(void* ptr);
 
 } // extern "C"
 
@@ -1866,7 +1872,10 @@ extern "C" bool decklink_output_get_last_frame_timing(double* packet_prep, doubl
 extern "C" bool decklink_output_schedule_frame_gpu_dvp(const uint8_t* gpu_bgra_data, int32_t gpu_pitch, int32_t width, int32_t height, uint64_t display_time, uint64_t display_duration) {
     auto timing_start = std::chrono::high_resolution_clock::now();
     
+    // CRITICAL: Check if output device is still valid before any DVP operations
+    // This prevents DVP errors when device has been closed (e.g., during shutdown)
     if (!g_output || !gpu_bgra_data) {
+        // Silently return false if device is closed (normal during shutdown)
         return false;
     }
 
@@ -1916,22 +1925,35 @@ extern "C" bool decklink_output_schedule_frame_gpu_dvp(const uint8_t* gpu_bgra_d
     DVPBufferHandle dst_handle = 0;
     if (!get_dvp_host_handle(frame_bytes, &dst_handle) || dst_handle == 0) {
         // Frame buffer not allocated by DVP allocator - fallback to cudaMemcpy
-        frame->Release();
-        return decklink_output_schedule_frame_gpu(gpu_bgra_data, gpu_pitch, width, height, display_time, display_duration);
-    }
-
-    // Create temporary DVP handle for GPU source buffer
-    CUdeviceptr cu_src = reinterpret_cast<CUdeviceptr>(gpu_bgra_data);
-    DVPBufferHandle gpu_src_handle = 0;
-    DVPStatus create_status = dvpCreateGPUCUDADevicePtr(cu_src, &gpu_src_handle);
-    if (create_status != DVP_STATUS_OK) {
-        log_dvp_error("dvpCreateGPUCUDADevicePtr (output src)", create_status);
+        fprintf(stderr, "[shim][dvp] ⚠️  DeckLink frame buffer is NOT DVP-registered! Falling back to cudaMemcpy.\n");
+        fprintf(stderr, "[shim][dvp]    This means DVP allocator failed to register the frame buffer.\n");
         frame->Release();
         return decklink_output_schedule_frame_gpu(gpu_bgra_data, gpu_pitch, width, height, display_time, display_duration);
     }
 
     // DMA transfer via DVP (GPU → DeckLink buffer via PCIe DMA)
     size_t total_bytes = static_cast<size_t>(row_bytes) * static_cast<size_t>(height);
+
+    // Create temporary DVP handle for GPU source buffer
+    CUdeviceptr cu_src = reinterpret_cast<CUdeviceptr>(gpu_bgra_data);
+    DVPBufferHandle gpu_src_handle = 0;
+    
+    DVPStatus create_status = dvpCreateGPUCUDADevicePtr(cu_src, &gpu_src_handle);
+    if (create_status != DVP_STATUS_OK) {
+        fprintf(stderr, "[shim][dvp] ❌ dvpCreateGPUCUDADevicePtr failed for overlay buffer!\n");
+        fprintf(stderr, "[shim][dvp]    ptr=0x%llx, size=%dx%d (%zu bytes)\n",
+                (unsigned long long)cu_src, width, height, total_bytes);
+        log_dvp_error("dvpCreateGPUCUDADevicePtr (output src)", create_status);
+        frame->Release();
+        return decklink_output_schedule_frame_gpu(gpu_bgra_data, gpu_pitch, width, height, display_time, display_duration);
+    }
+
+    // Double-check device is still valid before starting DVP operations
+    if (!g_output) {
+        dvpFreeBuffer(gpu_src_handle);
+        frame->Release();
+        return false;
+    }
     
     DVPStatus begin_status = dvpBegin();
     if (begin_status != DVP_STATUS_OK) {
@@ -1975,6 +1997,12 @@ extern "C" bool decklink_output_schedule_frame_gpu_dvp(const uint8_t* gpu_bgra_d
         return decklink_output_schedule_frame_gpu(gpu_bgra_data, gpu_pitch, width, height, display_time, display_duration);
     }
 
+    // Final check before scheduling (device might have closed during DMA)
+    if (!g_output) {
+        frame->Release();
+        return false;
+    }
+
     // Schedule frame for async playback
     auto scheduling_start = std::chrono::high_resolution_clock::now();
     
@@ -1998,10 +2026,65 @@ extern "C" bool decklink_output_schedule_frame_gpu_dvp(const uint8_t* gpu_bgra_d
     }
 
     uint64_t frame_num = g_scheduled_frames_count.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (frame_num <= 5 || frame_num % 60 == 0) {
-        fprintf(stderr, "[shim][output] DVP Scheduled frame #%llu (DMA: %.2fms)\n",
+    
+    // Log DVP success for first few frames
+    if (frame_num <= 3) {
+        fprintf(stderr, "[shim][dvp] ✅ Frame #%llu: DVP DMA completed (%.2f ms)\n",
                 (unsigned long long)frame_num, g_last_frame_timing.dma_copy_ms);
     }
+    
+    // DVP frame scheduling logging disabled
+    // if (frame_num <= 5 || frame_num % 60 == 0) {
+    //     fprintf(stderr, "[shim][output] DVP Scheduled frame #%llu (DMA: %.2fms)\n",
+    //             (unsigned long long)frame_num, g_last_frame_timing.dma_copy_ms);
+    // }
+    return true;
+}
+
+// CPU path: Schedule frame from CPU memory (no GPU operations)
+extern "C" bool decklink_output_schedule_frame(const uint8_t* cpu_bgra_data, int32_t pitch, int32_t width, int32_t height, uint64_t display_time, uint64_t display_duration) {
+    if (!g_output || !cpu_bgra_data) {
+        return false;
+    }
+
+    if (width != g_output_width || height != g_output_height) {
+        fprintf(stderr, "[shim][output] Frame dimension mismatch: expected %dx%d, got %dx%d\n",
+                g_output_width, g_output_height, width, height);
+        return false;
+    }
+
+    // Create video frame (BGRA format: bmdFormat8BitBGRA)
+    IDeckLinkMutableVideoFrame_v14_2_1* frame = nullptr;
+    int32_t row_bytes = width * 4; // BGRA = 4 bytes per pixel
+    HRESULT create_hr = g_output->CreateVideoFrame(width, height, row_bytes, bmdFormat8BitBGRA, bmdFrameFlagDefault, &frame);
+    if (create_hr != S_OK || !frame) {
+        fprintf(stderr, "[shim][output] CreateVideoFrame failed hr=0x%08x\n", (unsigned)create_hr);
+        return false;
+    }
+
+    // Get frame buffer pointer (CPU-side)
+    void* frame_bytes = nullptr;
+    HRESULT getbytes_hr = frame->GetBytes(&frame_bytes);
+    if (getbytes_hr != S_OK || !frame_bytes) {
+        fprintf(stderr, "[shim][output] GetBytes failed hr=0x%08x\n", (unsigned)getbytes_hr);
+        frame->Release();
+        return false;
+    }
+
+    // Copy from CPU buffer to DeckLink frame buffer
+    size_t copy_size = static_cast<size_t>(row_bytes) * height;
+    std::memcpy(frame_bytes, cpu_bgra_data, copy_size);
+
+    // Schedule frame for async playback
+    BMDTimeScale timebase = (BMDTimeScale)g_output_fps_num;
+    HRESULT schedule_hr = g_output->ScheduleVideoFrame(frame, display_time, display_duration, timebase);
+    
+    if (schedule_hr != S_OK) {
+        fprintf(stderr, "[shim][output] ScheduleVideoFrame failed hr=0x%08x\n", (unsigned)schedule_hr);
+        frame->Release();
+        return false;
+    }
+
     return true;
 }
 
@@ -2371,4 +2454,101 @@ extern "C" bool decklink_set_video_output_connection(int64_t connection) {
     }
 
     return true;
+}
+
+// Initialize DVP context early (before buffer allocation)
+extern "C" bool decklink_initialize_dvp_context() {
+    if (g_dvp.initialized) {
+        fprintf(stderr, "[shim][dvp-init] ✅ DVP already initialized\n");
+        return true;
+    }
+    
+    DVPStatus init_status = dvpInitCUDAContext(DVP_DEVICE_FLAGS_SHARE_APP_CONTEXT);
+    if (init_status != DVP_STATUS_OK && init_status != DVP_STATUS_INVALID_OPERATION) {
+        log_dvp_error("dvpInitCUDAContext (early init)", init_status);
+        return false;
+    }
+
+    uint32_t buffer_align = 1;
+    uint32_t stride_align = 1;
+    uint32_t semaphore_align = 1;
+    uint32_t semaphore_alloc = 0;
+    uint32_t semaphore_payload_offset = 0;
+    uint32_t semaphore_payload_size = 0;
+    DVPStatus const_status = dvpGetRequiredConstantsCUDACtx(
+        &buffer_align,
+        &stride_align,
+        &semaphore_align,
+        &semaphore_alloc,
+        &semaphore_payload_offset,
+        &semaphore_payload_size);
+    if (const_status != DVP_STATUS_OK) {
+        log_dvp_error("dvpGetRequiredConstantsCUDACtx (early init)", const_status);
+        if (init_status == DVP_STATUS_OK) {
+            (void)dvpCloseCUDAContext();
+        }
+        return false;
+    }
+
+    g_dvp.buffer_alignment = buffer_align == 0 ? 1u : buffer_align;
+    g_dvp.gpu_stride_alignment = stride_align == 0 ? 1u : stride_align;
+    g_dvp.semaphore_alignment = semaphore_align == 0 ? 1u : semaphore_align;
+    g_dvp.semaphore_alloc_size = semaphore_alloc;
+    g_dvp.semaphore_payload_offset = semaphore_payload_offset;
+    g_dvp.semaphore_payload_size = semaphore_payload_size;
+    g_dvp.initialized = true;
+    
+    fprintf(stderr, "[shim][dvp-init] ✅ DVP initialized early (alignment: buffer=%u, stride=%u)\n",
+            g_dvp.buffer_alignment, g_dvp.gpu_stride_alignment);
+    return true;
+}
+
+// DVP-compatible GPU memory allocation
+// This uses the same CUDA context that DVP was initialized with
+extern "C" void* decklink_allocate_dvp_compatible_buffer(size_t size) {
+    // Ensure DVP is initialized first (this sets up the CUDA context)
+    if (!g_dvp.initialized) {
+        fprintf(stderr, "[shim][dvp-alloc] ⚠️  DVP not initialized yet, attempting early init...\n");
+        if (!decklink_initialize_dvp_context()) {
+            fprintf(stderr, "[shim][dvp-alloc] ❌ Failed to initialize DVP context\n");
+            return nullptr;
+        }
+    }
+    
+    // Allocate with proper alignment for DVP
+    size_t aligned_size = ((size + g_dvp.buffer_alignment - 1) / g_dvp.buffer_alignment) * g_dvp.buffer_alignment;
+    
+    CUdeviceptr dev_ptr = 0;
+    CUresult result = cuMemAlloc(&dev_ptr, aligned_size);
+    
+    if (result != CUDA_SUCCESS) {
+        const char* error_str = nullptr;
+        cuGetErrorString(result, &error_str);
+        fprintf(stderr, "[shim][dvp-alloc] ❌ cuMemAlloc failed: %s (requested: %zu bytes, aligned: %zu bytes)\n",
+                error_str ? error_str : "unknown error", size, aligned_size);
+        return nullptr;
+    }
+    
+    fprintf(stderr, "[shim][dvp-alloc] ✅ Allocated DVP-compatible buffer: 0x%llx (%zu bytes, alignment: %u)\n",
+            (unsigned long long)dev_ptr, aligned_size, g_dvp.buffer_alignment);
+    
+    return reinterpret_cast<void*>(dev_ptr);
+}
+
+extern "C" void decklink_free_dvp_compatible_buffer(void* ptr) {
+    if (!ptr) {
+        return;
+    }
+    
+    CUdeviceptr dev_ptr = reinterpret_cast<CUdeviceptr>(ptr);
+    CUresult result = cuMemFree(dev_ptr);
+    
+    if (result != CUDA_SUCCESS) {
+        const char* error_str = nullptr;
+        cuGetErrorString(result, &error_str);
+        fprintf(stderr, "[shim][dvp-alloc] ⚠️  cuMemFree failed: %s (ptr: 0x%llx)\n",
+                error_str ? error_str : "unknown error", (unsigned long long)dev_ptr);
+    } else {
+        fprintf(stderr, "[shim][dvp-alloc] 🗑️  Freed DVP-compatible buffer: 0x%llx\n", (unsigned long long)dev_ptr);
+    }
 }

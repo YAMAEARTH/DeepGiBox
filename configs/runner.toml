@@ -15,7 +15,7 @@ test_duration_seconds = 0          # 0 = run indefinitely
 enable_debug_dumps = false
 debug_dump_frame_count = 5
 stats_print_interval = 60          # Print stats every N frames
-enable_runtime_statistics = false   # Show statistics during runtime (every N frames)
+enable_runtime_statistics = true   # Show statistics during runtime (every N frames)
 enable_final_summary = true        # Show final summary when program ends
 
 # =============================================================================
@@ -31,7 +31,7 @@ expected_resolution = "1080p60"    # 1080p60, 2160p60, etc.
 [preprocessing]
 output_width = 512                 # Model input width (must match engine)
 output_height = 512                # Model input height (must match engine)
-use_fp16 = false                   # Use FP16 for preprocessing
+use_fp16 = false                   # Use FP16 for preprocessing (must match engine!)
 cuda_device = 0                    # CUDA device index
 mean = [0.0, 0.0, 0.0]            # Normalization mean
 std = [1.0, 1.0, 1.0]             # Normalization std
@@ -53,20 +53,25 @@ lib_path = "trt-shim/build/libtrt_shim.so"
 # =============================================================================
 [postprocessing]
 num_classes = 2
-confidence_threshold = 0.25        # Confidence threshold (0.25 = balanced)
-nms_threshold = 0.45               # NMS IoU threshold
+confidence_threshold = 0.25        # Confidence threshold (0.28 = balanced smooth)
+nms_threshold = 0.48               # NMS IoU threshold (higher = more aggressive)
 max_detections = 100
 verbose_stats = false              # Print detailed postprocessing stats (anchors, NMS, temporal smoothing)
 
 [postprocessing.temporal_smoothing]
 enable = true
-window_size = 4                    # Number of frames for smoothing
+window_size = 5                    # Number of frames for smoothing (5 = smoother than 4)
 
 [postprocessing.tracking]
 enable = true
-max_age = 30                       # Maximum frames to keep track without detection
+max_age = 40                       # Maximum frames to keep track without detection (40 = more forgiving)
 min_confidence = 0.3               # Minimum confidence for tracking
-iou_threshold = 0.3                # IoU threshold for matching
+iou_threshold = 0.28               # IoU threshold for matching (lower = easier matching)
+
+[postprocessing.ema_smoothing]
+enable = true
+alpha_position = 0.25              # EMA alpha for position (0.25 = 75% old, 25% new) - smoother
+alpha_size = 0.35                  # EMA alpha for size (0.35 = 65% old, 35% new) - slightly more responsive
 
 # =============================================================================
 # Overlay Configuration

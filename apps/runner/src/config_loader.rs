@@ -160,6 +160,16 @@ pub struct TrackingConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct EmaSmoothingConfig {
+    #[serde(default)]
+    pub enable: bool,
+    #[serde(default = "default_alpha_position")]
+    pub alpha_position: f32,
+    #[serde(default = "default_alpha_size")]
+    pub alpha_size: f32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct PostprocessingConfig {
     #[serde(default = "default_num_classes")]
     pub num_classes: usize,
@@ -173,6 +183,8 @@ pub struct PostprocessingConfig {
     pub temporal_smoothing: TemporalSmoothingConfig,
     #[serde(default)]
     pub tracking: TrackingConfig,
+    #[serde(default)]
+    pub ema_smoothing: EmaSmoothingConfig,
     /// Print verbose statistics (anchor stats, temporal smoothing, NMS details, etc.)
     #[serde(default)]
     pub verbose_stats: bool,
@@ -324,6 +336,12 @@ fn default_min_confidence() -> f32 {
 fn default_iou_threshold() -> f32 {
     0.3
 }
+fn default_alpha_position() -> f32 {
+    0.3
+}
+fn default_alpha_size() -> f32 {
+    0.4
+}
 fn default_num_classes() -> usize {
     2
 }
@@ -452,6 +470,16 @@ impl Default for TrackingConfig {
     }
 }
 
+impl Default for EmaSmoothingConfig {
+    fn default() -> Self {
+        Self {
+            enable: true,
+            alpha_position: default_alpha_position(),
+            alpha_size: default_alpha_size(),
+        }
+    }
+}
+
 impl Default for PostprocessingConfig {
     fn default() -> Self {
         Self {
@@ -461,6 +489,7 @@ impl Default for PostprocessingConfig {
             max_detections: default_max_detections(),
             temporal_smoothing: TemporalSmoothingConfig::default(),
             tracking: TrackingConfig::default(),
+            ema_smoothing: EmaSmoothingConfig::default(),
             verbose_stats: false,
         }
     }

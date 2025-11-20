@@ -2,6 +2,35 @@ use anyhow::Result;
 use common_io::{DetectionsPacket, OverlayPlanPacket, DrawOp, Stage};
 use std::cmp::Ordering;
 
+// GPU overlay planning module (optional)
+#[cfg(feature = "gpu")]
+pub mod gpu_overlay;
+
+// Re-export GPU utilities for easy access
+#[cfg(feature = "gpu")]
+pub use gpu_overlay::{
+    GpuOverlayPlanner, 
+    GpuOverlayPlan,
+    convert_gpu_to_overlay_plan,
+    prepare_detections_for_gpu,
+};
+
+/// Helper function: Process detections with GPU overlay planning
+/// Returns OverlayPlanPacket compatible with existing render pipeline
+#[cfg(feature = "gpu")]
+pub fn process_with_gpu_planning(
+    gpu_planner: &mut GpuOverlayPlanner,
+    detections: DetectionsPacket,
+) -> Result<OverlayPlanPacket> {
+    let canvas = (detections.from.width, detections.from.height);
+    
+    // Generate GPU overlay plan
+    let gpu_plan = gpu_planner.plan_from_detections(&detections)?;
+    
+    // Convert to CPU format for render stage
+    convert_gpu_to_overlay_plan(gpu_plan, canvas)
+}
+
 pub fn from_path(cfg: &str) -> Result<PlanStage> {
     PlanStage::from_path(cfg)
 }
@@ -59,8 +88,8 @@ impl Stage<DetectionsPacket, OverlayPlanPacket> for PlanStage {
             .max_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(Ordering::Equal));
         // best_score = คะแนนความมั่นใจสูงสุด (0.0 - 1.0)
         let best_score = best_detection.map(|d| d.score.clamp(0.0, 1.0)).unwrap_or(0.0);
-        // best_long_label = ชื่อประเภทของการตรวจจับ, best_color = สีของการตรวจจับ
-        let (_, best_long_label, best_color) = best_detection
+        // best_long_label = ชื่อประเภทของการตรวจจับ, _best_color = สีของการตรวจจับ (ไม่ใช้)
+        let (_, best_long_label, _best_color) = best_detection
             .map(|d| class_palette(d.class_id as u32))
             .unwrap_or(("None", "Awaiting", (80, 80, 80, 255)));
 
@@ -96,13 +125,13 @@ impl Stage<DetectionsPacket, OverlayPlanPacket> for PlanStage {
                 (best_score * num_segments as f32).ceil().clamp(0.0, num_segments as f32) as i32;
             // bar_width = ความกว้างของแถบ
             let bar_width = 28.0 * bar_scale;
-            // diag_thickness = ความหนาของเส้นทแยงมุม
-            let diag_thickness = scaled_thickness(2.0, ui_scale);
 
-            // วนวาดแต่ละช่องของ Confidence Bar
+            // วนวาดแต่ละช่องของ Confidence Bar (จากล่างขึ้นบน)
             for i in 0..num_segments {
-                // top = ตำแหน่ง Y ของช่องปัจจุบัน
-                let top = start_y + i as f32 * (segment_height + gap);
+                // reversed_i = ดัชนีกลับหัว (ช่องล่างสุด = 0, ช่องบนสุด = 3)
+                let reversed_i = num_segments - 1 - i;
+                // top = ตำแหน่ง Y ของช่องปัจจุบัน (นับจากล่างขึ้นบน)
+                let top = start_y + reversed_i as f32 * (segment_height + gap);
                 // seg_color = สีของช่อง (ขาวเข้มถ้า active, เทาอ่อนถ้า inactive)
                 let seg_color = if (i as i32) < active_segments {
                     (255, 255, 255, 255)  // สีขาวเข้ม สำหรับช่อง active
@@ -190,15 +219,11 @@ impl Stage<DetectionsPacket, OverlayPlanPacket> for PlanStage {
         // ============================================================
         // BOUNDING BOXES (กรอบวัตถุที่ตรวจพบ)
         // ============================================================
-        let bbox_scale = ui_scale;  // อัตราส่วนการขยายกรอบ
-        let bbox_outline = scaled_thickness(2.0, bbox_scale);  // ความหนาเส้นกรอบ
-        let corner_outline = scaled_thickness(3.0, bbox_scale);  // ความหนาเส้นมุม
-        let label_font = scaled_font_px(20.0, ui_scale, 14);  // ขนาดฟอนต์ label
+        let _bbox_scale = ui_scale;  // อัตราส่วนการขยายกรอบ (ไม่ใช้แล้ว)
+        let corner_outline = scaled_thickness(3.0, ui_scale);  // ความหนาเส้นมุม
 
         // วนวาดกรอบสำหรับแต่ละวัตถุที่ตรวจพบ
         for det in &input.items {
-            // short_label = ชื่อสั้น, class_color = สีของคลาส (ใช้สีฟ้าสำหรับทุกคลาส)
-            let (short_label, _, _) = class_palette(det.class_id as u32);
             // box_color = สีฟ้าสำหรับกรอบ (ไม่แยกตามคลาส)
             let box_color = (0, 180, 255, 255);  // สีฟ้า (Cyan Blue)
             // x, y, w, h = ตำแหน่งและขนาดของกรอบ

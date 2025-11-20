@@ -1,18 +1,28 @@
 [workspace]
-members = [
-  "apps/runner",
-  "apps/playgrounds",
-  "crates/common_io",
-  "crates/decklink_input",
-  "crates/preprocess_cuda",
-  "crates/inference",
-  "crates/inference_v2",
-  "crates/postprocess",
-  "crates/overlay_plan",
-  "crates/overlay_render",
-  "crates/decklink_output",
-  "crates/telemetry",
-  "crates/config",
-  "testsupport",
-]
 resolver = "2"
+members = [
+    "apps/runner",
+    "apps/playgrounds",
+    "crates/common_io",
+    "crates/config",
+    "crates/decklink_input",
+    "crates/decklink_output",
+    "crates/inference",
+    "crates/inference_v2",
+    "crates/inference_v3",
+    "crates/overlay_plan",
+    "crates/overlay_render",
+    "crates/postprocess",
+    "crates/preprocess_cuda",
+    "crates/telemetry",
+    "testsupport",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

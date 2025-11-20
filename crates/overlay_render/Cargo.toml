@@ -10,6 +10,10 @@ common_io = { path = "../common_io" }
 telemetry = { path = "../telemetry" }
 config = { path = "../config" }
 rusttype = "0.9"
+overlay_plan = { path = "../overlay_plan", optional = true }
+
+[features]
+gpu = ["overlay_plan/gpu"]
 
 [build-dependencies]
 cc = "1"

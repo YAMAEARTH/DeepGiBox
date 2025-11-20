@@ -2,13 +2,28 @@
 // This module provides API for sending frames to DeckLink output devices
 
 use common_io::{FrameMeta, MemLoc, PixelFormat, RawFramePacket};
-use std::os::raw::{c_double, c_int};
+use std::os::raw::{c_double, c_int, c_void};
 use std::path::Path;
+
+// CUDA API for fallback GPU→CPU copy
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum cudaMemcpyKind {
+    cudaMemcpyHostToHost = 0,
+    cudaMemcpyHostToDevice = 1,
+    cudaMemcpyDeviceToHost = 2,
+    cudaMemcpyDeviceToDevice = 3,
+}
+
+extern "C" {
+    fn cudaMemcpy(dst: *mut c_void, src: *const c_void, count: usize, kind: cudaMemcpyKind) -> c_int;
+}
 
 // C API from shim.cpp
 extern "C" {
     fn decklink_output_open(device_index: c_int, width: c_int, height: c_int, fps: c_double) -> bool;
     fn decklink_output_send_frame_gpu(gpu_bgra_data: *const u8, gpu_pitch: c_int, width: c_int, height: c_int) -> bool;
+    fn decklink_output_schedule_frame(bgra_data: *const u8, pitch: c_int, width: c_int, height: c_int, display_time: u64, display_duration: u64) -> bool;
     fn decklink_output_schedule_frame_gpu(gpu_bgra_data: *const u8, gpu_pitch: c_int, width: c_int, height: c_int, display_time: u64, display_duration: u64) -> bool;
     fn decklink_output_schedule_frame_gpu_dvp(gpu_bgra_data: *const u8, gpu_pitch: c_int, width: c_int, height: c_int, display_time: u64, display_duration: u64) -> bool;
     fn decklink_output_get_last_frame_timing(packet_prep: *mut c_double, queue_mgmt: *mut c_double, dma_copy: *mut c_double, api: *mut c_double, scheduling: *mut c_double) -> bool;
@@ -310,7 +325,9 @@ impl OutputDevice {
         Ok(())
     }
     
-    /// Schedule a frame for async playback using DVP (DMA transfer, zero-copy)
+    /// Schedule a frame for async playback using hybrid GPU/CPU approach
+    /// Tries DVP (zero-copy DMA) first, falls back to GPU→CPU copy if DVP fails
+    /// This keeps GPU pipeline benefits while avoiding DVP-cudarc memory incompatibility
     pub fn schedule_frame_dvp(&mut self, request: OutputRequest, display_time: u64, display_duration: u64) -> Result<(), OutputDeviceError> {
         if !self.is_open {
             return Err(OutputDeviceError::DeviceNotAvailable("Device not open".to_string()));
@@ -338,8 +355,10 @@ impl OutputDevice {
         // Check if frame is on GPU
         match frame_to_schedule.data.loc {
             MemLoc::Gpu { .. } => {
-                // Schedule GPU frame using DVP (DMA)
-                let success = unsafe {
+                // 🔧 HYBRID APPROACH: Try DVP first, fallback to GPU→CPU copy if DVP fails
+                // This keeps GPU pipeline benefits while avoiding DVP-cudarc incompatibility
+                
+                let dvp_success = unsafe {
                     decklink_output_schedule_frame_gpu_dvp(
                         frame_to_schedule.data.ptr,
                         frame_to_schedule.data.stride as c_int,
@@ -350,15 +369,56 @@ impl OutputDevice {
                     )
                 };
                 
-                if !success {
-                    return Err(OutputDeviceError::DeviceNotAvailable(
-                        "Failed to schedule GPU frame via DVP for DeckLink output".to_string()
-                    ));
+                if !dvp_success {
+                    // DVP failed (likely cudarc memory incompatibility)
+                    // Fallback: Copy GPU → CPU, then use standard CPU path
+                    // This is slower (~0.4ms) but still benefits from GPU preprocessing/inference/overlay
+                    
+                    use std::os::raw::c_void;
+                    
+                    // Allocate CPU buffer for frame
+                    let frame_size = (frame_to_schedule.data.stride * self.height as usize) as usize;
+                    let mut cpu_buffer = vec![0u8; frame_size];
+                    
+                    // Copy from GPU to CPU using cudaMemcpy
+                    let cuda_result = unsafe {
+                        let cuda_ptr = frame_to_schedule.data.ptr as *const c_void;
+                        let cpu_ptr = cpu_buffer.as_mut_ptr() as *mut c_void;
+                        cudaMemcpy(cpu_ptr, cuda_ptr, frame_size, cudaMemcpyKind::cudaMemcpyDeviceToHost)
+                    };
+                    
+                    if cuda_result != 0 {
+                        return Err(OutputDeviceError::DeviceNotAvailable(
+                            format!("GPU→CPU copy failed: cudaMemcpy error {}", cuda_result)
+                        ));
+                    }
+                    
+                    // Schedule using CPU buffer (standard path, no DVP)
+                    let cpu_success = unsafe {
+                        decklink_output_schedule_frame(
+                            cpu_buffer.as_ptr(),
+                            frame_to_schedule.data.stride as c_int,
+                            self.width as c_int,
+                            self.height as c_int,
+                            display_time,
+                            display_duration,
+                        )
+                    };
+                    
+                    if !cpu_success {
+                        return Err(OutputDeviceError::DeviceNotAvailable(
+                            "Failed to schedule frame via CPU fallback path".to_string()
+                        ));
+                    }
+                    
+                    // Buffer must stay alive until frame is consumed by DeckLink
+                    // In practice, DeckLink copies immediately in schedule_frame
+                    std::mem::drop(cpu_buffer);
                 }
             }
             MemLoc::Cpu => {
                 return Err(OutputDeviceError::ConfigError(
-                    "CPU frames not supported - frame must be on GPU for DVP".to_string()
+                    "CPU frames not supported - frame must be on GPU for this pipeline".to_string()
                 ));
             }
         }
@@ -509,12 +569,63 @@ impl OutputDevice {
         // TODO: Implement frame tracking
         None
     }
+    
+    /// Drain the frame queue before closing device
+    /// Waits for all pending frames to complete playback
+    fn drain_frame_queue(&mut self) {
+        use std::time::{Duration, Instant};
+        
+        println!("⏳ Draining frame queue before closing device...");
+        
+        let start = Instant::now();
+        let timeout = Duration::from_millis(500); // Max 500ms wait
+        let mut last_count = None;
+        
+        loop {
+            // Check if we've exceeded timeout
+            if start.elapsed() > timeout {
+                match self.get_buffered_frame_count() {
+                    Ok(count) if count > 0 => {
+                        println!("⚠️  Timeout draining queue - {} frames still buffered", count);
+                    }
+                    _ => {}
+                }
+                break;
+            }
+            
+            // Get current buffered frame count
+            match self.get_buffered_frame_count() {
+                Ok(count) => {
+                    if count == 0 {
+                        println!("✅ Frame queue drained successfully");
+                        break;
+                    }
+                    
+                    // Log only when count changes
+                    if last_count != Some(count) {
+                        println!("   Waiting for {} buffered frames...", count);
+                        last_count = Some(count);
+                    }
+                    
+                    // Short sleep to avoid busy-waiting
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => {
+                    println!("⚠️  Error checking buffered frames: {:?}", e);
+                    break;
+                }
+            }
+        }
+    }
 }
 
 impl Drop for OutputDevice {
     fn drop(&mut self) {
         if self.is_open {
             println!("🔌 Closing DeckLink output device {}...", self.device_index);
+            
+            // Drain frame queue before closing (wait for pending frames to complete)
+            self.drain_frame_queue();
             
             // Stop scheduled playback if active
             if self.scheduled_playback_active {

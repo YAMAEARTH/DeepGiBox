@@ -4,7 +4,7 @@
 # compile CXX with /usr/bin/c++
 CXX_DEFINES = -Dtrt_shim_EXPORTS
 
-CXX_INCLUDES = -I/usr/local/TensorRT-8.6.1.6/include -I/home/earth/Documents/pun/DeepGiBox/trt-shim/include
+CXX_INCLUDES = -I/usr/local/TensorRT-8.6.1.6/include -I/home/earth/Documents/Earth/Last/DeepGiBox/trt-shim/include
 
 CXX_FLAGS = -std=gnu++17 -fPIC
 

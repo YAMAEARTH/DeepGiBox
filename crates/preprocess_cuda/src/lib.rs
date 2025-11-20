@@ -24,9 +24,6 @@ pub enum CropRegion {
     /// OLYMPUS: [0:1080, 548:1920] -> crop center portion (1372×1080)
     #[serde(rename = "olympus")]
     Olympus,
-    /// PENTAX: [0:1080, 0:1376] -> crop left portion (1376×1080)
-    #[serde(rename = "pentax")]
-    Pentax,
     /// No cropping (use full frame)
     #[serde(rename = "none")]
     None,
@@ -55,11 +52,6 @@ impl CropRegion {
                 // 1080p: [0:1080, 548:1920] -> (548, 0, 1372, 1080)
                 // 4K:    [0:2160, 1096:3840] -> (1096, 0, 2744, 2160)
                 (548 * scale, 0, 1372 * scale, 1080 * scale)
-            }
-            CropRegion::Pentax => {
-                // 1080p: [0:1080, 0:1376] -> (0, 0, 1376, 1080)
-                // 4K:    [0:2160, 0:2752] -> (0, 0, 2752, 2160)
-                (0, 0, 1376 * scale, 1080 * scale)
             }
             CropRegion::None => {
                 // Full frame - use actual input size

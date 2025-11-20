@@ -192,6 +192,7 @@ impl TrtInferenceStage {
                 from: input.from,
                 raw_output: self.output_cpu.clone(),
                 output_shape,
+                gpu_ptr: None,  // BiSeNet v3 doesn't support GPU output yet
             })
         }
     }

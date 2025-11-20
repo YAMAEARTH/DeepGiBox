@@ -13,6 +13,10 @@ extern "C" {
     fn cudaStreamDestroy(stream: *mut c_void) -> c_int;
     fn cudaStreamSynchronize(stream: *mut c_void) -> c_int;
     
+    // DVP-compatible allocation (from shim.cpp)
+    fn decklink_allocate_dvp_compatible_buffer(size: usize) -> *mut c_void;
+    fn decklink_free_dvp_compatible_buffer(ptr: *mut c_void);
+    
     // CUDA kernels จาก overlay_render.cu
     fn launch_clear_buffer(
         gpu_buf: *mut u8,
@@ -53,6 +57,16 @@ extern "C" {
         r: u8,
         g: u8,
         b: u8,
+        stream: *mut c_void,
+    );
+    
+    fn launch_execute_commands(
+        gpu_buf: *mut u8,
+        stride: c_int,
+        width: c_int,
+        height: c_int,
+        gpu_commands: *const c_void,
+        num_commands: c_int,
         stream: *mut c_void,
     );
     
@@ -143,18 +157,20 @@ impl RenderStage {
         
         // ถ้ามี buffer เก่า free ก่อน
         if let Some(ptr) = self.gpu_buf {
-            unsafe { cudaFree(ptr as *mut c_void); }
+            unsafe { decklink_free_dvp_compatible_buffer(ptr as *mut c_void); }
         }
         
-        // Allocate GPU buffer ใหม่
+        // Allocate DVP-compatible GPU buffer ใหม่
         let stride = (width * 4) as usize;
         let size = stride * height as usize;
-        let mut dev_ptr: *mut c_void = ptr::null_mut();
         
-        let result = unsafe { cudaMalloc(&mut dev_ptr, size) };
-        if result != CUDA_SUCCESS || dev_ptr.is_null() {
-            anyhow::bail!("Failed to allocate GPU buffer for overlay rendering");
+        let dev_ptr = unsafe { decklink_allocate_dvp_compatible_buffer(size) };
+        if dev_ptr.is_null() {
+            anyhow::bail!("Failed to allocate DVP-compatible GPU buffer for overlay rendering");
         }
+        
+        eprintln!("[overlay_render] ✅ Allocated DVP-compatible buffer: {}x{} ({} bytes)", 
+                  width, height, size);
         
         self.gpu_buf = Some(dev_ptr as *mut u8);
         self.width = width;
@@ -418,11 +434,101 @@ impl Stage<OverlayPlanPacket, OverlayFramePacket> for RenderStage {
     }
 }
 
+// GPU-specific methods (outside trait impl)
+#[cfg(feature = "gpu")]
+impl RenderStage {
+    /// Process GPU overlay plan (zero-copy from GPU overlay planning)
+    /// Takes GpuOverlayPlanPacket directly without CPU conversion
+    /// This is the full zero-copy path: GPU detections → GPU commands → GPU rendering
+    pub fn process_gpu(&mut self, input: common_io::GpuOverlayPlanPacket) -> OverlayFramePacket {
+        let w = input.canvas.0;
+        let h = input.canvas.1;
+        
+        // Ensure GPU buffer is allocated
+        if let Err(e) = self.ensure_buffer(w, h) {
+            eprintln!("GPU overlay render error: {}", e);
+            return OverlayFramePacket {
+                from: input.frame_meta,
+                argb: MemRef {
+                    ptr: ptr::null_mut(),
+                    len: 0,
+                    stride: 0,
+                    loc: MemLoc::Gpu { device: self.device_id },
+                },
+                stride: 0,
+            };
+        }
+        
+        let gpu_ptr = self.gpu_buf.unwrap();
+        
+        // Clear buffer (transparent)
+        unsafe {
+            launch_clear_buffer(
+                gpu_ptr,
+                self.stride as c_int,
+                w as c_int,
+                h as c_int,
+                self.stream,
+            );
+        }
+        
+        // Execute GPU commands directly (FULL ZERO-COPY!)
+        // Commands are already on GPU - no CPU transfers except 2 × 4-byte counts
+        // GPU kernel separates commands by type and executes in parallel
+        
+        if self.debug_mode {
+            eprintln!("[DEBUG] process_gpu: num_commands={}, gpu_commands={:?}", 
+                     input.num_commands, input.gpu_commands);
+        }
+        
+        if input.num_commands > 0 && !input.gpu_commands.is_null() {
+            if self.debug_mode {
+                eprintln!("[DEBUG] Executing {} GPU commands (full GPU path)", input.num_commands);
+            }
+            
+            // Execute commands on GPU (zero-copy!)
+            // Only transfers: 2 × 4 bytes for command counts (rect_count, fill_count)
+            unsafe {
+                launch_execute_commands(
+                    gpu_ptr,
+                    self.stride as c_int,
+                    w as c_int,
+                    h as c_int,
+                    input.gpu_commands as *const c_void,
+                    input.num_commands as c_int,
+                    self.stream,
+                );
+            }
+            
+            // Note: Labels (cmd_type == 2) are skipped in GPU path
+            // Text rendering requires CPU rasterization
+        }        // Synchronize
+        let sync_result = unsafe {
+            cudaStreamSynchronize(self.stream)
+        };
+        if sync_result != CUDA_SUCCESS {
+            eprintln!("[ERROR] cudaStreamSynchronize failed: {}", sync_result);
+        }
+        
+        // Return GPU buffer (zero-copy!)
+        OverlayFramePacket {
+            from: input.frame_meta,
+            argb: MemRef {
+                ptr: gpu_ptr,
+                len: self.stride * h as usize,
+                stride: self.stride,
+                loc: MemLoc::Gpu { device: self.device_id },
+            },
+            stride: self.stride,
+        }
+    }
+}
+
 impl Drop for RenderStage {
     fn drop(&mut self) {
         if let Some(ptr) = self.gpu_buf {
             unsafe {
-                cudaFree(ptr as *mut c_void);
+                decklink_free_dvp_compatible_buffer(ptr as *mut c_void);
             }
         }
         if !self.stream.is_null() {

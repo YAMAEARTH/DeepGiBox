@@ -2,6 +2,10 @@
 name = "common_io"
 version = "0.1.0"
 edition = "2021"
+
 [lib]
 name = "common_io"
 path = "src/lib.rs"
+
+[features]
+gpu = []  # Enables GPU pointer field in RawDetectionsPacket for zero-copy optimization

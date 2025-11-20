@@ -179,6 +179,7 @@ impl TrtInferenceStage {
                 from: input.from,
                 raw_output: self.output_cpu.clone(),
                 output_shape,
+                gpu_ptr: None, // TODO: Enable zero-copy by returning GPU pointer directly
             })
         }
     }

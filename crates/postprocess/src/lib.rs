@@ -7,12 +7,20 @@ mod sort_tracker;
 mod fast_nms;
 mod ema_smoother;
 
+// GPU-accelerated postprocessing (optional, enabled with "gpu" feature)
+#[cfg(feature = "gpu")]
+pub mod gpu_postprocess;
+
 use post::{postprocess_yolov5_with_temporal_smoothing, TemporalSmoother, YoloPostConfig};
 use sort_tracker::SortTrackerWrapper;
 use ema_smoother::EmaSmoother;
 
 // Re-export config structs for external use
 pub use post::PostprocessConfig;
+
+// Re-export GPU postprocessor if enabled
+#[cfg(feature = "gpu")]
+pub use gpu_postprocess::GpuPostprocessor;
 
 /// Main postprocessing stage following postprocessing_guideline.md
 /// Converts raw model outputs → DetectionsPacket with bbox/score/class/track

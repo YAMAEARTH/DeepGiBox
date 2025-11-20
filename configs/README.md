@@ -10,8 +10,7 @@
 - **Pipeline**: Hardware Internal Keying (full production)
 - **Endoscope Modes**: Switch on-the-fly with keyboard
   - Press `1` → Fuji mode
-  - Press `2` → Olympus mode  
-  - Press `3` → Pentax mode
+  - Press `2` → Olympus mode
 - **Features**:
   - Single config file for all endoscopes
   - No restart needed to change modes
@@ -21,7 +20,7 @@
 **Usage**:
 ```bash
 cargo run --release -p runner -- configs/runner.toml
-# Press 1, 2, or 3 during runtime to switch endoscope modes
+# Press 1 or 2 during runtime to switch endoscope modes
 ```
 
 #### `runner_keying.toml`
@@ -96,10 +95,10 @@ cargo run --release -p runner -- configs/runner_visualization.toml
 
 | Config | Pipeline Mode | Endoscope | Runtime Switch | Output | Use Case |
 |--------|--------------|-----------|----------------|--------|----------|
-| **runner.toml** ⭐ | Hardware Keying | All (1,2,3 keys) | ✅ Yes | DeckLink | **Production** |
+| **runner.toml** ⭐ | Hardware Keying | All (1,2 keys) | ✅ Yes | DeckLink | **Production** |
 | runner_keying.toml | Hardware Keying | Olympus | ❌ No | DeckLink | Production (fixed) |
-| runner_inference_only.toml | Inference Only | Pentax | ❌ No | None | Performance test |
-| runner_visualization.toml | Visualization | Pentax | ❌ No | Disk | Debug/Analysis |
+| runner_inference_only.toml | Inference Only | Olympus | ❌ No | None | Performance test |
+| runner_visualization.toml | Visualization | Olympus | ❌ No | Disk | Debug/Analysis |
 
 ---
 
@@ -109,7 +108,7 @@ The following files were removed as they are replaced by `runner.toml`:
 
 - ~~`runner_fuji.toml`~~ → Use `runner.toml` and press `1`
 - ~~`runner_olympus.toml`~~ → Use `runner.toml` and press `2`
-- ~~`runner_pentax.toml`~~ → Use `runner.toml` and press `3`
+- ~~`runner_pentax.toml`~~ → **Removed (no longer supported)**
 
 **Migration**: Simply use `runner.toml` and switch modes with keyboard shortcuts during runtime.
 
@@ -162,7 +161,6 @@ cargo run --release -p runner -- configs/runner.toml
 # During runtime:
 # - Press 1 for Fuji
 # - Press 2 for Olympus
-# - Press 3 for Pentax
 # - Press Ctrl+C to stop
 ```
 

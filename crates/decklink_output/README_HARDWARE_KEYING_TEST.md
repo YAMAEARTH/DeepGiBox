@@ -141,7 +141,7 @@ HARDWARE LATENCY:    ~7.0ms (capture → output)
 ### Crop Regions
 Change the crop region in the code:
 ```rust
-let crop_region = CropRegion::Olympus; // or Fuji, Pentax
+let crop_region = CropRegion::Olympus; // or Fuji
 ```
 
 ### Keyer Level

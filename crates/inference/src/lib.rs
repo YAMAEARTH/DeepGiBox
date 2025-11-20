@@ -295,6 +295,7 @@ impl Stage<TensorInputPacket, RawDetectionsPacket> for OrtTrtEngine {
                     from: input.from,
                     raw_output: predictions,
                     output_shape,
+                    gpu_ptr: None,  // CPU inference - no GPU pointer
                 }
             }
             Err(e) => {
@@ -303,6 +304,7 @@ impl Stage<TensorInputPacket, RawDetectionsPacket> for OrtTrtEngine {
                     from: input.from,
                     raw_output: Vec::new(),
                     output_shape: Vec::new(),
+                    gpu_ptr: None,  // Error case - no GPU pointer
                 }
             }
         }

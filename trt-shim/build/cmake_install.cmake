@@ -1,4 +1,4 @@
-# Install script for directory: /home/earth/Documents/pun/DeepGiBox/trt-shim
+# Install script for directory: /home/earth/Documents/Earth/Last/DeepGiBox/trt-shim
 
 # Set the install prefix
 if(NOT DEFINED CMAKE_INSTALL_PREFIX)
@@ -50,5 +50,5 @@ endif()
 
 string(REPLACE ";" "\n" CMAKE_INSTALL_MANIFEST_CONTENT
        "${CMAKE_INSTALL_MANIFEST_FILES}")
-file(WRITE "/home/earth/Documents/pun/DeepGiBox/trt-shim/build/${CMAKE_INSTALL_MANIFEST}"
+file(WRITE "/home/earth/Documents/Earth/Last/DeepGiBox/trt-shim/build/${CMAKE_INSTALL_MANIFEST}"
      "${CMAKE_INSTALL_MANIFEST_CONTENT}")

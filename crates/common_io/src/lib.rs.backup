@@ -113,24 +113,6 @@ pub struct DetectionsPacket {
     pub items: Vec<Detection>,
 }
 
-/// GPU-resident detections (no CPU copy, for full GPU pipeline)
-/// Keeps detection data on GPU to eliminate GPU→CPU→GPU transfers
-#[derive(Clone, Debug)]
-pub struct GpuDetectionsPacket {
-    pub frame_meta: FrameMeta,
-    pub gpu_detections: *mut Detection,  // Device pointer to detection array
-    pub num_detections: usize,           // Number of valid detections
-    pub capacity: usize,                 // Buffer capacity
-}
-
-// Safety: GpuDetectionsPacket wraps GPU pointers that are managed by stage structs
-// Send/Sync are needed for passing between pipeline stages
-unsafe impl Send for GpuDetectionsPacket {}
-unsafe impl Sync for GpuDetectionsPacket {}
-
-
-
-
 pub enum DrawOp {
     Rect {
         xywh: (f32, f32, f32, f32),
@@ -159,21 +141,6 @@ pub struct OverlayPlanPacket {
     pub ops: Vec<DrawOp>,
     pub canvas: (u32, u32),
 }
-
-/// GPU-resident overlay plan (no CPU copy, for full GPU pipeline)
-/// Keeps command buffer on GPU to eliminate CPU→GPU transfers
-#[derive(Clone, Debug)]
-pub struct GpuOverlayPlanPacket {
-    pub frame_meta: FrameMeta,
-    pub gpu_commands: *mut u8,       // Device pointer to command buffer (GpuDrawCommand array)
-    pub num_commands: usize,         // Number of commands
-    pub canvas: (u32, u32),          // Canvas dimensions
-}
-
-// Safety: GpuOverlayPlanPacket wraps GPU pointers managed by stage structs
-unsafe impl Send for GpuOverlayPlanPacket {}
-unsafe impl Sync for GpuOverlayPlanPacket {}
-
 
 pub struct OverlayFramePacket {
     pub from: FrameMeta,
