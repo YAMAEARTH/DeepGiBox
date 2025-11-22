@@ -1,17 +1,41 @@
 use anyhow::Result;
 use common_io::{MemLoc, MemRef, OverlayFramePacket, OverlayPlanPacket, Stage, DrawOp};
 use rusttype::{Font, Scale, point};
-use std::os::raw::{c_int, c_void};
+use std::cmp::{max, min};
+use std::os::raw::{c_int, c_uint, c_void};
 use std::ptr;
+use std::slice;
 
 // ==================== CUDA FFI ====================
+#[allow(dead_code)]
 extern "C" {
-    fn cudaMalloc(dev_ptr: *mut *mut c_void, size: usize) -> c_int;
-    fn cudaFree(dev_ptr: *mut c_void) -> c_int;
-    fn cudaMemcpy(dst: *mut c_void, src: *const c_void, count: usize, kind: c_int) -> c_int;
+    fn cudaMemcpyAsync(
+        dst: *mut c_void,
+        src: *const c_void,
+        count: usize,
+        kind: c_int,
+        stream: *mut c_void,
+    ) -> c_int;
+    fn cudaMemcpy2DAsync(
+        dst: *mut c_void,
+        dpitch: usize,
+        src: *const c_void,
+        spitch: usize,
+        width: usize,
+        height: usize,
+        kind: c_int,
+        stream: *mut c_void,
+    ) -> c_int;
+    fn cudaHostAlloc(ptr: *mut *mut c_void, size: usize, flags: c_uint) -> c_int;
+    fn cudaFreeHost(ptr: *mut c_void) -> c_int;
     fn cudaStreamCreate(stream: *mut *mut c_void) -> c_int;
     fn cudaStreamDestroy(stream: *mut c_void) -> c_int;
     fn cudaStreamSynchronize(stream: *mut c_void) -> c_int;
+    fn cudaEventCreateWithFlags(event: *mut *mut c_void, flags: c_uint) -> c_int;
+    fn cudaEventDestroy(event: *mut c_void) -> c_int;
+    fn cudaEventRecord(event: *mut c_void, stream: *mut c_void) -> c_int;
+    fn cudaEventSynchronize(event: *mut c_void) -> c_int;
+    fn cudaStreamWaitEvent(stream: *mut c_void, event: *mut c_void, flags: c_uint) -> c_int;
     
     // DVP-compatible allocation (from shim.cpp)
     fn decklink_allocate_dvp_compatible_buffer(size: usize) -> *mut c_void;
@@ -90,12 +114,134 @@ extern "C" {
 const CUDA_SUCCESS: c_int = 0;
 const CUDA_MEMCPY_HOST_TO_DEVICE: c_int = 1;
 const CUDA_MEMCPY_DEVICE_TO_HOST: c_int = 2;
+const CUDA_EVENT_DISABLE_TIMING: c_uint = 0x02;
+
+struct PinnedHostBuffer {
+    ptr: *mut u8,
+    len: usize,
+}
+
+impl PinnedHostBuffer {
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+impl Drop for PinnedHostBuffer {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe {
+                cudaFreeHost(self.ptr as *mut c_void);
+            }
+            self.ptr = ptr::null_mut();
+            self.len = 0;
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Region {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+}
+
+impl Region {
+    fn union_with(&mut self, other: &Region) {
+        let min_x = min(self.x, other.x);
+        let min_y = min(self.y, other.y);
+        let max_x = max(self.x + self.width, other.x + other.width);
+        let max_y = max(self.y + self.height, other.y + other.height);
+        self.x = min_x;
+        self.y = min_y;
+        self.width = max_x - min_x;
+        self.height = max_y - min_y;
+    }
+}
+
+struct LabelCommand {
+    anchor: (i32, i32),
+    text: String,
+    font_px: f32,
+    color: (u8, u8, u8, u8),
+    bounds: Region,
+}
+
+fn measure_label_bounds(
+    font: &Font<'static>,
+    text: &str,
+    font_px: f32,
+    anchor: (i32, i32),
+    canvas_w: u32,
+    canvas_h: u32,
+) -> Option<Region> {
+    if text.is_empty() || font_px <= 0.0 {
+        return None;
+    }
+
+    let scale = Scale::uniform(font_px);
+    let v_metrics = font.v_metrics(scale);
+    let offset = point(0.0, v_metrics.ascent);
+
+    let mut min_x = i32::MAX;
+    let mut min_y = i32::MAX;
+    let mut max_x = i32::MIN;
+    let mut max_y = i32::MIN;
+
+    for glyph in font.layout(text, scale, offset) {
+        if let Some(bb) = glyph.pixel_bounding_box() {
+            let gx_min = anchor.0 + bb.min.x;
+            let gy_min = anchor.1 + bb.min.y;
+            let gx_max = anchor.0 + bb.max.x;
+            let gy_max = anchor.1 + bb.max.y;
+
+            min_x = min(min_x, gx_min);
+            min_y = min(min_y, gy_min);
+            max_x = max(max_x, gx_max);
+            max_y = max(max_y, gy_max);
+        }
+    }
+
+    if min_x == i32::MAX || min_y == i32::MAX {
+        return None;
+    }
+
+    let clamp_min_x = max(min_x, 0);
+    let clamp_min_y = max(min_y, 0);
+    let clamp_max_x = min(max_x, canvas_w as i32);
+    let clamp_max_y = min(max_y, canvas_h as i32);
+
+    if clamp_min_x >= clamp_max_x || clamp_min_y >= clamp_max_y {
+        return None;
+    }
+
+    Some(Region {
+        x: clamp_min_x as u32,
+        y: clamp_min_y as u32,
+        width: (clamp_max_x - clamp_min_x) as u32,
+        height: (clamp_max_y - clamp_min_y) as u32,
+    })
+}
+
+fn union_region(regions: &[Region]) -> Option<Region> {
+    let mut iter = regions.iter();
+    let first = iter.next()?.clone();
+    let mut acc = first;
+    for region in iter {
+        acc.union_with(region);
+    }
+    Some(acc)
+}
 
 // ==================== GPU Render Stage ====================
 pub struct RenderStage {
     gpu_buf: Option<*mut u8>,
-    cpu_buf: Option<Vec<u8>>,  // CPU buffer สำหรับ text rendering
+    cpu_buf: Option<PinnedHostBuffer>,  // CPU buffer สำหรับ text rendering (pinned)
     stream: *mut c_void,
+    text_stream: *mut c_void,
+    render_done_event: *mut c_void,
+    text_done_event: *mut c_void,
     width: u32,
     height: u32,
     stride: usize,
@@ -179,6 +325,34 @@ impl RenderStage {
         
         Ok(())
     }
+
+    fn ensure_cpu_buffer(&mut self, size: usize) -> Result<&mut PinnedHostBuffer> {
+        if size == 0 {
+            anyhow::bail!("Pinned buffer size must be > 0");
+        }
+
+        let needs_alloc = match &self.cpu_buf {
+            Some(buf) => buf.len != size,
+            None => true,
+        };
+
+        if needs_alloc {
+            self.cpu_buf.take();
+
+            let mut host_ptr: *mut c_void = ptr::null_mut();
+            let result = unsafe { cudaHostAlloc(&mut host_ptr, size, 0) };
+            if result != CUDA_SUCCESS || host_ptr.is_null() {
+                anyhow::bail!("Failed to allocate pinned host buffer for overlay text (code {})", result);
+            }
+
+            self.cpu_buf = Some(PinnedHostBuffer {
+                ptr: host_ptr as *mut u8,
+                len: size,
+            });
+        }
+
+        Ok(self.cpu_buf.as_mut().unwrap())
+    }
 }
 
 pub fn from_path(cfg: &str) -> Result<RenderStage> {
@@ -194,22 +368,54 @@ pub fn from_path(cfg: &str) -> Result<RenderStage> {
         .split(',')
         .any(|s| s.trim() == "debug" || s.trim() == "debug=true");
     
-    // Create CUDA stream
+    // Load font (do before heavy CUDA init to avoid cleanup noise)
+    let font_data = include_bytes!("../../../testsupport/DejaVuSans.ttf");
+    let font = Font::try_from_bytes(font_data as &[u8])
+        .ok_or_else(|| anyhow::anyhow!("Failed to load DejaVuSans.ttf font"))?;
+
+    // Create CUDA streams
     let mut stream: *mut c_void = ptr::null_mut();
+    let mut text_stream: *mut c_void = ptr::null_mut();
+    let mut render_done_event: *mut c_void = ptr::null_mut();
+    let mut text_done_event: *mut c_void = ptr::null_mut();
+
     let result = unsafe { cudaStreamCreate(&mut stream) };
     if result != CUDA_SUCCESS {
         anyhow::bail!("Failed to create CUDA stream for overlay rendering");
     }
-    
-    // Load font
-    let font_data = include_bytes!("../../../testsupport/DejaVuSans.ttf");
-    let font = Font::try_from_bytes(font_data as &[u8])
-        .ok_or_else(|| anyhow::anyhow!("Failed to load DejaVuSans.ttf font"))?;
+
+    let text_result = unsafe { cudaStreamCreate(&mut text_stream) };
+    if text_result != CUDA_SUCCESS {
+        unsafe { cudaStreamDestroy(stream); }
+        anyhow::bail!("Failed to create CUDA text stream for overlay rendering");
+    }
+
+    let render_event_result = unsafe { cudaEventCreateWithFlags(&mut render_done_event, CUDA_EVENT_DISABLE_TIMING) };
+    if render_event_result != CUDA_SUCCESS {
+        unsafe {
+            cudaStreamDestroy(text_stream);
+            cudaStreamDestroy(stream);
+        }
+        anyhow::bail!("Failed to create CUDA event for render_done");
+    }
+
+    let text_event_result = unsafe { cudaEventCreateWithFlags(&mut text_done_event, CUDA_EVENT_DISABLE_TIMING) };
+    if text_event_result != CUDA_SUCCESS {
+        unsafe {
+            cudaEventDestroy(render_done_event);
+            cudaStreamDestroy(text_stream);
+            cudaStreamDestroy(stream);
+        }
+        anyhow::bail!("Failed to create CUDA event for text_done");
+    }
     
     Ok(RenderStage {
         gpu_buf: None,
         cpu_buf: None,
         stream,
+        text_stream,
+        render_done_event,
+        text_done_event,
         width: 0,
         height: 0,
         stride: 0,
@@ -331,19 +537,8 @@ impl Stage<OverlayPlanPacket, OverlayFramePacket> for RenderStage {
             }
         }
         
-        // Synchronize stream เพื่อให้แน่ใจว่า rendering เสร็จ
-        let sync_result = unsafe {
-            cudaStreamSynchronize(self.stream)
-        };
-        if sync_result != CUDA_SUCCESS {
-            eprintln!("[ERROR] cudaStreamSynchronize failed: {}", sync_result);
-        } else if self.debug_mode {
-            eprintln!("[DEBUG] Stream synchronized successfully");
-        }
-        
         // Check for kernel errors
         extern "C" {
-            fn cudaGetLastError() -> c_int;
             fn cudaPeekAtLastError() -> c_int;
         }
         let last_err = unsafe { cudaPeekAtLastError() };
@@ -351,73 +546,154 @@ impl Stage<OverlayPlanPacket, OverlayFramePacket> for RenderStage {
             eprintln!("[ERROR] CUDA kernel error detected: {}", last_err);
         }
         
-        // === TEXT RENDERING (CPU-based) ===
-        // Collect all Label operations
-        let label_ops: Vec<_> = input.ops.iter()
-            .filter_map(|op| match op {
-                DrawOp::Label { anchor, text, font_px, color } => Some((*anchor, text.clone(), *font_px, *color)),
-                _ => None,
-            })
-            .collect();
-        
-        if !label_ops.is_empty() {
-            if self.debug_mode {
-                eprintln!("[DEBUG] Rendering {} text labels on CPU", label_ops.len());
+        // === TEXT RENDERING (CPU-based partial copy) ===
+        let mut label_cmds: Vec<LabelCommand> = Vec::new();
+        for op in input.ops.iter() {
+            if let DrawOp::Label { anchor, text, font_px, color } = op {
+                let anchor_i = (anchor.0 as i32, anchor.1 as i32);
+                let font_px_f32 = *font_px as f32;
+                let bounds = measure_label_bounds(&self.font, text, font_px_f32, anchor_i, w, h);
+                if let Some(bounds) = bounds {
+                    label_cmds.push(LabelCommand {
+                        anchor: anchor_i,
+                        text: text.clone(),
+                        font_px: font_px_f32,
+                        color: *color,
+                        bounds,
+                    });
+                } else if self.debug_mode {
+                    eprintln!("[DEBUG] Skipping label '{}' (outside canvas or empty)", text);
+                }
             }
-            
-            // Ensure CPU buffer
-            let buf_size = self.stride * h as usize;
-            if self.cpu_buf.is_none() || self.cpu_buf.as_ref().unwrap().len() != buf_size {
-                self.cpu_buf = Some(vec![0u8; buf_size]);
-            }
-            
-            // Copy GPU buffer to CPU
-            let cpu_buf = self.cpu_buf.as_mut().unwrap();
-            let copy_result = unsafe {
-                cudaMemcpy(
-                    cpu_buf.as_mut_ptr() as *mut c_void,
-                    gpu_ptr as *const c_void,
-                    buf_size,
-                    CUDA_MEMCPY_DEVICE_TO_HOST,
-                )
-            };
-            if copy_result != CUDA_SUCCESS {
-                eprintln!("[ERROR] cudaMemcpy D2H failed: {}", copy_result);
-            } else {
-                // Draw text on CPU buffer (need to split borrow)
-                let stride = self.stride;
-                let font = &self.font;
-                
-                for (anchor, text, font_px, color) in label_ops {
-                    draw_text_on_buffer(
-                        cpu_buf, 
-                        stride, 
-                        w, 
-                        h, 
-                        anchor.0 as i32, 
-                        anchor.1 as i32, 
-                        &text, 
-                        font_px as f32, 
-                        color,
-                        font,
+        }
+
+        let mut text_region: Option<Region> = None;
+        if !label_cmds.is_empty() {
+            let label_regions: Vec<Region> = label_cmds.iter().map(|cmd| cmd.bounds).collect();
+            text_region = union_region(&label_regions);
+        }
+
+        let mut text_updated = false;
+        if let Some(region) = &text_region {
+            if region.width > 0 && region.height > 0 {
+                if self.debug_mode {
+                    eprintln!(
+                        "[DEBUG] Rendering {} labels in region x:{} y:{} w:{} h:{}",
+                        label_cmds.len(),
+                        region.x,
+                        region.y,
+                        region.width,
+                        region.height
                     );
                 }
-                
-                // Copy back to GPU
-                let copy_back = unsafe {
-                    cudaMemcpy(
-                        gpu_ptr as *mut c_void,
-                        cpu_buf.as_ptr() as *const c_void,
-                        buf_size,
-                        CUDA_MEMCPY_HOST_TO_DEVICE,
-                    )
-                };
-                if copy_back != CUDA_SUCCESS {
-                    eprintln!("[ERROR] cudaMemcpy H2D failed: {}", copy_back);
-                } else if self.debug_mode {
-                    eprintln!("[DEBUG] Text rendering completed, copied back to GPU");
+
+                let row_bytes = region.width as usize * 4;
+                let buf_size = row_bytes * region.height as usize;
+                if buf_size > 0 {
+                    if let Err(err) = self.ensure_cpu_buffer(buf_size) {
+                        eprintln!("[ERROR] {}", err);
+                    } else {
+                        let gpu_offset = region.y as usize * self.stride + region.x as usize * 4;
+                        let gpu_region_ptr = unsafe { gpu_ptr.add(gpu_offset) } as *const c_void;
+                        let host_ptr = self.cpu_buf.as_ref().unwrap().ptr as *mut c_void;
+
+                        // Ensure draw kernels complete before copy
+                        let record_event = unsafe { cudaEventRecord(self.render_done_event, self.stream) };
+                        if record_event != CUDA_SUCCESS {
+                            eprintln!("[ERROR] cudaEventRecord (render_done) failed: {}", record_event);
+                        } else {
+                            let wait_result = unsafe { cudaStreamWaitEvent(self.text_stream, self.render_done_event, 0) };
+                            if wait_result != CUDA_SUCCESS {
+                                eprintln!("[ERROR] cudaStreamWaitEvent failed: {}", wait_result);
+                            } else {
+                                let copy_result = unsafe {
+                                    cudaMemcpy2DAsync(
+                                        host_ptr,
+                                        row_bytes,
+                                        gpu_region_ptr,
+                                        self.stride,
+                                        row_bytes,
+                                        region.height as usize,
+                                        CUDA_MEMCPY_DEVICE_TO_HOST,
+                                        self.text_stream,
+                                    )
+                                };
+                                if copy_result != CUDA_SUCCESS {
+                                    eprintln!("[ERROR] cudaMemcpy2DAsync D2H failed: {}", copy_result);
+                                } else {
+                                    let sync_after_copy = unsafe { cudaStreamSynchronize(self.text_stream) };
+                                    if sync_after_copy != CUDA_SUCCESS {
+                                        eprintln!("[ERROR] cudaStreamSynchronize text_stream failed: {}", sync_after_copy);
+                                    } else {
+                                        let stride = row_bytes;
+                                        let font_ptr: *const Font<'static> = &self.font;
+                                        {
+                                            let cpu_slice = self.cpu_buf.as_mut().unwrap().as_mut_slice();
+                                            for cmd in &label_cmds {
+                                                let local_x = cmd.anchor.0 - region.x as i32;
+                                                let local_y = cmd.anchor.1 - region.y as i32;
+                                                unsafe {
+                                                    draw_text_on_buffer(
+                                                        cpu_slice,
+                                                        stride,
+                                                        region.width,
+                                                        region.height,
+                                                        local_x,
+                                                        local_y,
+                                                        &cmd.text,
+                                                        cmd.font_px,
+                                                        cmd.color,
+                                                        &*font_ptr,
+                                                    );
+                                                }
+                                            }
+                                        }
+
+                                        let cpu_src = self.cpu_buf.as_ref().unwrap().ptr as *const c_void;
+                                        let copy_back = unsafe {
+                                            cudaMemcpy2DAsync(
+                                                gpu_ptr.add(gpu_offset) as *mut c_void,
+                                                self.stride,
+                                                cpu_src,
+                                                row_bytes,
+                                                row_bytes,
+                                                region.height as usize,
+                                                CUDA_MEMCPY_HOST_TO_DEVICE,
+                                                self.text_stream,
+                                            )
+                                        };
+                                        if copy_back != CUDA_SUCCESS {
+                                            eprintln!("[ERROR] cudaMemcpy2DAsync H2D failed: {}", copy_back);
+                                        } else {
+                                            let record_text_done = unsafe { cudaEventRecord(self.text_done_event, self.text_stream) };
+                                            if record_text_done != CUDA_SUCCESS {
+                                                eprintln!("[ERROR] cudaEventRecord (text_done) failed: {}", record_text_done);
+                                            } else {
+                                                text_updated = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
+        }
+
+        if text_updated {
+            let wait_main = unsafe { cudaStreamWaitEvent(self.stream, self.text_done_event, 0) };
+            if wait_main != CUDA_SUCCESS {
+                eprintln!("[ERROR] cudaStreamWaitEvent (text_done) failed: {}", wait_main);
+            }
+        }
+        
+        // Synchronize stream เพื่อให้แน่ใจว่า rendering เสร็จ
+        let sync_result = unsafe { cudaStreamSynchronize(self.stream) };
+        if sync_result != CUDA_SUCCESS {
+            eprintln!("[ERROR] cudaStreamSynchronize failed: {}", sync_result);
+        } else if self.debug_mode {
+            eprintln!("[DEBUG] Stream synchronized successfully");
         }
         
         // Return GPU buffer in BGRA format (ไม่มี CPU copy!)
@@ -529,6 +805,21 @@ impl Drop for RenderStage {
         if let Some(ptr) = self.gpu_buf {
             unsafe {
                 decklink_free_dvp_compatible_buffer(ptr as *mut c_void);
+            }
+        }
+        if !self.render_done_event.is_null() {
+            unsafe {
+                cudaEventDestroy(self.render_done_event);
+            }
+        }
+        if !self.text_done_event.is_null() {
+            unsafe {
+                cudaEventDestroy(self.text_done_event);
+            }
+        }
+        if !self.text_stream.is_null() {
+            unsafe {
+                cudaStreamDestroy(self.text_stream);
             }
         }
         if !self.stream.is_null() {

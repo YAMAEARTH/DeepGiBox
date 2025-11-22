@@ -6,6 +6,8 @@ edition = "2021"
 [features]
 default = []
 gpu = ["postprocess/gpu", "overlay_plan/gpu", "overlay_render/gpu", "common_io/gpu"]  # Enable GPU-accelerated pipeline
+disabled_gpu_postprocess = []
+disabled_gpu_planning = []
 
 [dependencies]
 anyhow = "1"

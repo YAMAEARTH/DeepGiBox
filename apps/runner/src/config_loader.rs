@@ -157,6 +157,49 @@ pub struct TrackingConfig {
     pub min_confidence: f32,
     #[serde(default = "default_iou_threshold")]
     pub iou_threshold: f32,
+    #[serde(default)]
+    pub motion: TrackingMotionConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TrackingMotionConfig {
+    #[serde(default = "default_use_kalman")]
+    pub use_kalman: bool,
+    #[serde(default = "default_kalman_process_noise")]
+    pub kalman_process_noise: f32,
+    #[serde(default = "default_kalman_measurement_noise")]
+    pub kalman_measurement_noise: f32,
+    #[serde(default = "default_use_optical_flow")]
+    pub use_optical_flow: bool,
+    #[serde(default = "default_optical_flow_alpha")]
+    pub optical_flow_alpha: f32,
+    #[serde(default = "default_optical_flow_max_pixels")]
+    pub optical_flow_max_pixels: f32,
+    #[serde(default = "default_use_velocity")]
+    pub use_velocity: bool,
+    #[serde(default = "default_velocity_alpha")]
+    pub velocity_alpha: f32,
+    #[serde(default = "default_velocity_max_delta")]
+    pub velocity_max_delta: f32,
+    #[serde(default = "default_velocity_decay")]
+    pub velocity_decay: f32,
+}
+
+impl Default for TrackingMotionConfig {
+    fn default() -> Self {
+        Self {
+            use_kalman: default_use_kalman(),
+            kalman_process_noise: default_kalman_process_noise(),
+            kalman_measurement_noise: default_kalman_measurement_noise(),
+            use_optical_flow: default_use_optical_flow(),
+            optical_flow_alpha: default_optical_flow_alpha(),
+            optical_flow_max_pixels: default_optical_flow_max_pixels(),
+            use_velocity: default_use_velocity(),
+            velocity_alpha: default_velocity_alpha(),
+            velocity_max_delta: default_velocity_max_delta(),
+            velocity_decay: default_velocity_decay(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -336,6 +379,36 @@ fn default_min_confidence() -> f32 {
 fn default_iou_threshold() -> f32 {
     0.3
 }
+fn default_use_kalman() -> bool {
+    true
+}
+fn default_kalman_process_noise() -> f32 {
+    1.0
+}
+fn default_kalman_measurement_noise() -> f32 {
+    0.4
+}
+fn default_use_optical_flow() -> bool {
+    true
+}
+fn default_optical_flow_alpha() -> f32 {
+    0.35
+}
+fn default_optical_flow_max_pixels() -> f32 {
+    12.0
+}
+fn default_use_velocity() -> bool {
+    true
+}
+fn default_velocity_alpha() -> f32 {
+    0.35
+}
+fn default_velocity_max_delta() -> f32 {
+    18.0
+}
+fn default_velocity_decay() -> f32 {
+    0.15
+}
 fn default_alpha_position() -> f32 {
     0.3
 }
@@ -466,6 +539,7 @@ impl Default for TrackingConfig {
             max_age: default_max_age(),
             min_confidence: default_min_confidence(),
             iou_threshold: default_iou_threshold(),
+            motion: TrackingMotionConfig::default(),
         }
     }
 }

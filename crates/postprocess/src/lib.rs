@@ -6,6 +6,8 @@ mod post;
 mod sort_tracker;
 mod fast_nms;
 mod ema_smoother;
+mod kalman;
+mod optical_flow;
 
 // GPU-accelerated postprocessing (optional, enabled with "gpu" feature)
 #[cfg(feature = "gpu")]
@@ -17,6 +19,7 @@ use ema_smoother::EmaSmoother;
 
 // Re-export config structs for external use
 pub use post::PostprocessConfig;
+pub use sort_tracker::TrackerMotionOptions;
 
 // Re-export GPU postprocessor if enabled
 #[cfg(feature = "gpu")]
@@ -31,8 +34,6 @@ pub struct Postprocess {
     smoother: Option<TemporalSmoother>,
     tracker: Option<SortTrackerWrapper>,
     current_epoch: usize,
-    // Preallocated buffers to reduce allocation in hot path
-    working_buffer: Vec<f32>,
 }
 
 /// Legacy struct for backward compatibility
@@ -61,15 +62,31 @@ impl PostStage {
     }
 
     pub fn with_sort_tracking(
-        mut self,
+        self,
         max_idle_epochs: usize,
         min_confidence: f32,
         iou_threshold: f32,
     ) -> Self {
-        self.tracker = Some(SortTrackerWrapper::new(
+        self.with_sort_tracking_motion(
             max_idle_epochs,
             min_confidence,
             iou_threshold,
+            TrackerMotionOptions::default(),
+        )
+    }
+
+    pub fn with_sort_tracking_motion(
+        mut self,
+        max_idle_epochs: usize,
+        min_confidence: f32,
+        iou_threshold: f32,
+        motion: TrackerMotionOptions,
+    ) -> Self {
+        self.tracker = Some(SortTrackerWrapper::with_motion(
+            max_idle_epochs,
+            min_confidence,
+            iou_threshold,
+            motion,
         ));
         self
     }
@@ -264,7 +281,6 @@ impl Postprocess {
             smoother: None,
             tracker: None,
             current_epoch: 0,
-            working_buffer: Vec::with_capacity(100000), // Preallocate for ~10k anchors
         })
     }
 
@@ -278,10 +294,24 @@ impl Postprocess {
     pub fn with_tracking(mut self) -> Self {
         let tracking_cfg = &self.cfg.tracking;
         if tracking_cfg.enable {
-            self.tracker = Some(SortTrackerWrapper::new(
+            let motion_cfg = &tracking_cfg.motion;
+            let motion = TrackerMotionOptions {
+                use_kalman: motion_cfg.use_kalman,
+                kalman_process_noise: motion_cfg.kalman_process_noise,
+                kalman_measurement_noise: motion_cfg.kalman_measurement_noise,
+                use_optical_flow: motion_cfg.use_optical_flow,
+                optical_flow_alpha: motion_cfg.optical_flow_alpha,
+                optical_flow_max_pixels: motion_cfg.optical_flow_max_pixels,
+                use_velocity: motion_cfg.use_velocity,
+                velocity_alpha: motion_cfg.velocity_alpha,
+                velocity_max_delta: motion_cfg.velocity_max_delta,
+                velocity_decay: motion_cfg.velocity_decay,
+            };
+            self.tracker = Some(SortTrackerWrapper::with_motion(
                 tracking_cfg.max_age,
                 tracking_cfg.min_confidence,
                 tracking_cfg.iou_match,
+                motion,
             ));
         }
         self

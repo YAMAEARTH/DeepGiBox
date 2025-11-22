@@ -52,19 +52,31 @@ lib_path = "trt-shim/build/libtrt_shim.so"
 # ═══════════════════════════════════════════════════════════════════════════
 [postprocessing]
 num_classes = 2
-confidence_threshold = 0.25
-nms_threshold = 0.45
-max_detections = 100
+confidence_threshold = 0.22
+nms_threshold = 0.5
+max_detections = 120
 
 [postprocessing.temporal_smoothing]
 enable = true
-window_size = 4
+window_size = 6
 
 [postprocessing.tracking]
 enable = true
-max_age = 30
-min_confidence = 0.3
-iou_threshold = 0.3
+max_age = 55
+min_confidence = 0.25
+iou_threshold = 0.24
+
+[postprocessing.tracking.motion]
+use_kalman = true
+kalman_process_noise = 0.85
+kalman_measurement_noise = 0.3
+use_optical_flow = true
+optical_flow_alpha = 0.4
+optical_flow_max_pixels = 18.0
+use_velocity = true
+velocity_alpha = 0.36
+velocity_max_delta = 20.0
+velocity_decay = 0.13
 
 # ═══════════════════════════════════════════════════════════════════════════
 # OVERLAY SETTINGS

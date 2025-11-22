@@ -16,6 +16,7 @@ use inference_v2::TrtInferenceStage;
 use overlay_plan::PlanStage;
 use overlay_render;
 use postprocess;
+use postprocess::TrackerMotionOptions;
 use preprocess_cuda::{ChromaOrder, CropRegion, Preprocessor};
 
 // GPU-accelerated modules (optional)
@@ -32,7 +33,7 @@ use device_query::{DeviceQuery, DeviceState, Keycode};
 use std::sync::atomic::AtomicU32;
 
 mod config_loader;
-use config_loader::{PipelineConfig, PipelineMode, EndoscopeMode};
+use config_loader::{PipelineConfig, PipelineMode, EndoscopeMode, TrackingMotionConfig};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // GPU PIPELINE OPTIMIZATION
@@ -67,6 +68,21 @@ fn mode_to_u8(mode: &EndoscopeMode) -> u8 {
     match mode {
         EndoscopeMode::Fuji => 0,
         EndoscopeMode::Olympus => 1,
+    }
+}
+
+fn tracker_motion_options_from_config(cfg: &TrackingMotionConfig) -> TrackerMotionOptions {
+    TrackerMotionOptions {
+        use_kalman: cfg.use_kalman,
+        kalman_process_noise: cfg.kalman_process_noise,
+        kalman_measurement_noise: cfg.kalman_measurement_noise,
+        use_optical_flow: cfg.use_optical_flow,
+        optical_flow_alpha: cfg.optical_flow_alpha,
+        optical_flow_max_pixels: cfg.optical_flow_max_pixels,
+        use_velocity: cfg.use_velocity,
+        velocity_alpha: cfg.velocity_alpha,
+        velocity_max_delta: cfg.velocity_max_delta,
+        velocity_decay: cfg.velocity_decay,
     }
 }
 
@@ -228,7 +244,7 @@ fn run_keying_pipeline(config: &PipelineConfig) -> Result<()> {
 
     // 2. CUDA Device
     println!("🔧 [2/7] CUDA Device");
-    let cuda_device = CudaDevice::new(config.preprocessing.cuda_device)?;
+    let _cuda_device = CudaDevice::new(config.preprocessing.cuda_device)?;
     println!("  ✓ GPU {} initialized", config.preprocessing.cuda_device);
     println!();
 
@@ -281,11 +297,13 @@ fn run_keying_pipeline(config: &PipelineConfig) -> Result<()> {
     // 5. Postprocessing
     println!("🎯 [5/7] Postprocessing");
     let mut post_stage = if config.postprocessing.tracking.enable {
+        let motion = tracker_motion_options_from_config(&config.postprocessing.tracking.motion);
         let mut stage = postprocess::from_path("")?
-            .with_sort_tracking(
+            .with_sort_tracking_motion(
                 config.postprocessing.tracking.max_age,
                 config.postprocessing.tracking.min_confidence,
                 config.postprocessing.tracking.iou_threshold,
+                motion,
             )
             .with_verbose_stats(config.postprocessing.verbose_stats);
         
@@ -303,6 +321,18 @@ fn run_keying_pipeline(config: &PipelineConfig) -> Result<()> {
     };
     println!("  ✓ Confidence threshold: {}", config.postprocessing.confidence_threshold);
     println!("  ✓ Tracking: {}", if config.postprocessing.tracking.enable { "enabled" } else { "disabled" });
+    if config.postprocessing.tracking.enable {
+        let motion = &config.postprocessing.tracking.motion;
+        println!(
+            "    ↳ Kalman={} (Q={:.2}, R={:.2}) | Optical Flow={} (α={:.2}, max={:.1}px)",
+            if motion.use_kalman { "on" } else { "off" },
+            motion.kalman_process_noise,
+            motion.kalman_measurement_noise,
+            if motion.use_optical_flow { "on" } else { "off" },
+            motion.optical_flow_alpha,
+            motion.optical_flow_max_pixels,
+        );
+    }
     if config.postprocessing.ema_smoothing.enable {
         println!("  ✓ EMA smoothing: enabled (α_pos={}, α_size={})", 
             config.postprocessing.ema_smoothing.alpha_position,
@@ -414,7 +444,7 @@ fn run_keying_pipeline(config: &PipelineConfig) -> Result<()> {
     // Pre-roll setup
     let mut scheduled_playback_started = false;
     let preroll_count = 2;
-    let mut hw_start_time: Option<u64> = None;
+    let mut _hw_start_time: Option<u64> = None;
     let frames_ahead = 0u64;
 
     // 🔒 FIXED Queue Depth = 2 (for minimum latency)
@@ -475,6 +505,9 @@ fn run_keying_pipeline(config: &PipelineConfig) -> Result<()> {
     let mut frame_count = 0u64;
     let mut total_latency_ms = 0.0;
     let mut total_capture_ms = 0.0;
+    let mut total_capture_wait_ms = 0.0;
+    let mut total_capture_dvp_ms = 0.0;
+    let mut total_capture_hw_ms = 0.0;
     let mut total_preprocess_ms = 0.0;
     let mut total_inference_ms = 0.0;
     let mut total_postprocess_ms = 0.0;
@@ -483,6 +516,7 @@ fn run_keying_pipeline(config: &PipelineConfig) -> Result<()> {
     let mut total_keying_ms = 0.0;
     let mut total_packet_prep_ms = 0.0;
     let mut total_queue_mgmt_ms = 0.0;
+    let mut total_queue_wait_ms = 0.0;
     let mut total_timing_calc_ms = 0.0;
     let mut total_cuda_sync_ms = 0.0;
     let mut total_glass_to_glass_ms = 0.0;
@@ -494,7 +528,8 @@ fn run_keying_pipeline(config: &PipelineConfig) -> Result<()> {
     let mut e2e_samples: Vec<f64> = Vec::with_capacity(1000);
     
     // Track last frame index to detect new frames (adaptive frame-driven processing)
-    let mut last_frame_idx: Option<u64> = None;
+    // Track last hardware sequence number (DeckLink increments g_shared.seq per real capture)
+    let mut last_frame_seq: Option<u64> = None;
 
     let pipeline_start_time = Instant::now();
     let test_duration = if config.general.test_duration_seconds > 0 {
@@ -520,25 +555,29 @@ fn run_keying_pipeline(config: &PipelineConfig) -> Result<()> {
 
         // 1. Adaptive Frame Capture (wait for NEW frame only)
         let capture_start = Instant::now();
+        let mut capture_wait_duration = Duration::ZERO;
         let raw_frame = loop {
             match capture.get_frame()? {
                 Some(frame) => {
-                    // Check if this is a NEW frame (different from last processed)
-                    match last_frame_idx {
+                    // Use DeckLink hardware sequence (pts_ns) to detect truly new frames
+                    let frame_seq = frame.meta.pts_ns;
+                    match last_frame_seq {
                         None => {
                             // First frame - always process
-                            last_frame_idx = Some(frame.meta.frame_idx);
+                            last_frame_seq = Some(frame_seq);
                             break frame;
                         }
-                        Some(last_idx) => {
-                            if frame.meta.frame_idx != last_idx {
+                        Some(last_seq) => {
+                            if frame_seq != last_seq {
                                 // NEW frame detected - process it!
-                                last_frame_idx = Some(frame.meta.frame_idx);
+                                last_frame_seq = Some(frame_seq);
                                 break frame;
                             } else {
                                 // SAME frame as before - wait for next one
                                 // Short sleep to avoid busy-waiting (adaptive polling)
-                                std::thread::sleep(Duration::from_micros(500));
+                                let sleep_dur = Duration::from_micros(500);
+                                std::thread::sleep(sleep_dur);
+                                capture_wait_duration += sleep_dur;
                                 continue;
                             }
                         }
@@ -546,19 +585,38 @@ fn run_keying_pipeline(config: &PipelineConfig) -> Result<()> {
                 }
                 None => {
                     // No frame available yet - short sleep and retry
-                    std::thread::sleep(Duration::from_micros(500));
+                    let sleep_dur = Duration::from_micros(500);
+                    std::thread::sleep(sleep_dur);
+                    capture_wait_duration += sleep_dur;
                     continue;
                 }
             }
         };
         
+        let capture_elapsed = capture_start.elapsed();
+        let capture_total_ms = capture_elapsed.as_secs_f64() * 1000.0;
+        let capture_wait_ms = capture_wait_duration.as_secs_f64() * 1000.0;
+        let capture_dvp_ms = capture_elapsed
+            .saturating_sub(capture_wait_duration)
+            .as_secs_f64()
+            * 1000.0;
         let capture_complete_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos() as u64;
-        let capture_latency_ns = capture_complete_ns.saturating_sub(raw_frame.meta.t_capture_ns);
-        let capture_latency_ms = capture_latency_ns as f64 / 1_000_000.0;
-        total_capture_ms += capture_latency_ms;
+        let capture_latency_hw_ns = capture_complete_ns.saturating_sub(raw_frame.meta.t_capture_ns);
+        let capture_latency_hw_ms = capture_latency_hw_ns as f64 / 1_000_000.0;
+        // Hardware timestamp path reports software overhead (sub-millisecond). When it is too small,
+        // fall back to the measured capture stage duration so statistics reflect real cadence.
+        let capture_hw_ms_for_stats = if capture_latency_hw_ms >= 0.1 {
+            capture_latency_hw_ms
+        } else {
+            capture_total_ms
+        };
+        total_capture_ms += capture_total_ms;
+        total_capture_wait_ms += capture_wait_ms;
+        total_capture_dvp_ms += capture_dvp_ms;
+        total_capture_hw_ms += capture_hw_ms_for_stats;
         
         let pipeline_start = Instant::now();
 
@@ -737,6 +795,7 @@ fn run_keying_pipeline(config: &PipelineConfig) -> Result<()> {
         
         // �🚀 OPTIMIZED: Efficient queue waiting strategy
         // Instead of aggressive polling (50 × 100us), use smart exponential backoff
+        let mut queue_wait_ms = 0.0;
         if buffered_count >= max_queue_depth {
             let mut wait_time_us = 500u64; // เริ่มที่ 0.5ms
             let max_wait_time_us = 8000u64; // สูงสุด 8ms
@@ -758,7 +817,10 @@ fn run_keying_pipeline(config: &PipelineConfig) -> Result<()> {
                 println!("⚠️  Queue still full after waiting {:.2}ms (frame {})", 
                          total_wait_ms, frame_count);
             }
+
+            queue_wait_ms = total_wait_ms;
         }
+        total_queue_wait_ms += queue_wait_ms;
         
         let queue_mgmt_time = queue_mgmt_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -781,7 +843,7 @@ fn run_keying_pipeline(config: &PipelineConfig) -> Result<()> {
                         .expect("Failed to get hardware reference clock");
                     let start_time = hw_time;
                     decklink_out.start_scheduled_playback(start_time, timebase as f64)?;
-                    hw_start_time = Some(hw_time);
+                    _hw_start_time = Some(hw_time);
                     scheduled_playback_started = true;
                 }
             } else {
@@ -818,8 +880,8 @@ fn run_keying_pipeline(config: &PipelineConfig) -> Result<()> {
             inference_samples.remove(0);
             e2e_samples.remove(0);
         }
-        latency_samples.push(pipeline_ms);
-        capture_samples.push(capture_latency_ms);
+    latency_samples.push(pipeline_ms);
+    capture_samples.push(capture_total_ms);
         inference_samples.push(inference_ms);
         e2e_samples.push(glass_to_glass_ms);
 
@@ -833,7 +895,7 @@ fn run_keying_pipeline(config: &PipelineConfig) -> Result<()> {
         // - Prevents wasted processing when frames arrive late
         // - More responsive to real-time capture timing
         //
-        // Note: The frame_idx check at capture ensures we only process NEW frames,
+    // Note: The DeckLink sequence (pts_ns) check at capture ensures we only process NEW frames,
         // so no artificial sleep/throttling is needed here.
 
         // 🔒 FIXED QUEUE DEPTH (NO adaptive adjustment)
@@ -849,6 +911,9 @@ fn run_keying_pipeline(config: &PipelineConfig) -> Result<()> {
             
             // Calculate average latencies
             let avg_capture = total_capture_ms / frame_count as f64;
+            let avg_capture_wait = total_capture_wait_ms / frame_count as f64;
+            let avg_capture_dvp = total_capture_dvp_ms / frame_count as f64;
+            let avg_capture_hw = total_capture_hw_ms / frame_count as f64;
             let avg_preprocess = total_preprocess_ms / frame_count as f64;
             let avg_inference = total_inference_ms / frame_count as f64;
             let avg_cuda_sync = total_cuda_sync_ms / frame_count as f64;
@@ -858,6 +923,7 @@ fn run_keying_pipeline(config: &PipelineConfig) -> Result<()> {
             let avg_keying = total_keying_ms / frame_count as f64;
             let avg_total = total_latency_ms / frame_count as f64;
             let avg_g2g = total_glass_to_glass_ms / frame_count as f64;
+            let avg_queue_wait = total_queue_wait_ms / frame_count as f64;
             
             // Calculate percentile statistics
             let (pipeline_p50, pipeline_p95, pipeline_p99, pipeline_min, pipeline_max) = get_percentile_stats(&latency_samples);
@@ -882,6 +948,9 @@ fn run_keying_pipeline(config: &PipelineConfig) -> Result<()> {
             println!();
             println!("  ⏱️  Latency Breakdown (Average):");
             println!("    ┌─ 1. Capture:         {:.2}ms ({:.1}%)", avg_capture, (avg_capture / avg_total) * 100.0);
+            println!("    │    ├─ Wait for frame:  {:.2}ms", avg_capture_wait);
+            println!("    │    ├─ DVP DMA ready:   {:.2}ms", avg_capture_dvp);
+            println!("    │    └─ HW delta:        {:.2}ms", avg_capture_hw);
             println!("    ├─ 2. Preprocessing:   {:.2}ms ({:.1}%)", avg_preprocess, (avg_preprocess / avg_total) * 100.0);
             println!("    ├─ 3. Inference:       {:.2}ms ({:.1}%)", avg_inference, (avg_inference / avg_total) * 100.0);
             println!("    │    └─ CUDA Sync:     {:.2}ms", avg_cuda_sync);
@@ -889,6 +958,7 @@ fn run_keying_pipeline(config: &PipelineConfig) -> Result<()> {
             println!("    ├─ 5. Overlay Plan:    {:.2}ms ({:.1}%)", avg_plan, (avg_plan / avg_total) * 100.0);
             println!("    ├─ 6. GPU Rendering:   {:.2}ms ({:.1}%)", avg_render, (avg_render / avg_total) * 100.0);
             println!("    └─ 7. Hardware Keying: {:.2}ms ({:.1}%)", avg_keying, (avg_keying / avg_total) * 100.0);
+            println!("         └─ Queue wait:     {:.2}ms", avg_queue_wait);
             println!("    ───────────────────────────────────────────────────────────");
             println!("    Pipeline Total:        {:.2}ms (100%)", avg_total);
             println!("    Glass-to-Glass (E2E):  {:.2}ms (pipeline + queue)", avg_g2g);
@@ -943,7 +1013,10 @@ fn run_keying_pipeline(config: &PipelineConfig) -> Result<()> {
         println!();
         
         // Calculate averages
-        let avg_capture = total_capture_ms / frame_count as f64;
+    let avg_capture = total_capture_ms / frame_count as f64;
+    let avg_capture_wait = total_capture_wait_ms / frame_count as f64;
+    let avg_capture_dvp = total_capture_dvp_ms / frame_count as f64;
+    let avg_capture_hw = total_capture_hw_ms / frame_count as f64;
         let avg_preprocess = total_preprocess_ms / frame_count as f64;
         let avg_inference = total_inference_ms / frame_count as f64;
         let avg_cuda_sync = total_cuda_sync_ms / frame_count as f64;
@@ -955,13 +1028,17 @@ fn run_keying_pipeline(config: &PipelineConfig) -> Result<()> {
         let avg_g2g = total_glass_to_glass_ms / frame_count as f64;
         let avg_packet_prep = total_packet_prep_ms / frame_count as f64;
         let avg_queue_mgmt = total_queue_mgmt_ms / frame_count as f64;
+    let avg_queue_wait = total_queue_wait_ms / frame_count as f64;
         let avg_timing_calc = total_timing_calc_ms / frame_count as f64;
         
         // Get DVP-specific timings from last frame
         let (_packet_prep_dvp, _queue_mgmt_dvp, dma_copy, api, scheduling_dvp) = decklink_out.get_last_frame_timing();
         
-        println!("  ⏱️  Latency Breakdown (Averages):");
-        println!("    ┌─ 1. Capture:              {:.2}ms ({:.1}%)", avg_capture, (avg_capture / avg_total) * 100.0);
+    println!("  ⏱️  Latency Breakdown (Averages):");
+    println!("    ┌─ 1. Capture:              {:.2}ms ({:.1}%)", avg_capture, (avg_capture / avg_total) * 100.0);
+    println!("    │    ├─ Wait for frame:      {:.2}ms", avg_capture_wait);
+    println!("    │    ├─ DVP DMA ready:       {:.2}ms", avg_capture_dvp);
+    println!("    │    └─ HW delta:            {:.2}ms", avg_capture_hw);
         println!("    ├─ 2. Preprocessing:        {:.2}ms ({:.1}%)", avg_preprocess, (avg_preprocess / avg_total) * 100.0);
         println!("    ├─ 3. Inference:            {:.2}ms ({:.1}%)", avg_inference, (avg_inference / avg_total) * 100.0);
         println!("    │    └─ CUDA Sync:          {:.2}ms", avg_cuda_sync);
@@ -970,7 +1047,8 @@ fn run_keying_pipeline(config: &PipelineConfig) -> Result<()> {
         println!("    ├─ 6. GPU Rendering:        {:.2}ms ({:.1}%)", avg_render, (avg_render / avg_total) * 100.0);
         println!("    └─ 7. Hardware Keying:      {:.2}ms ({:.1}%)", avg_keying, (avg_keying / avg_total) * 100.0);
         println!("         ├─ Packet prep:        {:.2}ms", avg_packet_prep);
-        println!("         ├─ Queue mgmt:         {:.2}ms", avg_queue_mgmt);
+            println!("         ├─ Queue mgmt:         {:.2}ms", avg_queue_mgmt);
+            println!("         │   └─ Wait time:      {:.2}ms", avg_queue_wait);
         println!("         ├─ Timing calc:        {:.2}ms", avg_timing_calc);
         println!("         │   ├─ DMA transfer:   {:.2}ms (DVP zero-copy)", dma_copy);
         println!("         │   ├─ DeckLink API:   {:.2}ms", api);
@@ -1064,12 +1142,11 @@ fn run_inference_only_pipeline(config: &PipelineConfig) -> Result<()> {
     let mut capture = CaptureSession::open(config.capture.device_index as i32)?;
     println!("📹 Capture: Device {}", config.capture.device_index);
 
-    let cuda_device = CudaDevice::new(config.preprocessing.cuda_device)?;
+    let _cuda_device = CudaDevice::new(config.preprocessing.cuda_device)?;
     println!("🔧 CUDA: GPU {}", config.preprocessing.cuda_device);
 
     let crop_region = match config.preprocessing.crop_region.as_str() {
         "Olympus" => CropRegion::Olympus,
-        "Pentax" => CropRegion::Pentax,
         "Fuji" => CropRegion::Fuji,
         _ => CropRegion::Olympus,
     };
@@ -1097,10 +1174,12 @@ fn run_inference_only_pipeline(config: &PipelineConfig) -> Result<()> {
     println!("🧠 Inference: {}", config.inference.engine_path);
 
     let mut post_stage = if config.postprocessing.tracking.enable {
-        postprocess::from_path("")?.with_sort_tracking(
+        let motion = tracker_motion_options_from_config(&config.postprocessing.tracking.motion);
+        postprocess::from_path("")?.with_sort_tracking_motion(
             config.postprocessing.tracking.max_age,
             config.postprocessing.tracking.min_confidence,
             config.postprocessing.tracking.iou_threshold,
+            motion,
         )
     } else {
         postprocess::from_path("")?

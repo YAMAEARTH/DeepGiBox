@@ -23,7 +23,7 @@ enable_final_summary = true        # Show final summary when program ends
 # =============================================================================
 [capture]
 device_index = 0                   # DeckLink device index
-expected_resolution = "1080p60"    # 1080p60, 2160p60, etc.
+expected_resolution = "2160p30"    # 1080p60, 2160p60, etc.
 
 # =============================================================================
 # Preprocessing Configuration
@@ -53,25 +53,37 @@ lib_path = "trt-shim/build/libtrt_shim.so"
 # =============================================================================
 [postprocessing]
 num_classes = 2
-confidence_threshold = 0.25        # Confidence threshold (0.28 = balanced smooth)
-nms_threshold = 0.48               # NMS IoU threshold (higher = more aggressive)
-max_detections = 100
-verbose_stats = false              # Print detailed postprocessing stats (anchors, NMS, temporal smoothing)
+confidence_threshold = 0.25
+nms_threshold = 0.52
+max_detections = 120
+verbose_stats = false
 
 [postprocessing.temporal_smoothing]
 enable = true
-window_size = 5                    # Number of frames for smoothing (5 = smoother than 4)
+window_size = 4                    # **ลดลง** (จาก 10) เพื่อให้ค่า Conf ตอบสนองไวขึ้น ไม่รอเฉลี่ยนาน
 
 [postprocessing.tracking]
 enable = true
-max_age = 40                       # Maximum frames to keep track without detection (40 = more forgiving)
-min_confidence = 0.3               # Minimum confidence for tracking
-iou_threshold = 0.28               # IoU threshold for matching (lower = easier matching)
+max_age = 45                       # ปรับให้พอดีๆ ไม่ต้องค้างนานเกินไปจนเป็น Ghost
+min_confidence = 0.25
+iou_threshold = 0.30               # ขยับขึ้นนิดนึง ต้องการความแม่นยำในการจับคู่ระยะใกล้
+
+[postprocessing.tracking.motion]
+use_kalman = true
+kalman_process_noise = 1.5         # **เพิ่มขึ้นมาก** (High Agility) บอกระบบว่าวัตถุเราเปลี่ยนทิศทางไวมาก อย่าดื้อ
+kalman_measurement_noise = 0.1     # **ลดลงต่ำสุดๆ** (Trust Observation) บอกให้เชื่อ "สิ่งที่ตาเห็น" (Detection) มากกว่า "การคำนวณล่วงหน้า"
+use_optical_flow = true
+optical_flow_alpha = 0.5           # เพิ่มความไวต่อ Optical flow
+optical_flow_max_pixels = 25.0     # ยอมให้ขยับได้ระยะไกลขึ้นต่อเฟรม
+use_velocity = true
+velocity_alpha = 0.6               # ปรับให้ velocity เปลี่ยนค่าไวขึ้น
+velocity_max_delta = 30.0
+velocity_decay = 0.4               # **เพิ่มขึ้น** ให้แรงส่งเก่าหายไปไวๆ จะได้เปลี่ยนทิศทางทันที (เลี้ยวคม)
 
 [postprocessing.ema_smoothing]
 enable = true
-alpha_position = 0.25              # EMA alpha for position (0.25 = 75% old, 25% new) - smoother
-alpha_size = 0.35                  # EMA alpha for size (0.35 = 65% old, 35% new) - slightly more responsive
+alpha_position = 0.75              # **พระเอกของความจิก** ค่านี้ยิ่งใกล้ 1.0 ยิ่งพุ่งเข้าหาเป้าไว (แนะนำ 0.7-0.8 สำหรับความจิก)
+alpha_size = 0.60                  # ให้ขนาดกล่องขยาย/หด ไวขึ้นตามวัตถุจริง
 
 # =============================================================================
 # Overlay Configuration
